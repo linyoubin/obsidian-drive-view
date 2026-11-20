@@ -228,13 +228,56 @@ export function describeStatusBar(snapshot: QuarkUiSnapshot): string {
   return `Quark 只读：未登录`;
 }
 
+/** 必经的选根被取消时的提示（0.2.2：终止流程，登录状态保留）。 */
+export const QUARK_ROOT_REQUIRED_NOTICE = "夸克：需先选择知识库根目录（点左侧「同步夸克」图标）";
+
+/** 触发流程下一步的输入：ribbon 点击、扫码结果、选根结果、确认框选择。 */
+export type QuarkFlowEvent =
+  | { type: "click"; snapshot: QuarkUiSnapshot }
+  | { type: "login"; ok: boolean; snapshot: QuarkUiSnapshot }
+  | { type: "root"; ok: boolean; returnToConfirm?: boolean }
+  | { type: "confirm"; choice: "sync" | "change-root" | "cancel" };
+
+/** 引擎要执行的一步；`stop` 表示终止（带提示时弹 Notice）。 */
+export type QuarkFlowAction =
+  | { action: "login" }
+  | { action: "choose-root" }
+  | { action: "confirm" }
+  | { action: "sync"; reason: string }
+  | { action: "stop"; notice: string | null };
+
 /**
- * ribbon 点击分支（A3/A4 的判定逻辑，纯函数便于单测）：
- *   - 未登录 / 登录已过期 → `"login"`（先扫码，登录成功后自动同步）
- *   - 已登录 → `"sync"`（先弹确认框，确认后才同步）
+ * 点「同步夸克」后的状态机（0.2.2 顺序：**先扫码 → 再选根 → 自动同步**，A3/A4）：
+ *
+ * | 点之前的状态 | 点击后的流程 |
+ * |---|---|
+ * | 未登录 + 未选根 | 扫码 → 选根 → 选定即同步 |
+ * | 未登录 + 已选根 | 扫码 → 成功即同步（不弹确认框） |
+ * | 已登录 + 未选根 | 选根 → 选定即同步 |
+ * | 已登录 + 已选根 | 确认框（现在同步 / 修改库根 / 取消） |
+ *
+ * 取消扫码 → 终止，不选根、不同步；取消选根 → 终止并提示必须选根（登录状态保留）。
+ * 确认框里「修改库根」→ 选完回确认框，不直接开跑。
  */
-export function planQuarkRibbonAction(snapshot: QuarkUiSnapshot): "login" | "sync" {
-  return snapshot.loginState === "active" ? "sync" : "login";
+export function reduceQuarkFlow(event: QuarkFlowEvent): QuarkFlowAction {
+  switch (event.type) {
+    case "click":
+      if (event.snapshot.loginState !== "active") return { action: "login" };
+      return event.snapshot.rootChosen ? { action: "confirm" } : { action: "choose-root" };
+    case "login":
+      if (!event.ok) return { action: "stop", notice: null };
+      return event.snapshot.rootChosen
+        ? { action: "sync", reason: "登录后自动同步" }
+        : { action: "choose-root" };
+    case "root":
+      if (!event.ok) return { action: "stop", notice: QUARK_ROOT_REQUIRED_NOTICE };
+      // 从确认框「修改库根」来的回确认框；登录后/首次选根的直接同步
+      return event.returnToConfirm ? { action: "confirm" } : { action: "sync", reason: "首次同步" };
+    case "confirm":
+      if (event.choice === "cancel") return { action: "stop", notice: null };
+      if (event.choice === "change-root") return { action: "choose-root" };
+      return { action: "sync", reason: "手动同步" };
+  }
 }
 
 interface SettingTabLike {

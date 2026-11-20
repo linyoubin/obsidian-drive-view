@@ -37,10 +37,9 @@ import {
   describeSyncCancel,
   describeSyncProgressNotice,
   describeSyncResult,
-  planQuarkRibbonAction,
-  shouldForceRootPicker,
+  reduceQuarkFlow,
 } from "./ui/QuarkSettingsTab";
-import type { QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSettingsTab";
+import type { QuarkFlowEvent, QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSettingsTab";
 import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { normalizeVaultPath } from "./utils/pathUtils";
 
@@ -454,32 +453,48 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.updateQuarkStatusBar();
   }
 
-  /** ribbon 点击（A3/A4 的分支判定走纯函数，便于单测）。 */
+  /**
+   * ribbon 点击（0.2.2 顺序：**先扫码 → 再选根 → 自动同步**，状态机判定走纯函数）。
+   * 只有「已登录 + 已选根」才弹确认框；登录/选根刚补齐时不再打断用户。
+   */
   public async onQuarkRibbonClick(): Promise<void> {
-    // T-11 A2：从未选过库根 → 强制先选；取消则整条流程终止（不扫码、不同步）
-    if (shouldForceRootPicker(this.settings)) {
-      const chosen = await this.pickQuarkRoot();
-      if (!chosen) {
-        new Notice("夸克：需先选择知识库根目录（点左侧「同步夸克」图标）", 8000);
-        return;
-      }
-    }
+    await this.runQuarkFlow({ type: "click", snapshot: this.quarkSnapshot() });
+  }
 
-    if (planQuarkRibbonAction(this.quarkSnapshot()) === "login") {
-      await this.quarkOpenQrModal();
-      return;
-    }
-
-    // T-11 A3/A4：确认框三选一；点了「修改库根」就选新根，然后**回到确认框**，不自动开跑
+  /**
+   * 流程引擎：`reduceQuarkFlow` 决定下一步，这里只做 UI/IO。
+   * 取消任意一步都由状态机返回 `stop`（扫码取消不选根、选根取消不同步）。
+   */
+  private async runQuarkFlow(event: QuarkFlowEvent): Promise<void> {
+    let action = reduceQuarkFlow(event);
     for (;;) {
-      const choice = await this.confirmQuarkSync();
-      if (choice === "cancel") return;
-      if (choice === "change-root") {
-        await this.pickQuarkRoot();
-        continue;
+      switch (action.action) {
+        case "stop":
+          if (action.notice) new Notice(action.notice, 8000);
+          return;
+        case "sync":
+          await this.quarkSync(action.reason);
+          return;
+        case "login":
+          // 扫码弹窗自己管生命周期；登录成功后从 onDone 回灌 `{ type: "login" }` 继续走选根/同步
+          await this.quarkOpenQrModal();
+          return;
+        case "choose-root": {
+          const chosen = await this.pickQuarkRoot();
+          action = reduceQuarkFlow({ type: "root", ok: chosen });
+          break;
+        }
+        case "confirm": {
+          const choice = await this.confirmQuarkSync();
+          if (choice === "change-root") {
+            const chosen = await this.pickQuarkRoot();
+            action = reduceQuarkFlow({ type: "root", ok: chosen, returnToConfirm: true });
+          } else {
+            action = reduceQuarkFlow({ type: "confirm", choice });
+          }
+          break;
+        }
       }
-      await this.quarkSync("手动同步");
-      return;
     }
   }
 
@@ -503,8 +518,12 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         initialFid: this.settings.quarkRootFid || "0",
         initialPath: this.settings.quarkRootPath || "/",
         onChoose: async (fid, path) => {
-          finish(true);
-          await this.applyQuarkRoot(fid, path);
+          // 先落设置（改根时还会清旧索引），再 resolve —— 否则调用方会在库根还没生效时就开始同步
+          try {
+            await this.applyQuarkRoot(fid, path);
+          } finally {
+            finish(true);
+          }
         },
         onCancel: () => finish(false),
       });
@@ -523,7 +542,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.updateQuarkStatusBar();
     if (fid === previousFid && path === previousPath) return;
 
-    new Notice(`夸克：库根已切换到 ${describeRootPath(path)}，需重建索引（点「同步夸克」）`, 8000);
+    new Notice(`夸克：库根已切换到 ${describeRootPath(path)}，索引将重建`, 8000);
     if (this.quarkMounted) {
       await this.mounter.unmount(this.createQuarkMountFacade());
       this.quarkMounted = false;
@@ -552,20 +571,28 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     });
   }
 
-  /** 扫码弹窗（QuarkHost）。登录成功 → 自动继续同步（A3）。 */
+  /**
+   * 扫码弹窗（QuarkHost）。0.2.2 顺序：登录成功后**先看库根**（未选则弹选择器），
+   * 选定立即同步；已选根则直接同步；扫码取消/失败则整条流程终止（不选根、不同步）。
+   * 弹窗在登录成功时已自行关闭（A7），同步在后台继续。
+   */
   public async quarkOpenQrModal(): Promise<void> {
     const modal = new QuarkQrModal({
       app: this.app,
       createAuth: (onProgress: (progress: QuarkQrProgress) => void) =>
         new QuarkQrAuth({ client: this.quarkClient, onProgress }),
       onDone: async (result: QuarkQrLoginResult) => {
-        if (result.state !== "success") return;
-        await this.quarkCookieStore.save();
-        this.lastPersistedQuarkCookie = this.quarkCookieStore.getHeader();
-        this.updateQuarkStatusBar();
-        new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），开始同步索引…`, 4000);
-        // 不打断、不再确认：登录成功即连续同步（A3）
-        await this.quarkSync("登录后自动同步");
+        const ok = result.state === "success";
+        if (ok) {
+          await this.quarkCookieStore.save();
+          this.lastPersistedQuarkCookie = this.quarkCookieStore.getHeader();
+          this.updateQuarkStatusBar();
+          new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），继续…`, 4000);
+        }
+        await this.runQuarkFlow({ type: "login", ok, snapshot: this.quarkSnapshot() }).catch((error) => {
+          console.error("[Quark] flow after login failed:", error);
+          new Notice(`夸克同步失败：${error instanceof Error ? error.message : String(error)}`);
+        });
       },
     });
     modal.open();

@@ -199,18 +199,86 @@ describe("QuarkQrModal：倒计时与状态文案", () => {
 
 // ------------------------------------------------------------------ ribbon 分支
 
-describe("QuarkSettingsTab：ribbon 点击分支（A3/A4）", () => {
-  test("未登录 / 已过期 → 先扫码；已登录 → 先确认同步", () => {
-    expect(settingsTab.planQuarkRibbonAction(snapshot({ loginState: "none" }))).toBe("login");
-    expect(settingsTab.planQuarkRibbonAction(snapshot({ loginState: "expired" }))).toBe("login");
-    expect(settingsTab.planQuarkRibbonAction(snapshot({ loginState: "active" }))).toBe("sync");
-    // 已登录但未挂载 / 已挂载，都走确认同步
+// ------------------------------------------------------------------ 流程顺序（0.2.2）
+
+describe("点「同步夸克」的流程顺序（0.2.2：先扫码 → 再选根 → 自动同步）", () => {
+  test("① 未登录 + 未选根：点 → 扫码 → 选根 → 选定即同步", () => {
+    const none = snapshot({ loginState: "none", rootChosen: false });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: none })).toEqual({ action: "login" });
+    expect(settingsTab.reduceQuarkFlow({ type: "login", ok: true, snapshot: none })).toEqual({
+      action: "choose-root",
+    });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({
+      action: "sync",
+      reason: "首次同步",
+    });
+  });
+
+  test("② 未登录 + 已选根：扫码成功 → 直接同步（不弹确认框）", () => {
+    const chosen = snapshot({ loginState: "none", rootChosen: true });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: chosen })).toEqual({ action: "login" });
+    expect(settingsTab.reduceQuarkFlow({ type: "login", ok: true, snapshot: chosen })).toEqual({
+      action: "sync",
+      reason: "登录后自动同步",
+    });
+  });
+
+  test("③ 已登录 + 未选根：点 → 选根 → 选定即同步", () => {
+    const active = snapshot({ loginState: "active", rootChosen: false });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: active })).toEqual({
+      action: "choose-root",
+    });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({
+      action: "sync",
+      reason: "首次同步",
+    });
+  });
+
+  test("④ 已登录 + 已选根：点 → 确认框；选「现在同步」才跑、选「取消」就停", () => {
+    const ready = snapshot({ loginState: "active", rootChosen: true });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: ready })).toEqual({ action: "confirm" });
+    expect(settingsTab.reduceQuarkFlow({ type: "confirm", choice: "sync" })).toEqual({
+      action: "sync",
+      reason: "手动同步",
+    });
+    expect(settingsTab.reduceQuarkFlow({ type: "confirm", choice: "cancel" })).toEqual({
+      action: "stop",
+      notice: null,
+    });
+  });
+
+  test("⑤ 取消扫码：终止，不选根、不同步", () => {
+    const none = snapshot({ loginState: "none", rootChosen: false });
+    expect(settingsTab.reduceQuarkFlow({ type: "login", ok: false, snapshot: none })).toEqual({
+      action: "stop",
+      notice: null,
+    });
+  });
+
+  test("⑥ 取消选根：终止并提示需先选根（登录状态保留，不再扫码）", () => {
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: false })).toEqual({
+      action: "stop",
+      notice: "夸克：需先选择知识库根目录（点左侧「同步夸克」图标）",
+    });
+  });
+
+  test("补：确认框「修改库根」→ 选完回确认框（不直接开跑）；中途取消也终止", () => {
+    expect(settingsTab.reduceQuarkFlow({ type: "confirm", choice: "change-root" })).toEqual({
+      action: "choose-root",
+    });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true, returnToConfirm: true })).toEqual({
+      action: "confirm",
+    });
     expect(
-      settingsTab.planQuarkRibbonAction(snapshot({ loginState: "active", mounted: false }))
-    ).toBe("sync");
-    expect(settingsTab.planQuarkRibbonAction(snapshot({ loginState: "active", mounted: true }))).toBe(
-      "sync"
-    );
+      settingsTab.reduceQuarkFlow({ type: "root", ok: false, returnToConfirm: true }).action
+    ).toBe("stop");
+  });
+
+  test("登录已过期（expired）按未登录处理：先扫码，不看库根", () => {
+    const expired = snapshot({ loginState: "expired", rootChosen: true });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: expired })).toEqual({
+      action: "login",
+    });
   });
 });
 
@@ -340,11 +408,15 @@ describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
     expect(new Set([none, loggedIn, mounted]).size).toBe(3);
   });
 
-  test("库根是否选过不影响 ribbon 的登录/同步分支（A5 只决定先弹选择器）", () => {
+  test("库根是否选过决定点 ribbon 后是选根还是确认框（0.2.2 顺序）", () => {
     const notChosen = snapshot({ loginState: "active", rootChosen: false });
     const chosen = snapshot({ loginState: "active", rootChosen: true });
-    expect(settingsTab.planQuarkRibbonAction(notChosen)).toBe("sync");
-    expect(settingsTab.planQuarkRibbonAction(chosen)).toBe("sync");
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: notChosen })).toEqual({
+      action: "choose-root",
+    });
+    expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: chosen })).toEqual({
+      action: "confirm",
+    });
     expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootChosen).toBe(false);
     expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootPath).toBe("/");
   });
