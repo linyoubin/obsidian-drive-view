@@ -237,7 +237,7 @@ export interface QuarkClientOptions {
   userAgent?: string;
   /** 下载并发闸门（默认内部新建；单测可注入以观察并发峰值）。 */
   gate?: DownloadGate;
-  /** 下载并发上限，默认 2（1–3 由设置页暴露）。 */
+  /** 下载并发上限，默认 4（1–6 由设置页暴露）。 */
   downloadConcurrency?: number;
   /** 401 熔断冷却时长，默认 60s。 */
   authCooldownMs?: number;

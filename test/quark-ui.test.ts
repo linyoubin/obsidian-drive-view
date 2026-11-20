@@ -413,14 +413,14 @@ describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
     const synced = settingsTab.describeRibbonTooltip(
       snapshot({ loginState: "active", indexCount: 128, builtAt })
     );
-    expect(none).toBe("Quark Vault · 未登录");
-    expect(loggedIn).toBe("Quark Vault · 已登录");
-    expect(syncing).toBe("Quark Vault · 同步中 29% · /技术");
-    expect(synced).toBe("Quark Vault · 已同步（索引 2026-11-20 15:40 · 128 条）");
+    expect(none).toBe("同步夸克 · 未登录");
+    expect(loggedIn).toBe("同步夸克 · 已登录");
+    expect(syncing).toBe("同步夸克 · 同步中 29% · /技术");
+    expect(synced).toBe("同步夸克 · 已同步（索引 2026-11-20 15:40 · 128 条）");
     expect(new Set([none, loggedIn, syncing, synced]).size).toBe(4);
     // 登录已过期：不误报「未登录」，提示要重新扫码
     expect(settingsTab.describeRibbonTooltip(snapshot({ loginState: "expired" }))).toBe(
-      "Quark Vault · 已登录（过期）"
+      "同步夸克 · 已登录（过期）"
     );
   });
 
@@ -476,7 +476,7 @@ describe("同步进度：百分比与文案（T-11 addendum）", () => {
     const syncing = settingsTab.describeRibbonTooltip(
       snapshot({ loginState: "active", indexing: true, scannedFolders: 12, pendingFolders: 30, currentFolder: "/技术" })
     );
-    expect(syncing).toBe("Quark Vault · 同步中 29% · /技术");
+    expect(syncing).toBe("同步夸克 · 同步中 29% · /技术");
     const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
     const idle = settingsTab.describeRibbonTooltip(
       snapshot({ loginState: "active", indexCount: 15, builtAt })
@@ -527,31 +527,76 @@ describe("同步进度：百分比与文案（T-11 addendum）", () => {
     expect(text).toBe("已同步 0 条 · 新增 0 · 变更 0 · 删除 0 · 耗时 0.4s");
   });
 });
-// ------------------------------------------------------------------ ribbon 图标与设置页标题（0.2.5 A6/A7）
+// ------------------------------------------------------------------ ribbon 固定图标 + 后缀文字（0.2.5 A6′/A7）
 
-describe("ribbon 图标四态与设置页标题（0.2.5）", () => {
-  test("图标随状态切换：未登录 / 已登录未挂载 / 已挂载待命 / 同步中 各不相同", () => {
-    const icons = [
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "none" })),
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: false })),
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true })),
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: true })),
+describe("ribbon 固定图标与五态后缀文字（0.2.5 A6′）", () => {
+  test("五态 title 互不相同，且都以「同步夸克 ·」开头", () => {
+    const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
+    const texts = [
+      settingsTab.describeRibbonTooltip(snapshot({ loginState: "none" })),
+      settingsTab.describeRibbonTooltip(snapshot({ loginState: "active", indexCount: 0 })),
+      settingsTab.describeRibbonTooltip(
+        snapshot({
+          loginState: "active",
+          indexing: true,
+          scannedFolders: 12,
+          pendingFolders: 30,
+          currentFolder: "/技术",
+        })
+      ),
+      settingsTab.describeRibbonTooltip(snapshot({ loginState: "active", indexCount: 128, builtAt })),
+      settingsTab.describeRibbonTooltip(snapshot({ loginState: "expired" })),
     ];
-    expect(icons).toEqual(["log-in", "cloud", "refresh-cw", "loader"]);
-    expect(new Set(icons).size).toBe(4);
+    expect(texts).toEqual([
+      "同步夸克 · 未登录",
+      "同步夸克 · 已登录",
+      "同步夸克 · 同步中 29% · /技术",
+      "同步夸克 · 已同步（索引 2026-11-20 15:40 · 128 条）",
+      "同步夸克 · 已登录（过期）",
+    ]);
+    expect(new Set(texts).size).toBe(5);
+    for (const text of texts) expect(text.startsWith("同步夸克 · ")).toBe(true);
   });
 
-  test("登录过期显示 log-in（提示重新扫码）", () => {
-    expect(settingsTab.describeRibbonIcon(snapshot({ loginState: "expired" }))).toBe("log-in");
-  });
+  test("图标恒为 refresh-cw：初始化 setIcon 只调 1 次，之后刷 title 不再调 setIcon", () => {
+    const attrs: Record<string, string> = {};
+    const el = {
+      setAttr: (name: string, value: string) => {
+        attrs[name] = value;
+      },
+    } as unknown as HTMLElement;
+    const icons: string[] = [];
+    let setIconCalls = 0;
+    const host = {
+      addRibbonIcon: (icon: string) => {
+        icons.push(icon);
+        return el;
+      },
+      setIcon: (_element: HTMLElement, icon: string) => {
+        setIconCalls += 1;
+        icons.push(icon);
+      },
+    };
 
-  test("同步中优先 loader；结束后回到 refresh-cw", () => {
-    expect(
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: true }))
-    ).toBe("loader");
-    expect(
-      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: false }))
-    ).toBe("refresh-cw");
+    const created = settingsTab.initQuarkRibbon({
+      host,
+      snapshot: snapshot({ loginState: "none" }),
+      onClick: () => undefined,
+    });
+    expect(created.setIconCalls).toBe(1);
+    expect(icons).toEqual(["refresh-cw", "refresh-cw"]);
+
+    // 后续状态变化只改 title，不再碰图标
+    for (const state of [
+      { loginState: "active" as const },
+      { loginState: "active" as const, mounted: true, indexing: true, scannedFolders: 3, pendingFolders: 7 },
+      { loginState: "expired" as const },
+    ]) {
+      settingsTab.applyQuarkRibbonTitle(el, snapshot(state));
+    }
+    expect(setIconCalls).toBe(1);
+    expect(icons.every((icon) => icon === "refresh-cw")).toBe(true);
+    expect(attrs.title).toContain("同步夸克 · ");
   });
 
   test("设置页标题：只有 Quark 设置页含 Quark Vault，Google Drive 页恢复 Drive View", async () => {

@@ -178,7 +178,7 @@ export interface QuarkSettings {
    */
   quarkLastIndexBuiltAt: number;
   /**
-   * 下载并发上限（1–3，默认 2；真机并发风暴后加，0.2.4）。
+   * 下载并发上限（1–6，默认 4；超过即排队等待）。
    */
   quarkDownloadConcurrency: number;
   /**
@@ -193,7 +193,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkRootPath: "/",
   quarkRootChosenAt: 0,
   quarkLastIndexBuiltAt: 0,
-  quarkDownloadConcurrency: 2,
+  quarkDownloadConcurrency: 4,
   quarkMaxFileBytes: 50 * 1024 * 1024,
 };
 

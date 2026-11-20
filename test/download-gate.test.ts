@@ -121,14 +121,32 @@ describe("DownloadGate：并发上限与排队（A2）", () => {
     expect(gate.active).toBe(0);
   });
 
-  test("setConcurrency：clamp 与「调小后不再多开」", async () => {
+  test("setConcurrency：clamp（默认 4，范围 1–6）与「调小后不再多开」", async () => {
     expect(normalizeGateConcurrency(0)).toBe(1);
-    expect(normalizeGateConcurrency(9)).toBe(8);
-    expect(normalizeGateConcurrency(undefined)).toBe(2);
+    expect(normalizeGateConcurrency(9)).toBe(6);
+    expect(normalizeGateConcurrency(undefined)).toBe(4);
     expect(normalizeGateConcurrency(2.6)).toBe(2);
     const gate = new DownloadGate({ concurrency: 3 });
     expect(gate.setConcurrency(1)).toBe(1);
-    expect(gate.setConcurrency(2)).toBe(2);
+    expect(gate.setConcurrency(6)).toBe(6);
+  });
+
+  test("20 个任务、配置 4 → 并发峰值 ≤4（A6′/A2 口径）", async () => {
+    const gate = new DownloadGate({ concurrency: 4 });
+    let running = 0;
+    let observedPeak = 0;
+    const tasks = Array.from({ length: 20 }, () =>
+      gate.run(async () => {
+        running += 1;
+        observedPeak = Math.max(observedPeak, running);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        running -= 1;
+      })
+    );
+    await Promise.all(tasks);
+    expect(observedPeak).toBeLessThanOrEqual(4);
+    expect(gate.peak).toBeLessThanOrEqual(4);
+    expect(gate.peak).toBe(4);
   });
 
   test("任务异常不泄漏并发槽：失败后下一个仍能跑", async () => {

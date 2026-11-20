@@ -29,7 +29,7 @@ export interface QuarkUiSnapshot {
   pendingFolders: number;
   /** 正在扫描的目录（库内路径，根为 `/`）；空闲时为空串。 */
   currentFolder: string;
-  /** 下载并发上限（0.2.4，默认 2，可调 1–3）。 */
+  /** 下载并发上限（0.2.5，默认 4，可调 1–6）。 */
   downloadConcurrency: number;
   /** 大文件提醒阈值（字节，0 = 不提醒；仅提示不拦截）。 */
   maxFileBytes: number;
@@ -44,7 +44,7 @@ export interface QuarkHost {
   quarkExitReadOnly(): Promise<void>;
   /** 0.2.3 A7：最近 200 行诊断日志复制到剪贴板。 */
   quarkExportDiagnostics(): Promise<void>;
-  /** 0.2.4：下载并发（1–3，改完立即生效）。 */
+  /** 0.2.5：下载并发（1–6，默认 4，改完立即生效）。 */
   quarkSetDownloadConcurrency(value: number): Promise<void>;
   /** 0.2.4：大文件提醒阈值（MB，仅提示不拦截）。 */
   quarkSetMaxFileMb(mb: number): Promise<void>;
@@ -66,7 +66,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   scannedFolders: 0,
   pendingFolders: 0,
   currentFolder: "",
-  downloadConcurrency: 2,
+  downloadConcurrency: 4,
   maxFileBytes: 50 * 1024 * 1024,
 };
 
@@ -200,43 +200,66 @@ export function describeSyncResult(
 }
 
 /**
- * ribbon tooltip 四态（0.2.3 A4，手机端看不到状态栏，全靠这个 title）：
- *   - 未登录：`Quark Vault · 未登录`
- *   - 已登录：`Quark Vault · 已登录`
- *   - 同步中：`Quark Vault · 同步中 29% · /技术`
- *   - 已同步：`Quark Vault · 已同步（索引 15:40 · 128 条）`
- * 登录已过期显示「已登录（过期）」，提示需要重新扫码。
+ * ribbon 的 title（0.2.5 A6′）：图标固定 `refresh-cw`，**状态只用后缀文字表达**。
+ *   - 未登录：`同步夸克 · 未登录`
+ *   - 已登录：`同步夸克 · 已登录`
+ *   - 同步中：`同步夸克 · 同步中 29% · /技术`
+ *   - 已同步：`同步夸克 · 已同步（索引 15:40 · 128 条）`
+ *   - 登录过期：`同步夸克 · 已登录（过期）`
  */
 export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
   if (snapshot.indexing) {
     const current = snapshot.currentFolder && snapshot.currentFolder !== "" ? snapshot.currentFolder : "/";
-    return `Quark Vault · 同步中 ${estimateScanPercent(
+    return `同步夸克 · 同步中 ${estimateScanPercent(
       snapshot.scannedFolders,
       snapshot.pendingFolders
     )}% · ${current}`;
   }
   if (snapshot.loginState === "active") {
     if (snapshot.indexCount > 0) {
-      return `Quark Vault · 已同步（索引 ${formatBuiltAt(snapshot.builtAt)} · ${snapshot.indexCount} 条）`;
+      return `同步夸克 · 已同步（索引 ${formatBuiltAt(snapshot.builtAt)} · ${snapshot.indexCount} 条）`;
     }
-    return "Quark Vault · 已登录";
+    return "同步夸克 · 已登录";
   }
-  if (snapshot.loginState === "expired") return "Quark Vault · 已登录（过期）";
-  return "Quark Vault · 未登录";
+  if (snapshot.loginState === "expired") return "同步夸克 · 已登录（过期）";
+  return "同步夸克 · 未登录";
+}
+
+/** ribbon 图标固定值（0.2.5 A6′：任何状态都不换图标）。 */
+export const QUARK_RIBBON_ICON = "refresh-cw";
+
+/** ribbon 相关的最小宿主（obsidian 的 `addRibbonIcon` / `setIcon` 形状）。 */
+export interface QuarkRibbonHost {
+  addRibbonIcon(icon: string, title: string, callback: (event: MouseEvent) => unknown): HTMLElement;
+  setIcon?(el: HTMLElement, icon: string): void;
 }
 
 /**
- * ribbon 图标四态（0.2.5 A6）：图标本身随状态变化，不重建 ribbon。
- *   - 未登录 / 登录过期 → `log-in`
- *   - 已登录未挂载 → `cloud`
- *   - 已挂载待命 → `refresh-cw`
- *   - 同步中 → `loader`（旋转类），结束后回到 `refresh-cw`
+ * 初始化 ribbon（0.2.5 A6′）：
+ *   - 图标**只在这里**设置一次（`setIcon` 调用次数恒为 1），之后任何状态都不换；
+ *   - 之后只改 `title`（后缀文字），见 `applyQuarkRibbonTitle`。
  */
-export function describeRibbonIcon(snapshot: QuarkUiSnapshot): "log-in" | "cloud" | "refresh-cw" | "loader" {
-  if (snapshot.indexing) return "loader";
-  if (snapshot.loginState !== "active") return "log-in";
-  if (!snapshot.mounted) return "cloud";
-  return "refresh-cw";
+export function initQuarkRibbon(options: {
+  host: QuarkRibbonHost;
+  snapshot: QuarkUiSnapshot;
+  onClick: () => void;
+}): { el: HTMLElement; setIconCalls: number } {
+  const el = options.host.addRibbonIcon(
+    QUARK_RIBBON_ICON,
+    describeRibbonTooltip(options.snapshot),
+    options.onClick
+  );
+  let setIconCalls = 0;
+  if (typeof options.host.setIcon === "function") {
+    options.host.setIcon(el, QUARK_RIBBON_ICON);
+    setIconCalls = 1;
+  }
+  return { el, setIconCalls };
+}
+
+/** 之后每次只刷新 title（不碰图标、不重建 ribbon）。 */
+export function applyQuarkRibbonTitle(el: HTMLElement, snapshot: QuarkUiSnapshot): void {
+  el.setAttr("title", describeRibbonTooltip(snapshot));
 }
 
 /**
@@ -389,13 +412,13 @@ export class QuarkSettingsTab extends settingTabBase() {
       .setName("索引状态")
       .setDesc(describeIndexState(snapshot));
 
-    // 0.2.4 A8：下载并发（1–3，默认 2）
+    // 0.2.5 A8：下载并发（1–6，默认 4）
     new Setting(container)
-      .setName("下载并发（1–3，默认 2）")
-      .setDesc(`当前 ${snapshot.downloadConcurrency} 路同时下载；手机端通道脆弱，建议 ≤2`)
+      .setName("下载并发（1–6，默认 4）")
+      .setDesc(`当前 ${snapshot.downloadConcurrency} 路同时下载；超过后其余排队等待（FIFO）`)
       .addText((text: any) =>
         text
-          .setPlaceholder("2")
+          .setPlaceholder("4")
           .setValue(String(snapshot.downloadConcurrency))
           .onChange(async (value: string) => {
             const parsed = Number.parseInt(String(value), 10);

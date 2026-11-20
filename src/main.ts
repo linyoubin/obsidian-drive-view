@@ -31,7 +31,8 @@ import {
   QuarkSettingsTab,
   describeCacheState,
   describeIndexState,
-  describeRibbonIcon,
+  applyQuarkRibbonTitle,
+  initQuarkRibbon,
   describeRibbonTooltip,
   describeRootPath,
   describeRootState,
@@ -149,6 +150,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkDiag: DiagLogger | null = null;
   private quarkSettingsTab: QuarkSettingsTab | null = null;
   private lastQuarkLoginState: QuarkUiSnapshot["loginState"] | null = null;
+  private lastRibbonTitleAt = 0;
   private quarkDownloadBook: DownloadNoticeBook | null = null;
   private quarkAuthExpired = false;
   private lastSettingsRefreshAt = 0;
@@ -490,14 +492,26 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.refreshQuarkUi();
 
     // 唯一交互入口：左侧 ribbon（title 四态，手机端靠它看状态；每次状态变化刷新）
-    this.quarkRibbonEl = this.addRibbonIcon(describeRibbonIcon(this.quarkSnapshot()), describeRibbonTooltip(this.quarkSnapshot()), () => {
-      void this.onQuarkRibbonClick().catch((error) => {
-        console.error("[Quark] ribbon action failed:", error);
-        new Notice(
-          `夸克同步失败：${error instanceof Error ? error.message : String(error)}\n详情见 ${DIAG_LOG_PATH}`
-        );
-      });
-    });
+    // 0.2.5 A6′：图标固定 refresh-cw，只在初始化 setIcon 一次；状态全靠 title 后缀文字
+    this.quarkRibbonEl = initQuarkRibbon({
+      host: {
+        addRibbonIcon: (icon, title, callback) => this.addRibbonIcon(icon, title, callback),
+        setIcon: (el, icon) => {
+          const setIconFn = (obsidianRuntime as unknown as { setIcon?: (element: HTMLElement, name: string) => void })
+            .setIcon;
+          if (typeof setIconFn === "function") setIconFn(el, icon);
+        },
+      },
+      snapshot: this.quarkSnapshot(),
+      onClick: () => {
+        void this.onQuarkRibbonClick().catch((error) => {
+          console.error("[Quark] ribbon action failed:", error);
+          new Notice(
+            `夸克同步失败：${error instanceof Error ? error.message : String(error)}\n详情见 ${DIAG_LOG_PATH}`
+          );
+        });
+      },
+    }).el;
 
     this.updateQuarkRibbonTooltip();
 
@@ -706,8 +720,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkScanSignal = { aborted: false };
     this.quarkProgress = { scanned: 0, pending: 0, current: "/" };
     const startedAt = Date.now();
-    // 变化点②同步开始：统一刷新（ribbon title / 状态栏 / 设置页）
-    this.refreshQuarkUi();
+    // 变化点②同步开始：统一刷新（ribbon title 立即刷一次 / 状态栏 / 设置页）
+    this.refreshQuarkUi(true);
     // 0.2.3 A2：同步进度走模块级单例 Notice —— 只 new 一次，之后每扫完一个目录 setMessage
     showQuarkSyncNotice(describeSyncProgressNotice(this.settings.quarkRootPath, 0, 0, "/"));
 
@@ -768,7 +782,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     } finally {
       this.quarkIndexing = false;
       this.quarkScanSignal = null;
-      this.refreshQuarkUi();
+      // 变化点③同步结束：title 立即刷新（从「同步中」回到「已同步」）
+      this.refreshQuarkUi(true);
     }
   }
 
@@ -907,10 +922,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.refreshQuarkUi();
   }
 
-  /** 设置页：下载并发（1–3）改完立即生效。 */
+  /** 设置页：下载并发（1–6，默认 4）改完立即生效。 */
   public async quarkSetDownloadConcurrency(value: number): Promise<void> {
-    const numeric = Number.isFinite(value) ? Math.round(value) : 2;
-    const concurrency = Math.min(3, Math.max(1, numeric));
+    const numeric = Number.isFinite(value) ? Math.round(value) : 4;
+    const concurrency = Math.min(6, Math.max(1, numeric));
     await this.updateSettings({ quarkDownloadConcurrency: concurrency });
     this.quarkClient?.setDownloadConcurrency(concurrency);
     this.refreshQuarkUi();
@@ -925,26 +940,22 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   }
 
   /**
-   * ribbon 图标 + title 一起刷新（0.2.5 A6）：图标随四态切换，不重建 ribbon。
-   * `setIcon` 从运行期取（obsidian.d.ts 未声明），移动端缺失时只退化为 title 变化。
+   * 只刷新 ribbon 的 title（0.2.5 A6′：图标固定，不换）。
+   * 同步中每次进度回调都会走到这里，按 ≥300ms 节流；`force=true`（同步开始/结束）立即刷新。
    */
-  private updateQuarkRibbonTooltip(): void {
+  private updateQuarkRibbonTooltip(force = false): void {
     if (!this.quarkRibbonEl) return;
-    const snapshot = this.quarkSnapshot();
-    try {
-      const setIconFn = (obsidianRuntime as unknown as { setIcon?: (el: HTMLElement, icon: string) => void }).setIcon;
-      if (typeof setIconFn === "function") setIconFn(this.quarkRibbonEl, describeRibbonIcon(snapshot));
-    } catch (error) {
-      console.warn("[Quark] setIcon failed:", error);
-    }
-    this.quarkRibbonEl.setAttr("title", describeRibbonTooltip(snapshot));
+    const now = Date.now();
+    if (!force && now - this.lastRibbonTitleAt < 300) return;
+    this.lastRibbonTitleAt = now;
+    applyQuarkRibbonTitle(this.quarkRibbonEl, this.quarkSnapshot());
   }
 
   /**
    * 统一状态刷新点（0.2.3 A3）：一次更新 ribbon title + 状态栏 + 设置页（节流 1 秒）。
    * 六个变化点都调它：登录成功、同步开始、同步结束、挂载完成、卸载、cookie 过期。
    */
-  private refreshQuarkUi(): void {
+  private refreshQuarkUi(force = false): void {
     if (!this.quarkIndex || !this.quarkCache) return;
     const snapshot = this.quarkSnapshot();
     // 第六个变化点：cookie 过期（登录态从 active 掉到 expired 时提示一次）
@@ -963,7 +974,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         )}`
       );
     }
-    this.updateQuarkRibbonTooltip();
+    this.updateQuarkRibbonTooltip(force);
     this.refreshQuarkSettingsTab();
   }
 

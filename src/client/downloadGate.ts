@@ -6,7 +6,7 @@
  *
  * 本模块只做「排队 + 并发上限 + 401 短路」，不含任何网络/存储逻辑，便于单测：
  *   - FIFO；可选 `high` 优先级插队（同优先级仍 FIFO）；
- *   - 并发峰值可观测（`peak`），默认 2，可 1–3 配置；
+ *   - 并发峰值可观测（`peak`），默认 4，可 1–6 配置；
  *   - 401 熔断：`failAuth()` 立即清空队列（排队任务以 `auth-expired` 拒绝）、
  *     并在冷却期内直接拒绝新任务（不再发请求）；重新扫码后 `resetAuth()` 恢复。
  */
@@ -24,7 +24,7 @@ export interface GateRunOptions {
 }
 
 export interface DownloadGateOptions {
-  /** 并发上限，默认 2。 */
+  /** 并发上限，默认 4（范围 1–6）。 */
   concurrency?: number;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
@@ -56,8 +56,8 @@ interface PendingTask<T = unknown> {
 // 队列元素类型放宽：run<T> 里的 PendingTask<T> 与内部 push 的 PendingTask 需要兼容
 type QueuedTask = PendingTask<any>;
 
-/** 默认并发上限：2（手机端通道很脆，别超过 2 路同时下载）。 */
-export const DEFAULT_DOWNLOAD_CONCURRENCY = 2;
+/** 默认并发上限：4（用户口径「超过 4 个就等待」）。 */
+export const DEFAULT_DOWNLOAD_CONCURRENCY = 4;
 /** 401 后的默认冷却：60 秒（期间不再发任何下载请求）。 */
 export const DEFAULT_AUTH_COOLDOWN_MS = 60_000;
 
@@ -100,7 +100,7 @@ export class DownloadGate {
     return this.startedCount;
   }
 
-  /** 调整并发上限（1–3 生效范围由设置页保证；这里只做下限/上限保护）。 */
+  /** 调整并发上限（1–6 由设置页保证；这里只做下限/上限保护）。 */
   setConcurrency(value: number): number {
     this.concurrencyValue = normalizeGateConcurrency(value);
     this.pump();
@@ -219,8 +219,8 @@ export class DownloadGate {
   }
 }
 
-/** 并发上限归一：1–8（设置页只暴露 1–3，这里防御更宽的值）。 */
+/** 并发上限归一：1–6（设置页暴露 1–6，这里防御越界值）。 */
 export function normalizeGateConcurrency(value: number | undefined): number {
   const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : DEFAULT_DOWNLOAD_CONCURRENCY;
-  return Math.min(8, Math.max(1, numeric));
+  return Math.min(6, Math.max(1, numeric));
 }
