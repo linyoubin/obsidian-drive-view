@@ -1,0 +1,306 @@
+/**
+ * QuarkReadOnlyAdapter —— 把夸克网盘当 Obsidian 库的只读 DataAdapter（v3 §3）。
+ *
+ * 19 个方法一个不少（`implements DataAdapter`，少一个 TS 就报）：
+ *   - 读 5：`exists` / `stat` / `list` / `read` / `readBinary`
+ *   - 同步 2：`getName()` → `"quark-readonly"`；`getResourcePath()` → blob URL 或 `""`
+ *   - 抛错 12：`write` / `writeBinary` / `append` / `appendBinary` / `process` /
+ *              `mkdir` / `trashSystem` / `trashLocal` / `rmdir` / `remove` / `rename` / `copy`
+ *
+ * 行为约束：
+ *   - `exists`/`stat`/`list` **只查索引**，一次网络请求都不发（v3 §8 A2：有快照冷启动 0 请求）；
+ *   - `list` 非递归，实现为「按父路径取直接子项」；
+ *   - `read`/`readBinary` 先查内存缓存，未命中才 `client.downloadFile(fid)` 并写回缓存；
+ *   - `getResourcePath` 是同步方法：命中给 blob URL，未命中返回 `""` 并把路径塞进预取队列
+ *     （v3 §3 第 12 条：同步接口不能等网络）；
+ *   - `.obsidian/**` 与插件自身目录：读写**都**转发给注入的 `baseAdapter`，既不抛错也不查索引
+ *     （否则配置、主题、workspace 都会写失败，v3 §3 全局例外）。
+ *
+ * 只使用注入的 `index` / `cache` / `client`，不直接 import 它们的实现，也不发网络。
+ */
+
+import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from "obsidian";
+
+import type { IndexEntry } from "../store/IndexStore";
+import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
+import { ReadOnlyError } from "./readonlyError";
+
+/** 本 adapter 的固定名字（`getName()` 返回值）。 */
+export const QUARK_ADAPTER_NAME = "quark-readonly";
+/** 默认配置目录。 */
+export const DEFAULT_CONFIG_DIR = ".obsidian";
+/** 默认插件目录（配置目录内的子集，转发规则与配置目录相同）。 */
+export const DEFAULT_PLUGIN_DIR = ".obsidian/plugins/quark-vault";
+
+/** 只读所需的索引读口：`IndexStore.entries` 就是这个形状（getter 也行）。 */
+export interface QuarkIndexReader {
+  readonly entries: IndexEntry[];
+  readonly entryCount?: number;
+}
+
+/** 内容缓存的最小接口（`ContentCache` 结构上满足）。 */
+export interface QuarkCacheLike {
+  has(path: string): boolean;
+  get(path: string): ArrayBuffer | null;
+  getResourceUrl(path: string): string;
+  put(
+    path: string,
+    data: ArrayBuffer | Uint8Array,
+    meta?: { fid?: string; mtime?: number }
+  ): { cached: boolean };
+  enqueuePrefetch(items: Array<{ path: string; size?: number }>): unknown;
+}
+
+/** 下载器的最小接口（`QuarkClient` 结构上满足）。 */
+export interface QuarkDownloadClient {
+  downloadFile(fid: string): Promise<ArrayBuffer>;
+}
+
+export interface QuarkReadOnlyAdapterOptions {
+  index: QuarkIndexReader;
+  cache: QuarkCacheLike;
+  client: QuarkDownloadClient;
+  /** 原生 adapter（桌面 `FileSystemAdapter` / 手机 `CapacitorAdapter`），用于配置目录转发。 */
+  baseAdapter: DataAdapter;
+  /** 配置目录，默认 `.obsidian`。 */
+  configDir?: string;
+  /** 本插件目录，默认 `.obsidian/plugins/quark-vault`。 */
+  pluginDir?: string;
+}
+
+/** 索引里查不到该路径（不是只读错误，是「库里有快照但不含此文件」）。 */
+export class QuarkEntryNotFoundError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`索引中没有该路径：${path || "根目录"}`);
+    this.name = "QuarkEntryNotFoundError";
+    this.path = path;
+  }
+}
+
+function isDirectoryLike(entry: IndexEntry): boolean {
+  return entry.type === "folder";
+}
+
+export class QuarkReadOnlyAdapter implements DataAdapter {
+  private readonly index: QuarkIndexReader;
+  private readonly cache: QuarkCacheLike;
+  private readonly client: QuarkDownloadClient;
+  private readonly baseAdapter: DataAdapter;
+  private readonly configDir: string;
+  private readonly pluginDir: string;
+
+  constructor(options: QuarkReadOnlyAdapterOptions) {
+    if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
+      throw new Error("QuarkReadOnlyAdapter 需要注入 { index, cache, client, baseAdapter }");
+    }
+    this.index = options.index;
+    this.cache = options.cache;
+    this.client = options.client;
+    this.baseAdapter = options.baseAdapter;
+    this.configDir = normalizeVaultPath(options.configDir ?? DEFAULT_CONFIG_DIR);
+    this.pluginDir = normalizeVaultPath(options.pluginDir ?? DEFAULT_PLUGIN_DIR);
+  }
+
+  // ---------------------------------------------------------------- 同步 2
+
+  getName(): string {
+    return QUARK_ADAPTER_NAME;
+  }
+
+  /** 命中缓存 → 该条目的 blob URL；未命中 → `""` 并排队预取（同步，绝不返回 Promise）。 */
+  getResourcePath(normalizedPath: string): string {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.getResourcePath(normalizedPath);
+    }
+    const clean = normalizeVaultPath(normalizedPath);
+    const url = this.cache.getResourceUrl(clean);
+    if (url) return url;
+    if (clean) {
+      const entry = this.findEntry(clean);
+      this.cache.enqueuePrefetch([{ path: clean, size: entry ? entry.size : undefined }]);
+    }
+    return "";
+  }
+
+  // ---------------------------------------------------------------- 读 5
+
+  async exists(normalizedPath: string, sensitive?: boolean): Promise<boolean> {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.exists(normalizedPath, sensitive);
+    }
+    const clean = normalizeVaultPath(normalizedPath);
+    if (clean === "") return true;
+    if (this.findEntry(clean)) return true;
+    if (sensitive === false) {
+      const lower = clean.toLowerCase();
+      return this.index.entries.some((entry) => entry.path.toLowerCase() === lower);
+    }
+    return false;
+  }
+
+  async stat(normalizedPath: string): Promise<Stat | null> {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.stat(normalizedPath);
+    }
+    const clean = normalizeVaultPath(normalizedPath);
+    if (clean === "") {
+      // 根目录不在索引里，按「全库最新 mtime」造一个；没有条目就用 0
+      let mtime = 0;
+      for (const entry of this.index.entries) {
+        if (entry.mtime > mtime) mtime = entry.mtime;
+      }
+      return { type: "folder", ctime: mtime, mtime, size: 0 };
+    }
+    const entry = this.findEntry(clean);
+    if (!entry) return null;
+    // 索引里没有 ctime（夸克只给 updated_at），ctime 取 mtime 兜底
+    return { type: entry.type, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
+  }
+
+  /** 非递归：只返回直接子项（完整库内路径，与 Obsidian 约定一致）。 */
+  async list(normalizedPath: string): Promise<ListedFiles> {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.list(normalizedPath);
+    }
+    const clean = normalizeVaultPath(normalizedPath);
+    const files: string[] = [];
+    const folders: string[] = [];
+    for (const entry of this.index.entries) {
+      if (getParentPath(entry.path) !== clean) continue;
+      if (isDirectoryLike(entry)) folders.push(entry.path);
+      else files.push(entry.path);
+    }
+    files.sort((a, b) => a.localeCompare(b));
+    folders.sort((a, b) => a.localeCompare(b));
+    return { files, folders };
+  }
+
+  async read(normalizedPath: string): Promise<string> {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.read(normalizedPath);
+    }
+    const buffer = await this.loadBinary(normalizedPath);
+    return arrayBufferToString(buffer);
+  }
+
+  async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
+    if (this.shouldForward(normalizedPath)) {
+      return this.baseAdapter.readBinary(normalizedPath);
+    }
+    return await this.loadBinary(normalizedPath);
+  }
+
+  // ---------------------------------------------------------------- 抛错 12
+
+  async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.write(normalizedPath, data, options);
+    throw new ReadOnlyError("write", normalizeVaultPath(normalizedPath));
+  }
+
+  async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+    if (this.shouldForward(normalizedPath)) {
+      return await this.baseAdapter.writeBinary(normalizedPath, data, options);
+    }
+    throw new ReadOnlyError("writeBinary", normalizeVaultPath(normalizedPath));
+  }
+
+  async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.append(normalizedPath, data, options);
+    throw new ReadOnlyError("append", normalizeVaultPath(normalizedPath));
+  }
+
+  async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+    if (this.shouldForward(normalizedPath)) {
+      return await this.baseAdapter.appendBinary(normalizedPath, data, options);
+    }
+    throw new ReadOnlyError("appendBinary", normalizeVaultPath(normalizedPath));
+  }
+
+  async process(
+    normalizedPath: string,
+    fn: (data: string) => string,
+    options?: DataWriteOptions
+  ): Promise<string> {
+    if (this.shouldForward(normalizedPath)) {
+      return await this.baseAdapter.process(normalizedPath, fn, options);
+    }
+    throw new ReadOnlyError("process", normalizeVaultPath(normalizedPath));
+  }
+
+  async mkdir(normalizedPath: string): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.mkdir(normalizedPath);
+    throw new ReadOnlyError("mkdir", normalizeVaultPath(normalizedPath));
+  }
+
+  /** 注意：抛错而不是 `return false`——否则上层会误判「已删除」。 */
+  async trashSystem(normalizedPath: string): Promise<boolean> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashSystem(normalizedPath);
+    throw new ReadOnlyError("trashSystem", normalizeVaultPath(normalizedPath));
+  }
+
+  async trashLocal(normalizedPath: string): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashLocal(normalizedPath);
+    throw new ReadOnlyError("trashLocal", normalizeVaultPath(normalizedPath));
+  }
+
+  async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.rmdir(normalizedPath, recursive);
+    throw new ReadOnlyError("rmdir", normalizeVaultPath(normalizedPath));
+  }
+
+  async remove(normalizedPath: string): Promise<void> {
+    if (this.shouldForward(normalizedPath)) return await this.baseAdapter.remove(normalizedPath);
+    throw new ReadOnlyError("remove", normalizeVaultPath(normalizedPath));
+  }
+
+  async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
+    if (this.shouldForward(normalizedPath)) {
+      return await this.baseAdapter.rename(normalizedPath, normalizedNewPath);
+    }
+    throw new ReadOnlyError("rename", normalizeVaultPath(normalizedPath));
+  }
+
+  async copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
+    if (this.shouldForward(normalizedPath)) {
+      return await this.baseAdapter.copy(normalizedPath, normalizedNewPath);
+    }
+    throw new ReadOnlyError("copy", normalizeVaultPath(normalizedPath));
+  }
+
+  // ---------------------------------------------------------------- 内部
+
+  /** 配置目录 / 插件目录：读写都交给原生 adapter（v3 §3 全局例外）。 */
+  private shouldForward(normalizedPath: string): boolean {
+    const clean = normalizeVaultPath(normalizedPath);
+    if (!clean) return false;
+    if (clean === this.configDir || clean.startsWith(`${this.configDir}/`)) return true;
+    if (this.pluginDir && (clean === this.pluginDir || clean.startsWith(`${this.pluginDir}/`))) return true;
+    return false;
+  }
+
+  private findEntry(path: string): IndexEntry | null {
+    for (const entry of this.index.entries) {
+      if (entry.path === path) return entry;
+    }
+    return null;
+  }
+
+  /** 缓存优先；未命中则下载并回写缓存（正文与附件同一规则，v3 §5）。 */
+  private async loadBinary(normalizedPath: string): Promise<ArrayBuffer> {
+    const clean = normalizeVaultPath(normalizedPath);
+    if (!clean) throw new QuarkEntryNotFoundError(clean);
+
+    const cached = this.cache.get(clean);
+    if (cached) return cached;
+
+    const entry = this.findEntry(clean);
+    if (!entry) throw new QuarkEntryNotFoundError(clean);
+    if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
+
+    const buffer = await this.client.downloadFile(entry.fid);
+    this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
+    return buffer;
+  }
+}
