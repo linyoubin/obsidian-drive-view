@@ -193,7 +193,7 @@ describe("QuarkQrModal：倒计时与状态文案", () => {
 
     const empty = qrModal.describeSyncPrompt(snapshot());
     expect(empty).toContain("从未建立");
-    expect(empty).toContain("索引条目 无");
+    expect(empty).toContain("索引 无");
   });
 });
 
@@ -241,7 +241,7 @@ describe("QuarkSettingsTab：登录态 / 索引态 / 缓存态文案（A5）", (
     const scanning = settingsTab.describeIndexState(
       snapshot({ indexCount: 10, builtAt, indexing: true, scannedFolders: 7, pendingFolders: 12 })
     );
-    expect(scanning).toContain("索引中：已扫 7 个目录、待扫 12 个");
+    expect(scanning).toContain("同步中：已扫 7 · 待扫 12 · 约 37% · 正在扫描 /");
   });
 
   test("缓存态与字节格式化", () => {
@@ -279,7 +279,7 @@ describe("QuarkSettingsTab：状态栏三态（A6）", () => {
     const scanning = settingsTab.describeStatusBar(
       snapshot({ loginState: "active", indexing: true, scannedFolders: 12, pendingFolders: 182 })
     );
-    expect(scanning).toBe("Quark 只读：索引中 12/194 个目录");
+    expect(scanning).toBe("Quark 只读：同步中 6% · /");
   });
 
   test("时间格式化：0 显示「从未建立」，合法时间戳显示本地时间", () => {
@@ -347,5 +347,80 @@ describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
     expect(settingsTab.planQuarkRibbonAction(chosen)).toBe("sync");
     expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootChosen).toBe(false);
     expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootPath).toBe("/");
+  });
+});
+// ------------------------------------------------------------------ 同步进度可见性（T-11 addendum A9/A10）
+
+describe("同步进度：百分比与文案（T-11 addendum）", () => {
+  test("estimateScanPercent：常规、0 分母、待扫为 0 三种", () => {
+    expect(settingsTab.estimateScanPercent(12, 30)).toBe(29); // 12/42 ≈ 28.6 → 29
+    expect(settingsTab.estimateScanPercent(0, 0)).toBe(0);
+    expect(settingsTab.estimateScanPercent(0, 10)).toBe(0);
+    expect(settingsTab.estimateScanPercent(5, 0)).toBe(100);
+    expect(settingsTab.estimateScanPercent(-1, -1)).toBe(0);
+    expect(settingsTab.estimateScanPercent(200, 0)).toBe(100);
+  });
+
+  test("进度文案含库根、三段计数与当前目录（含中文路径）", () => {
+    const text = settingsTab.describeSyncProgressNotice("/知识库_云端", 12, 30, "/技术");
+    expect(text).toBe("同步 /知识库_云端：已扫 12 · 待扫 30 · 约 29% · 正在扫描 /技术");
+    expect(text).toContain("约 29%"); // 估算值，文案里必须带「约」
+    const atRoot = settingsTab.describeSyncProgressNotice("/知识库_云端", 1, 0, "");
+    expect(atRoot).toContain("正在扫描 /");
+    expect(atRoot).toContain("约 100%");
+  });
+
+  test("取消文案：已扫目录数 + 索引保留上一版", () => {
+    expect(settingsTab.describeSyncCancel(12)).toBe("已取消同步（已扫 12 个目录，索引保留上一版）");
+  });
+
+  test("ribbon tooltip 同步中显示百分比与当前目录，结束后恢复三态", () => {
+    const syncing = settingsTab.describeRibbonTooltip(
+      snapshot({ loginState: "active", indexing: true, scannedFolders: 12, pendingFolders: 30, currentFolder: "/技术" })
+    );
+    expect(syncing).toBe("同步夸克 · 同步中 29% · /技术");
+    const idle = settingsTab.describeRibbonTooltip(snapshot({ loginState: "active", mounted: true }));
+    expect(idle).toContain("已挂载");
+  });
+
+  test("设置页索引态同步显示三段信息", () => {
+    const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
+    const text = settingsTab.describeIndexState(
+      snapshot({
+        indexCount: 10,
+        builtAt,
+        indexing: true,
+        scannedFolders: 12,
+        pendingFolders: 30,
+        currentFolder: "/技术",
+      })
+    );
+    expect(text).toContain("已扫 12");
+    expect(text).toContain("待扫 30");
+    expect(text).toContain("约 29%");
+    expect(text).toContain("正在扫描 /技术");
+  });
+
+  test("确认框正文三行：库根 / 上次同步 / 将执行", () => {
+    const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
+    const body = qrModal.describeSyncPrompt(
+      snapshot({ rootChosen: true, rootPath: "/知识库_云端", indexCount: 128, builtAt })
+    );
+    const lines = body.split("\n");
+    expect(lines.length).toBe(3);
+    expect(lines[0]).toBe("库根：/知识库_云端");
+    expect(lines[1]).toContain("上次同步：2026-11-20 15:40");
+    expect(lines[1]).toContain("索引 128 条");
+    expect(lines[2]).toBe("将执行：全量刷新索引");
+  });
+
+  test("完成文案：统计四项 + 耗时（且可带库根）", () => {
+    const text = settingsTab.describeSyncResult("/知识库_云端", 128, { added: 3, changed: 4, removed: 5 }, "12.3");
+    expect(text).toContain("已同步 128 条");
+    expect(text).toContain("新增 3");
+    expect(text).toContain("变更 4");
+    expect(text).toContain("删除 5");
+    expect(text).toContain("耗时 12.3s");
+    expect(text).toContain("库根 /知识库_云端");
   });
 });

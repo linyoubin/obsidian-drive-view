@@ -24,19 +24,32 @@ import {
 import type { GoogleDriveSettings, PluginSettings } from "./types";
 import { QuarkFolderPickerModal } from "./ui/QuarkFolderPickerModal";
 import { QuarkQrModal, QuarkSyncConfirmModal, describeSyncPrompt } from "./ui/QuarkQrModal";
+import type { QuarkSyncChoice } from "./ui/QuarkQrModal";
 import {
   EMPTY_QUARK_SNAPSHOT,
   QuarkSettingsTab,
   describeCacheState,
   describeIndexState,
   describeRibbonTooltip,
+  describeRootPath,
   describeRootState,
   describeStatusBar,
+  describeSyncCancel,
+  describeSyncProgressNotice,
+  describeSyncResult,
   planQuarkRibbonAction,
+  shouldForceRootPicker,
 } from "./ui/QuarkSettingsTab";
 import type { QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSettingsTab";
 import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { normalizeVaultPath } from "./utils/pathUtils";
+
+/** 运行期 Notice 的扩展能力（obsidian.d.ts 只声明了构造函数）。 */
+type NoticeWithMessage = {
+  setMessage?: (message: string) => void;
+  noticeEl?: { setText?: (text: string) => void };
+  hide?: () => void;
+};
 
 /** 夸克网络出口：唯一的 `requestUrl` 调用点（QuarkClient 只拿到这个函数）。 */
 const quarkTransport: QuarkTransport = async (request) => {
@@ -78,7 +91,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkModal: QuarkQrModal | null = null;
   private quarkIndexing = false;
   private quarkScanSignal: { aborted: boolean } | null = null;
-  private quarkProgress = { scanned: 0, pending: 0 };
+  private quarkProgress = { scanned: 0, pending: 0, current: "" };
   private lastPersistedQuarkCookie = "";
   private quarkRibbonEl: HTMLElement | null = null;
 
@@ -119,9 +132,6 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       this.updateStatusBarUi();
     }
 
-    this.addRibbonIcon("cloud", "Drive View: Sync now", async () => {
-      await this.syncNow();
-    });
 
     this.addCommand({
       id: "sync-now",
@@ -446,19 +456,31 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   /** ribbon 点击（A3/A4 的分支判定走纯函数，便于单测）。 */
   public async onQuarkRibbonClick(): Promise<void> {
-    // A5：从未选过库根 → 先弹目录选择器，选完再继续原流程（扫码 / 确认同步）
-    if (!this.settings.quarkRootChosenAt) {
+    // T-11 A2：从未选过库根 → 强制先选；取消则整条流程终止（不扫码、不同步）
+    if (shouldForceRootPicker(this.settings)) {
       const chosen = await this.pickQuarkRoot();
-      if (!chosen) return;
+      if (!chosen) {
+        new Notice("夸克：需先选择知识库根目录（点左侧「同步夸克」图标）", 8000);
+        return;
+      }
     }
-    const action = planQuarkRibbonAction(this.quarkSnapshot());
-    if (action === "login") {
+
+    if (planQuarkRibbonAction(this.quarkSnapshot()) === "login") {
       await this.quarkOpenQrModal();
       return;
     }
-    const confirmed = await this.confirmQuarkSync();
-    if (!confirmed) return;
-    await this.quarkSync("手动同步");
+
+    // T-11 A3/A4：确认框三选一；点了「修改库根」就选新根，然后**回到确认框**，不自动开跑
+    for (;;) {
+      const choice = await this.confirmQuarkSync();
+      if (choice === "cancel") return;
+      if (choice === "change-root") {
+        await this.pickQuarkRoot();
+        continue;
+      }
+      await this.quarkSync("手动同步");
+      return;
+    }
   }
 
   /** 设置页按钮入口：打开目录选择器。 */
@@ -501,7 +523,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.updateQuarkStatusBar();
     if (fid === previousFid && path === previousPath) return;
 
-    new Notice(`夸克：库根切换到 ${path}，将重建索引…`, 6000);
+    new Notice(`夸克：库根已切换到 ${describeRootPath(path)}，需重建索引（点「同步夸克」）`, 8000);
     if (this.quarkMounted) {
       await this.mounter.unmount(this.createQuarkMountFacade());
       this.quarkMounted = false;
@@ -510,20 +532,20 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCache.clear();
     await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
     this.updateQuarkStatusBar();
-    await this.quarkSync("库根切换后重建");
+    // T-11：改库根后**不自动同步**，由用户确认后再跑（回到确认框 / 点同步）
   }
 
-  /** 确认框：显示上次同步时间与条目数（A4）。 */
-  private confirmQuarkSync(): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
+  /** 确认框：三行正文（库根/上次同步/将执行）+ 三按钮（现在同步/修改库根/取消）。 */
+  private confirmQuarkSync(): Promise<QuarkSyncChoice> {
+    return new Promise<QuarkSyncChoice>((resolve) => {
       let settled = false;
       const modal = new QuarkSyncConfirmModal({
         app: this.app,
         body: describeSyncPrompt(this.quarkSnapshot()),
-        onChoose: (confirmed) => {
+        onChoose: (choice) => {
           if (settled) return;
           settled = true;
-          resolve(confirmed);
+          resolve(choice);
         },
       });
       modal.open();
@@ -563,10 +585,14 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
     this.quarkIndexing = true;
     this.quarkScanSignal = { aborted: false };
-    this.quarkProgress = { scanned: 0, pending: 0 };
+    this.quarkProgress = { scanned: 0, pending: 0, current: "/" };
     const startedAt = Date.now();
     this.updateQuarkStatusBar();
-    new Notice(`夸克：开始同步（${reason}）…`, 3000);
+    // T-11 addendum A9：常驻 Notice（duration 0），每扫完一个目录刷新文案
+    const progressNotice = new Notice(
+      describeSyncProgressNotice(this.settings.quarkRootPath, 0, 0, "/"),
+      0
+    ) as Notice & NoticeWithMessage;
 
     try {
       const result = await this.quarkIndex.scan({
@@ -577,21 +603,30 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           this.quarkProgress = {
             scanned: progress.scannedFolders.length,
             pending: progress.pendingFolders.length,
+            current: this.quarkProgress.current,
           };
           this.updateQuarkStatusBar();
+          this.updateSyncNotice(progressNotice);
         },
       });
 
       const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (result.aborted) {
-        new Notice(`夸克：同步已取消（已扫 ${result.progress.scannedFolders.length} 个目录，进度已保存）`, 6000);
+        this.hideSyncNotice(progressNotice);
+        new Notice(`夸克：${describeSyncCancel(result.progress.scannedFolders.length)}`, 7000);
         return;
       }
 
       const diff = result.diff;
+      this.hideSyncNotice(progressNotice);
       new Notice(
-        `夸克：已同步 ${this.quarkIndex.entryCount} 条 / 耗时 ${seconds}s（新增 ${diff.added.length}、变更 ${diff.changed.length}、删除 ${diff.removed.length}）`,
-        6000
+        `夸克：${describeSyncResult(
+          this.settings.quarkRootPath,
+          this.quarkIndex.entryCount,
+          { added: diff.added.length, changed: diff.changed.length, removed: diff.removed.length },
+          seconds
+        )}`,
+        8000
       );
       await this.updateSettings({ quarkLastIndexBuiltAt: this.quarkIndex.metaInfo.builtAt });
 
@@ -602,6 +637,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         await this.mounter.reconcileFullVault(this.createQuarkMountFacade());
       }
     } catch (error) {
+      this.hideSyncNotice(progressNotice);
       console.error("[Quark] sync failed:", error);
       new Notice(`夸克：同步失败（${error instanceof Error ? error.message : String(error)}）`, 8000);
     } finally {
@@ -613,6 +649,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   /** 列目录：BFS 的唯一网络出口（IndexStore.scan 的回调）。 */
   private async listQuarkFolder(folderPath: string, folderFid: string): Promise<IndexEntry[]> {
+    // 记录「正在扫描」的目录（含根 `/`），供常驻 Notice / tooltip / 设置页显示
+    this.quarkProgress = { ...this.quarkProgress, current: folderPath || "/" };
     const page = await this.quarkClient.listDir(folderFid, { all: true });
     const prefix = folderPath ? `${folderPath}/` : "";
     return page.items.map((item) => ({
@@ -710,7 +748,24 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       indexing: this.quarkIndexing,
       scannedFolders: this.quarkProgress.scanned,
       pendingFolders: this.quarkProgress.pending,
+      currentFolder: this.quarkProgress.current,
     };
+  }
+
+  /** 刷新常驻进度 Notice（obsidian.d.ts 没有 setMessage，用运行期能力兜底）。 */
+  private updateSyncNotice(notice: Notice & NoticeWithMessage): void {
+    const text = describeSyncProgressNotice(
+      this.settings.quarkRootPath,
+      this.quarkProgress.scanned,
+      this.quarkProgress.pending,
+      this.quarkProgress.current
+    );
+    if (typeof notice.setMessage === "function") notice.setMessage(text);
+    else if (notice.noticeEl && typeof notice.noticeEl.setText === "function") notice.noticeEl.setText(text);
+  }
+
+  private hideSyncNotice(notice: Notice & NoticeWithMessage): void {
+    if (typeof notice.hide === "function") notice.hide();
   }
 
   private updateQuarkRibbonTooltip(): void {

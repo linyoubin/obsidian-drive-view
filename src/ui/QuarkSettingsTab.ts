@@ -27,6 +27,8 @@ export interface QuarkUiSnapshot {
   indexing: boolean;
   scannedFolders: number;
   pendingFolders: number;
+  /** 正在扫描的目录（库内路径，根为 `/`）；空闲时为空串。 */
+  currentFolder: string;
 }
 
 /** 主插件暴露给设置页/弹窗的最小接口（避免 UI 直接操作 store/client）。 */
@@ -53,6 +55,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   indexing: false,
   scannedFolders: 0,
   pendingFolders: 0,
+  currentFolder: "",
 };
 
 /** 登录态文案：未登录 / 已登录（N 个 cookie）/ 登录已过期（缺判据）。 */
@@ -92,8 +95,12 @@ export function describeIndexState(snapshot: QuarkUiSnapshot): string {
     return snapshot.degraded ? "无快照（索引未持久化）" : "无快照";
   }
   const base = `${snapshot.indexCount} 条 · v${snapshot.version} · ${formatBuiltAt(snapshot.builtAt)}`;
+  const current = snapshot.currentFolder && snapshot.currentFolder !== "" ? snapshot.currentFolder : "/";
   const progress = snapshot.indexing
-    ? ` · 索引中：已扫 ${snapshot.scannedFolders} 个目录、待扫 ${snapshot.pendingFolders} 个`
+    ? ` · 同步中：已扫 ${snapshot.scannedFolders} · 待扫 ${snapshot.pendingFolders} · 约 ${estimateScanPercent(
+        snapshot.scannedFolders,
+        snapshot.pendingFolders
+      )}% · 正在扫描 ${current}`
     : "";
   const degraded = snapshot.degraded ? " · 索引未持久化" : "";
   return `${base}${progress}${degraded}`;
@@ -117,8 +124,74 @@ export function describeRootState(snapshot: QuarkUiSnapshot): string {
   return snapshot.rootPath && snapshot.rootPath !== "/" ? snapshot.rootPath : "根目录（整个网盘）";
 }
 
+/** 首次使用判定：没选过库根就必须先选（T-11 A2）。 */
+export function shouldForceRootPicker(settings: { quarkRootChosenAt?: number }): boolean {
+  return !settings.quarkRootChosenAt;
+}
+
+/** 库根展示文案（设置页/提示共用）。 */
+export function describeRootPath(rootPath: string | null | undefined): string {
+  const path = String(rootPath ?? "");
+  return path && path !== "/" ? path : "根目录（整个网盘）";
+}
+
+/** 同步进度文案：`同步 /知识库_云端：12/194 目录`（T-11 A5）。 */
+export function describeSyncProgress(rootPath: string, scanned: number, total: number): string {
+  return `同步 ${describeRootPath(rootPath)}：${scanned}/${total} 目录`;
+}
+
+/**
+ * 扫描百分比（**估算值**，T-11 addendum A9）。
+ *
+ * 定义：`已扫 / (已扫 + 待扫)`。BFS 的目录总数要一边扫一边才被发现，
+ * 所以这不是精确进度，界面文案统一写「约 N%」。
+ * 分母为 0 时：还没扫到任何东西 → 0；已经扫完且没有待扫 → 100。
+ */
+export function estimateScanPercent(scanned: number, pending: number): number {
+  const total = Math.max(0, scanned) + Math.max(0, pending);
+  if (total <= 0) return scanned > 0 ? 100 : 0;
+  const percent = Math.round((Math.max(0, scanned) / total) * 100);
+  return Math.max(0, Math.min(100, percent));
+}
+
+/** 常驻进度 Notice 的文案（T-11 addendum A9/A10）。 */
+export function describeSyncProgressNotice(
+  rootPath: string,
+  scanned: number,
+  pending: number,
+  currentFolder: string
+): string {
+  const current = currentFolder && currentFolder !== "" ? currentFolder : "/";
+  return `同步 ${describeRootPath(rootPath)}：已扫 ${scanned} · 待扫 ${pending} · 约 ${estimateScanPercent(
+    scanned,
+    pending
+  )}% · 正在扫描 ${current}`;
+}
+
+/** 取消同步的文案（T-11 addendum A9）。 */
+export function describeSyncCancel(scanned: number): string {
+  return `已取消同步（已扫 ${scanned} 个目录，索引保留上一版）`;
+}
+
+/** 同步完成文案：`已同步 N 条 · 新增 a · 变更 b · 删除 c · 耗时 Xs（库根 /x）`（T-11 A5）。 */
+export function describeSyncResult(
+  rootPath: string,
+  entryCount: number,
+  diff: { added: number; changed: number; removed: number },
+  seconds: string
+): string {
+  return `已同步 ${entryCount} 条 · 新增 ${diff.added} · 变更 ${diff.changed} · 删除 ${diff.removed} · 耗时 ${seconds}s（库根 ${describeRootPath(rootPath)}）`;
+}
+
 /** ribbon tooltip 三态（A6）：手机端看不到状态栏，靠这个 title 看状态。 */
 export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
+  if (snapshot.indexing) {
+    const current = snapshot.currentFolder && snapshot.currentFolder !== "" ? snapshot.currentFolder : "/";
+    return `同步夸克 · 同步中 ${estimateScanPercent(
+      snapshot.scannedFolders,
+      snapshot.pendingFolders
+    )}% · ${current}`;
+  }
   if (snapshot.mounted) {
     return `同步夸克 · 已挂载（索引 ${formatBuiltAt(snapshot.builtAt)}）`;
   }
@@ -136,9 +209,11 @@ export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
  */
 export function describeStatusBar(snapshot: QuarkUiSnapshot): string {
   if (snapshot.indexing) {
-    return `Quark 只读：索引中 ${snapshot.scannedFolders}/${
-      snapshot.scannedFolders + snapshot.pendingFolders
-    } 个目录`;
+    const current = snapshot.currentFolder && snapshot.currentFolder !== "" ? snapshot.currentFolder : "/";
+    return `Quark 只读：同步中 ${estimateScanPercent(
+      snapshot.scannedFolders,
+      snapshot.pendingFolders
+    )}% · ${current}`;
   }
   if (snapshot.mounted) {
     return `Quark 只读：已挂载（索引 ${formatBuiltAt(snapshot.builtAt)}）`;
@@ -213,7 +288,7 @@ export class QuarkSettingsTab extends settingTabBase() {
       .setName("库根目录")
       .setDesc(describeRootState(snapshot))
       .addButton((button: any) =>
-        button.setButtonText("选择库根目录").setCta().onClick(async () => {
+        button.setButtonText("修改库根").setCta().onClick(async () => {
           await this.host.quarkChooseRoot();
           this.display();
         })

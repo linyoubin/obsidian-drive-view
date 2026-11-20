@@ -19,14 +19,34 @@ import { createQrCode } from "../vendor/qr";
 import { formatBuiltAt } from "./QuarkSettingsTab";
 import type { QuarkUiSnapshot } from "./QuarkSettingsTab";
 
-/** 已登录时点 ribbon 的确认框正文：上次同步时间 + 条目数（不含任何凭据）。 */
+/** 库根展示文案（确认框/提示共用）。 */
+export function describeRootLabel(rootPath: string | null | undefined): string {
+  const path = String(rootPath ?? "");
+  return path && path !== "/" ? path : "根目录（整个网盘）";
+}
+
+/** 确认框三选一结果（T-11）。 */
+export type QuarkSyncChoice = "sync" | "change-root" | "cancel";
+/** 三个按钮的顺序（供界面与单测共用）。 */
+export const QUARK_SYNC_CHOICES: QuarkSyncChoice[] = ["sync", "change-root", "cancel"];
+
+/**
+ * 已登录时点 ribbon 的确认框正文（三行，T-11 A3）：
+ *   库根：/知识库_云端
+ *   上次同步：2026-11-20 15:40 · 索引 128 条
+ *   将执行：全量刷新索引
+ */
 export function describeSyncPrompt(snapshot: QuarkUiSnapshot): string {
   const count = snapshot.indexCount > 0 ? `${snapshot.indexCount} 条` : "无";
   const progress =
     snapshot.indexing && snapshot.scannedFolders + snapshot.pendingFolders > 0
-      ? `（正在同步中：${snapshot.scannedFolders}/${snapshot.scannedFolders + snapshot.pendingFolders} 个目录）`
+      ? `（同步中：${snapshot.scannedFolders}/${snapshot.scannedFolders + snapshot.pendingFolders} 目录）`
       : "";
-  return `上次同步：${formatBuiltAt(snapshot.builtAt)} · 索引条目 ${count}${progress}`;
+  return [
+    `库根：${describeRootLabel(snapshot.rootPath)}`,
+    `上次同步：${formatBuiltAt(snapshot.builtAt)} · 索引 ${count}${progress}`,
+    `将执行：全量刷新索引`,
+  ].join("\n");
 }
 
 /** 倒计时文案：`剩余 179 秒（服务端实测 184 秒，提前 4 秒停）`；≤30 秒加提醒。 */
@@ -288,9 +308,9 @@ export class QuarkQrModal extends modalBase() {
 
 export interface QuarkSyncConfirmOptions {
   app: App;
-  /** 正文（上次同步时间 + 条目数），由 `describeSyncPrompt` 生成。 */
+  /** 正文（库根 + 上次同步 + 将执行），由 `describeSyncPrompt` 生成。 */
   body: string;
-  onChoose: (confirmed: boolean) => void;
+  onChoose: (choice: QuarkSyncChoice) => void;
 }
 
 /**
@@ -314,10 +334,12 @@ export class QuarkSyncConfirmModal extends modalBase() {
 
     const actions = content.createEl("div");
     const cancel = actions.createEl("button", { text: "取消" });
-    cancel.addEventListener("click", () => this.choose(false));
+    cancel.addEventListener("click", () => this.choose("cancel"));
+    const changeRoot = actions.createEl("button", { text: "修改库根" });
+    changeRoot.addEventListener("click", () => this.choose("change-root"));
     const confirm = actions.createEl("button", { text: "现在同步" });
-    confirm.addEventListener("click", () => this.choose(true));
-    // 默认焦点放在「取消」上
+    confirm.addEventListener("click", () => this.choose("sync"));
+    // 默认焦点放在「取消」上（不让回车直接触发同步）
     window.setTimeout(() => cancel.focus(), 0);
   }
 
@@ -325,14 +347,14 @@ export class QuarkSyncConfirmModal extends modalBase() {
     this.contentEl.empty();
     if (!this.settled) {
       this.settled = true;
-      this.options.onChoose(false);
+      this.options.onChoose("cancel");
     }
   }
 
-  private choose(confirmed: boolean): void {
+  private choose(choice: QuarkSyncChoice): void {
     if (this.settled) return;
     this.settled = true;
-    this.options.onChoose(confirmed);
+    this.options.onChoose(choice);
     this.close();
   }
 }
