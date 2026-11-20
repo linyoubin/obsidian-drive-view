@@ -151,3 +151,34 @@ export interface DriveChangeItem {
   removed?: boolean;
   file?: DriveFileMetadata;
 }
+
+/**
+ * 夸克一期：只读库设置（与 Google Drive 共用同一个 `data.json`）。
+ * 字段名带 `quark` 前缀，避免和 Drive 的设置冲突。
+ */
+export interface QuarkSettings {
+  /**
+   * 登录态 Cookie 字符串（`k=v; k2=v2`）。运行期 `secretStorage` 可用时优先存那里，这里是回退。
+   */
+  quarkCookie: string;
+  /**
+   * 夸克根目录 fid（一期固定 `"0"`）。
+   */
+  quarkRootFid: string;
+  /**
+   * 最近一次索引建立的毫秒时间戳（0 = 从未建立）。
+   */
+  quarkLastIndexBuiltAt: number;
+}
+
+export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
+  quarkCookie: "",
+  quarkRootFid: "0",
+  quarkLastIndexBuiltAt: 0,
+};
+
+/** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */
+export const QUARK_COOKIE_STORAGE_KEY = "quarkCookie";
+
+/** 本插件完整设置：Google Drive 那套 + 夸克那套。 */
+export type PluginSettings = GoogleDriveSettings & QuarkSettings;
