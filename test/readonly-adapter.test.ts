@@ -301,8 +301,8 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
     const { adapter, client, cache } = makeAdapter();
     const root = await adapter.list("");
     expect(root.files).toEqual(["a.md"]);
-    // localeCompare：大小写不敏感序，"folder" 在 "Folder2" 之前
-    expect(root.folders).toEqual(["folder", "Folder2"]);
+    // 顺序取决于运行环境的 Collation（CI Linux 与 Windows 可能不同），这里只断言内容
+    expect([...root.folders].sort()).toEqual(["Folder2", "folder"]);
 
     const folder = await adapter.list("folder");
     expect(folder.files).toEqual(["folder/b.md"]);

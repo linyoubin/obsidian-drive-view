@@ -9,7 +9,11 @@
 
 import { describe, expect, mock, test } from "bun:test";
 
-mock.module("obsidian", () => {
+// 注意：本文件与 adapter.test.ts 都要 mock "obsidian"。bun 在整进程内只实例化一次模块对象，
+// 因此这里：(a) 提供其它测试文件需要的全部符号；(b) 用 try/catch 兜住"重复 mock"的报错，
+// 保证无论哪个文件先注册，测试进程都不会因 mock 本身崩掉。
+try {
+  mock.module("obsidian", () => {
   class MockModal {
     app: unknown;
     contentEl: unknown;
@@ -69,8 +73,23 @@ mock.module("obsidian", () => {
       isIosApp: false,
       isAndroidApp: false,
     },
+    // 其它测试文件（adapter.test.ts）经 GoogleDrive 代码会用到这些运行时符号
+    requestUrl: async () => ({ status: 200, text: "", json: {}, headers: {}, arrayBuffer: new ArrayBuffer(0) }),
+    TAbstractFile: class {},
+    TFile: class {},
+    TFolder: class {},
+    MarkdownView: class {},
+    Vault: class {},
+    Workspace: class {},
+    MetadataCache: class {},
+    ButtonComponent: class {},
+    TextComponent: class {},
+    ToggleComponent: class {},
   };
-});
+  });
+} catch (error) {
+  console.warn("[quark-ui.test] obsidian mock 已有注册，沿用现有实现：", error);
+}
 
 const qrModal = await import("../src/ui/QuarkQrModal");
 const settingsTab = await import("../src/ui/QuarkSettingsTab");
