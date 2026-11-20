@@ -607,3 +607,29 @@ describe("ribbon 固定图标与五态后缀文字（0.2.5 A6′）", () => {
     expect(drive).toContain("Drive View");
   });
 });
+
+// ------------------------------------------------------------------ 只注册一个设置页（0.2.6 A2/A3/A4）
+
+describe("设置页唯一注册入口（0.2.6）", () => {
+  test("main.ts 里 addSettingTab 只出现 1 次（夸克页），Google 页不再注册", async () => {
+    const main = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
+    const hits = main.match(/addSettingTab\(/g) ?? [];
+    expect(hits.length).toBe(1);
+    expect(main).toContain("addSettingTab(this.quarkSettingsTab)");
+    expect(main).toContain("不再注册");
+  });
+
+  test("三条 Google Drive 命令仍注册（sync-now / flush-uploads / rebuild-cache）", async () => {
+    const main = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
+    for (const id of ["sync-now", "flush-uploads", "rebuild-cache"]) {
+      expect(main).toContain(`id: "${id}"`);
+    }
+  });
+
+  test("夸克设置页有一行说明：Google Drive 旧功能仍可在命令面板使用", async () => {
+    const quark = await Bun.file(new URL("../src/ui/QuarkSettingsTab.ts", import.meta.url)).text();
+    expect(quark).toContain("Google Drive 旧功能仍可在命令面板使用");
+    expect(quark).toContain("sync-now / flush-uploads / rebuild-cache");
+    expect(quark).toContain("其专属设置页已不再注册");
+  });
+});

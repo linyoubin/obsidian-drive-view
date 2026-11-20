@@ -218,7 +218,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
     });
 
-    this.addSettingTab(new GoogleDriveSettingTab(this.app, this));
+    // 0.2.6：**只注册一个设置页**（夸克页在 initQuark 里注册）。
+    // Google Drive 旧设置页 `GoogleDriveSettingTab`（src/ui/SettingsTab.ts）保留但**不再注册**：
+    // Obsidian 设置侧边栏按插件名列出条目，注册两个就会并排出现两个「Quark Vault」，
+    // 改页面内标题治不了。Google Drive 功能仍可通过命令面板使用
+    // （sync-now / flush-uploads / rebuild-cache），不影响业务代码。
 
     await this.initQuark();
 

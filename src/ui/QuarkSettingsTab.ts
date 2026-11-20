@@ -475,5 +475,10 @@ export class QuarkSettingsTab extends settingTabBase() {
           await this.host.quarkExportDiagnostics();
         })
       );
+
+    // 0.2.6：插件只注册这一个设置页（Google Drive 旧设置页不再注册），这里注明其功能仍可用
+    container.createEl("p", {
+      text: "Google Drive 旧功能仍可在命令面板使用（sync-now / flush-uploads / rebuild-cache）；其专属设置页已不再注册，避免设置里出现两个同名页面。",
+    });
   }
 }
