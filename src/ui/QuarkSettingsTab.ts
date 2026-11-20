@@ -29,6 +29,10 @@ export interface QuarkUiSnapshot {
   pendingFolders: number;
   /** 正在扫描的目录（库内路径，根为 `/`）；空闲时为空串。 */
   currentFolder: string;
+  /** 下载并发上限（0.2.4，默认 2，可调 1–3）。 */
+  downloadConcurrency: number;
+  /** 大文件提醒阈值（字节，0 = 不提醒；仅提示不拦截）。 */
+  maxFileBytes: number;
 }
 
 /** 主插件暴露给设置页/弹窗的最小接口（避免 UI 直接操作 store/client）。 */
@@ -40,6 +44,10 @@ export interface QuarkHost {
   quarkExitReadOnly(): Promise<void>;
   /** 0.2.3 A7：最近 200 行诊断日志复制到剪贴板。 */
   quarkExportDiagnostics(): Promise<void>;
+  /** 0.2.4：下载并发（1–3，改完立即生效）。 */
+  quarkSetDownloadConcurrency(value: number): Promise<void>;
+  /** 0.2.4：大文件提醒阈值（MB，仅提示不拦截）。 */
+  quarkSetMaxFileMb(mb: number): Promise<void>;
 }
 
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
@@ -58,6 +66,8 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   scannedFolders: 0,
   pendingFolders: 0,
   currentFolder: "",
+  downloadConcurrency: 2,
+  maxFileBytes: 50 * 1024 * 1024,
 };
 
 /** 登录态文案：未登录 / 已登录（N 个 cookie）/ 登录已过期（缺判据）。 */
@@ -364,6 +374,36 @@ export class QuarkSettingsTab extends settingTabBase() {
     new Setting(container)
       .setName("索引状态")
       .setDesc(describeIndexState(snapshot));
+
+    // 0.2.4 A8：下载并发（1–3，默认 2）
+    new Setting(container)
+      .setName("下载并发（1–3，默认 2）")
+      .setDesc(`当前 ${snapshot.downloadConcurrency} 路同时下载；手机端通道脆弱，建议 ≤2`)
+      .addText((text: any) =>
+        text
+          .setPlaceholder("2")
+          .setValue(String(snapshot.downloadConcurrency))
+          .onChange(async (value: string) => {
+            const parsed = Number.parseInt(String(value), 10);
+            if (Number.isFinite(parsed)) await this.host.quarkSetDownloadConcurrency(parsed);
+          })
+      );
+
+    // 0.2.4 A6′：「单文件上限」改成提醒阈值，只影响提示、不拦截下载
+    new Setting(container)
+      .setName("大文件提醒阈值（MB，默认 50，0 = 不提醒）")
+      .setDesc(
+        `超过 ${Math.round(snapshot.maxFileBytes / (1024 * 1024))} MB 时在下载提示里额外提醒；仅提示，不拦截下载`
+      )
+      .addText((text: any) =>
+        text
+          .setPlaceholder("50")
+          .setValue(String(Math.round(snapshot.maxFileBytes / (1024 * 1024))))
+          .onChange(async (value: string) => {
+            const parsed = Number.parseFloat(String(value));
+            if (Number.isFinite(parsed)) await this.host.quarkSetMaxFileMb(parsed);
+          })
+      );
 
     new Setting(container)
       .setName("内容缓存（内存，不落盘）")

@@ -22,6 +22,13 @@
 import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from "obsidian";
 
 import type { IndexEntry } from "../store/IndexStore";
+import {
+  QuarkAuthError,
+  QuarkDownloadCanceledError,
+  QuarkDownloadTimeoutError,
+  QuarkFileTooLargeError,
+} from "../client/QuarkClient";
+import { DownloadGateError } from "../client/downloadGate";
 import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
 import { ReadOnlyError } from "./readonlyError";
 
@@ -53,18 +60,43 @@ export interface QuarkCacheLike {
 
 /** 下载器的最小接口（`QuarkClient` 结构上满足）。 */
 export interface QuarkDownloadClient {
-  downloadFile(fid: string): Promise<ArrayBuffer>;
+  /** 第二参数是取消令牌（`aborted=true` 时客户端丢弃结果、不再重试）。 */
+  downloadFile(fid: string, options?: { signal?: { aborted: boolean } | null }): Promise<ArrayBuffer>;
+}
+
+/** 日志 cause（0.2.4 A7）：一次失败一条日志，带原因分类。 */
+export type QuarkDiagCause = "timeout" | "size" | "auth" | "http" | "canceled" | "unknown";
+
+/** 一次下载的取消令牌（与 `DownloadToken` 结构兼容）。 */
+export interface QuarkDownloadToken {
+  readonly id?: string;
+  aborted: boolean;
+}
+
+export type QuarkDownloadEndOutcome = "done" | "failed" | "canceled";
+
+/**
+ * 下载提示出口（0.2.4 A4′）：由 main.ts 实现「正在下载 … [取消]」单例提示。
+ *
+ * 取消只改 `token.aborted`：`requestUrl` 无 AbortSignal，**不能中断已发出的 HTTP**，
+ * 只能丢弃结果、停止重试、不写缓存。
+ */
+export interface QuarkDownloadUi {
+  begin(info: { path: string; fid: string; sizeBytes: number }): QuarkDownloadToken;
+  end(token: QuarkDownloadToken | null, outcome: QuarkDownloadEndOutcome): void;
 }
 
 /** 诊断阶段名（与 `src/utils/diagLog.ts` 的 `DiagStage` 对齐）。 */
 export type QuarkAdapterDiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort";
 
-/** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5）。 */
+/** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5 / 0.2.4 A7）。 */
 export type QuarkAdapterDiagSink = (entry: {
   stage: QuarkAdapterDiagStage;
   path: string;
   fid: string;
   message: string;
+  cause?: QuarkDiagCause;
+  retried?: boolean;
 }) => void;
 
 export interface QuarkReadOnlyAdapterOptions {
@@ -79,7 +111,12 @@ export interface QuarkReadOnlyAdapterOptions {
   pluginDir?: string;
   /** 可选诊断出口（失败时记录 path/fid/阶段）；不传则完全无副作用。 */
   diag?: QuarkAdapterDiagSink | null;
+  /** 可选下载提示 + 取消（0.2.4 A4′）；不传则下载时无提示。 */
+  downloadUi?: QuarkDownloadUi | null;
 }
+
+/** 同一个错误对象只记一条日志（download 与 read 不再各记一条，0.2.4 A7）。 */
+const loggedErrors = new WeakSet<object>();
 
 /** 索引里查不到该路径（不是只读错误，是「库里有快照但不含此文件」）。 */
 export class QuarkEntryNotFoundError extends Error {
@@ -104,6 +141,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly configDir: string;
   private readonly pluginDir: string;
   private readonly diag?: QuarkAdapterDiagSink | null;
+  private readonly downloadUi?: QuarkDownloadUi | null;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -116,6 +154,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.configDir = normalizeVaultPath(options.configDir ?? DEFAULT_CONFIG_DIR);
     this.pluginDir = normalizeVaultPath(options.pluginDir ?? DEFAULT_PLUGIN_DIR);
     this.diag = options.diag ?? null;
+    this.downloadUi = options.downloadUi ?? null;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -142,7 +181,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return "";
     } catch (error) {
       // 诊断：打开失败时记录读的是哪个 path/fid（不改行为：照旧抛出）
-      this.reportDiag("getResourcePath", clean, fid, error);
+      this.reportDiagOnce(error, "getResourcePath", clean, fid);
       throw error;
     }
   }
@@ -204,7 +243,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return { files, folders };
     } catch (error) {
       // 诊断：区分「列目录」与「排序」两个阶段（不改行为：照旧抛出）
-      this.reportDiag(sorting ? "sort" : "list", clean, "-", error);
+      this.reportDiagOnce(error, sorting ? "sort" : "list", clean, "-");
       throw error;
     }
   }
@@ -218,7 +257,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return arrayBufferToString(buffer);
     } catch (error) {
       // 诊断：read 阶段（含 download 阶段会另记一条）
-      this.reportDiag("read", normalizedPath, this.fidOf(normalizedPath), error);
+      this.reportDiagOnce(error, "read", normalizedPath, this.fidOf(normalizedPath));
       throw error;
     }
   }
@@ -231,7 +270,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return await this.loadBinary(normalizedPath);
     } catch (error) {
       // 诊断：readBinary 阶段
-      this.reportDiag("readBinary", normalizedPath, this.fidOf(normalizedPath), error);
+      this.reportDiagOnce(error, "readBinary", normalizedPath, this.fidOf(normalizedPath));
       throw error;
     }
   }
@@ -331,7 +370,13 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     return null;
   }
 
-  /** 缓存优先；未命中则下载并回写缓存（正文与附件同一规则，v3 §5）。 */
+  /**
+   * 缓存优先；未命中则下载并回写缓存（正文与附件同一规则，v3 §5）。
+   *
+   * 0.2.4：下载时通过注入的 `downloadUi` 显示「正在下载 … [取消]」。
+   * 取消 = 丢弃结果 + 不写缓存 + 抛 `QuarkDownloadCanceledError`；
+   * `requestUrl` 无 AbortSignal，**无法中断已发出的 HTTP**，这里也不假装能中断。
+   */
   private async loadBinary(normalizedPath: string): Promise<ArrayBuffer> {
     const clean = normalizeVaultPath(normalizedPath);
     if (!clean) throw new QuarkEntryNotFoundError(clean);
@@ -343,24 +388,30 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (!entry) throw new QuarkEntryNotFoundError(clean);
     if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
 
-    let buffer: ArrayBuffer;
+    const token = this.downloadUi?.begin({ path: clean, fid: entry.fid, sizeBytes: entry.size }) ?? null;
     try {
-      buffer = await this.client.downloadFile(entry.fid);
+      if (token && token.aborted) throw new QuarkDownloadCanceledError();
+      const buffer = await this.client.downloadFile(entry.fid, { signal: token });
+      if (token && token.aborted) throw new QuarkDownloadCanceledError();
+      this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
+      this.downloadUi?.end(token, "done");
+      return buffer;
     } catch (error) {
-      // 诊断：download 阶段（fid 就是请求用的 fid）
-      this.reportDiag("download", clean, entry.fid, error);
+      this.downloadUi?.end(token, token && token.aborted ? "canceled" : "failed");
+      // 一次失败只记一条日志（download 与 read 不重复记）
+      this.reportDiagOnce(error, "download", clean, entry.fid);
       throw error;
     }
-    this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
-    return buffer;
   }
 
-  /** 诊断出口：任何异常都不允许影响读路径。 */
+  /** 诊断出口：任何异常都不允许影响读路径；同一错误对象只记一条。 */
   private reportDiag(
     stage: QuarkAdapterDiagStage,
     path: string,
     fid: string,
-    error: unknown
+    error: unknown,
+    cause: QuarkDiagCause = "unknown",
+    retried = false
   ): void {
     try {
       this.diag?.({
@@ -368,14 +419,43 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
         path: path || "/",
         fid: fid || "-",
         message: error instanceof Error ? error.message : String(error),
+        cause: diagCauseOf(error, cause),
+        retried,
       });
     } catch {
       /* 诊断日志失败不影响读写 */
     }
   }
 
+  /** 去重版：同一个错误对象（同一次失败）只记一条。 */
+  private reportDiagOnce(
+    error: unknown,
+    stage: QuarkAdapterDiagStage,
+    path: string,
+    fid: string
+  ): void {
+    if (typeof error === "object" && error !== null) {
+      if (loggedErrors.has(error)) return;
+      loggedErrors.add(error);
+    }
+    this.reportDiag(stage, path, fid, error);
+  }
+
   private fidOf(normalizedPath: string): string {
     const entry = this.findEntry(normalizeVaultPath(normalizedPath));
     return entry ? entry.fid : "-";
   }
+}
+
+/** 错误 → 日志 cause（0.2.4 A7：timeout / size / auth / canceled / http / unknown）。 */
+export function diagCauseOf(error: unknown, fallback: QuarkDiagCause = "unknown"): QuarkDiagCause {
+  if (error instanceof QuarkFileTooLargeError) return "size";
+  if (error instanceof QuarkAuthError) return "auth";
+  if (error instanceof DownloadGateError && error.kind === "auth-expired") return "auth";
+  if (error instanceof QuarkDownloadCanceledError) return "canceled";
+  if (error instanceof QuarkDownloadTimeoutError) return "timeout";
+  if (error instanceof Error && /timeout|timed out|超时|ETIMEDOUT/i.test(`${error.name} ${error.message}`)) {
+    return "timeout";
+  }
+  return fallback;
 }

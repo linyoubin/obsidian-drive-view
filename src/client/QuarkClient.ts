@@ -15,6 +15,8 @@
  */
 
 import { CookieStore, collectSetCookieValues } from "../auth/CookieStore";
+import { DEFAULT_AUTH_COOLDOWN_MS, DEFAULT_DOWNLOAD_CONCURRENCY, DownloadGate } from "./downloadGate";
+import type { GateSignal } from "./downloadGate";
 
 /** 桌面 Chrome UA（与已跑通探针一致；手机端 UA 策略见 v3 §9.4 Q6，暂沿用）。 */
 export const QUARK_DEFAULT_UA =
@@ -111,6 +113,65 @@ export class QuarkApiError extends QuarkError {
   }
 }
 
+/**
+ * 文件太大（夸克侧限制，不是本插件 bug）。
+ *
+ * 两个来源：
+ *   - 下载前 precheck：`size > 单文件上限`（默认 5 MB），**不发请求**；
+ *   - 服务端 `code=23018 download file size limit`。
+ */
+export class QuarkFileTooLargeError extends QuarkError {
+  /** 触发的文件大小（未知时为 null）。 */
+  readonly sizeBytes: number | null;
+  /** 服务端业务码（precheck 触发时为 null）。 */
+  readonly code: number | null;
+
+  constructor(message: string, details: { sizeBytes?: number | null; code?: number | null } = {}) {
+    super("api", message);
+    this.name = "QuarkFileTooLargeError";
+    this.sizeBytes = details.sizeBytes ?? null;
+    this.code = details.code ?? null;
+  }
+}
+
+/**
+ * 用户取消下载（0.2.4 A4′）。
+ *
+ * 说明：`requestUrl` 没有 AbortSignal，取消**不能中断已发出的 HTTP 请求**；
+ * 这里是「丢弃结果 + 不再重试 + 不写缓存」，message 固定「已取消下载」。
+ */
+export class QuarkDownloadCanceledError extends QuarkError {
+  constructor(message = "已取消下载") {
+    super("protocol", message);
+    this.name = "QuarkDownloadCanceledError";
+  }
+}
+
+/** 下载超时（已按策略重试过；`retried=true` 表示确实重试了 1 次）。 */
+export class QuarkDownloadTimeoutError extends QuarkError {
+  readonly retried: boolean;
+
+  constructor(message: string, retried = false) {
+    super("protocol", message);
+    this.name = "QuarkDownloadTimeoutError";
+    this.retried = retried;
+  }
+}
+
+/** 下载超时 / 网络中断的判定（transport 抛错或 `requestUrl` 超时都走这里）。 */
+export function isDownloadTimeoutError(error: unknown): boolean {
+  if (error instanceof QuarkDownloadTimeoutError) return true;
+  const name = error instanceof Error ? `${error.name} ${error.message}` : String(error ?? "");
+  return /timeout|timed out|超时|ETIMEDOUT|ECONNRESET|network error|request failed/i.test(name);
+}
+
+/** 夸克「下载文件过大」业务码。 */
+export const QUARK_CODE_FILE_TOO_LARGE = 23018;
+/** 超时重试退避：1 秒。 */
+export const QUARK_DOWNLOAD_RETRY_BACKOFF_MS = 1000;
+/** 默认单文件上限：5 MB（夸克 API 下载上限附近）。 */
+export const QUARK_DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
+
 export interface QuarkDirItem {
   fid: string;
   name: string;
@@ -173,6 +234,14 @@ export interface QuarkClientOptions {
   riskStreakThreshold?: number;
   breakerCooldownMs?: number;
   userAgent?: string;
+  /** 下载并发闸门（默认内部新建；单测可注入以观察并发峰值）。 */
+  gate?: DownloadGate;
+  /** 下载并发上限，默认 2（1–3 由设置页暴露）。 */
+  downloadConcurrency?: number;
+  /** 401 熔断冷却时长，默认 60s。 */
+  authCooldownMs?: number;
+  /** 登录失效时回调（同一失效期只回调一次；main.ts 据此只弹一次 Notice）。 */
+  onAuthExpired?: () => void;
 }
 
 export interface TokenBucketOptions {
@@ -315,6 +384,12 @@ export class QuarkClient {
   private readonly riskStreakThreshold: number;
   private readonly breakerCooldownMs: number;
   private readonly userAgent: string;
+  /** 下载并发闸门（0.2.4：真机并发风暴后加的全局 ≤N 闸）。 */
+  readonly downloadGate: DownloadGate;
+  private readonly authCooldownMs: number;
+  private readonly onAuthExpired?: () => void;
+  /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
+  private authNotified = false;
 
   private riskStreak = 0;
   private breakerOpenUntil = 0;
@@ -333,6 +408,14 @@ export class QuarkClient {
     this.riskStreakThreshold = Math.max(1, options.riskStreakThreshold ?? QUARK_RISK_STREAK_THRESHOLD);
     this.breakerCooldownMs = Math.max(1, options.breakerCooldownMs ?? QUARK_BREAKER_MS);
     this.userAgent = options.userAgent ?? QUARK_DEFAULT_UA;
+    this.authCooldownMs = Math.max(1, options.authCooldownMs ?? DEFAULT_AUTH_COOLDOWN_MS);
+    this.onAuthExpired = options.onAuthExpired;
+    this.downloadGate =
+      options.gate ??
+      new DownloadGate({
+        concurrency: options.downloadConcurrency ?? DEFAULT_DOWNLOAD_CONCURRENCY,
+        now: this.now,
+      });
     this.limiter =
       options.limiter ??
       new TokenBucket({
@@ -340,6 +423,22 @@ export class QuarkClient {
         now: this.now,
         sleep: this.sleep,
       });
+  }
+
+  /** 调整下载并发（设置页改完立即生效）。 */
+  setDownloadConcurrency(value: number): number {
+    return this.downloadGate.setConcurrency(value);
+  }
+
+  /** 登录是否处于 401 熔断期（tooltip/状态栏显示「已登录（过期）」用）。 */
+  isAuthExpired(): boolean {
+    return this.downloadGate.isAuthExpired();
+  }
+
+  /** 重新扫码成功后调用：解除 401 熔断与「只提示一次」标记。 */
+  resetAuth(): void {
+    this.authNotified = false;
+    this.downloadGate.resetAuth();
   }
 
   /** 观测快照：请求数、风控连击、熔断状态、当前 Cookie 名。 */
@@ -502,19 +601,99 @@ export class QuarkClient {
     return downloadUrl;
   }
 
-  /** 下载文件内容（签名 URL 第二跳，仍带 Cookie 头，因为 CDN 侧也要登录态）。 */
-  async downloadFile(fid: string): Promise<ArrayBuffer> {
-    const downloadUrl = await this.resolveDownloadUrl(fid);
-    const response = await this.requestRaw(downloadUrl, {
-      headers: { Accept: "*/*" },
-      checkAuth: false,
-    });
+  /**
+   * 下载文件内容（签名 URL 第二跳，仍带 Cookie 头，因为 CDN 侧也要登录态）。
+   *
+   * 0.2.4：
+   *   - 所有下载走全局并发闸门 `downloadGate`（默认 ≤2，真机并发风暴后加）；
+   *   - 超时退避 1s 重试 **1 次**，仍失败抛 `QuarkDownloadTimeoutError(retried=true)`；
+   *   - `code=23018`（夸克单文件下载上限）映射为 `QuarkFileTooLargeError`，不重试；
+   *   - 401 → `authExpired`（清队列 + 暂停 60s + 只回调一次），后续下载直接快速失败。
+   */
+  async downloadFile(fid: string, options: { signal?: GateSignal | null } = {}): Promise<ArrayBuffer> {
+    const signal = options.signal ?? null;
+    return this.downloadGate.run(() => this.downloadWithRetry(fid, signal), { signal });
+  }
+
+  private async downloadWithRetry(fid: string, signal: GateSignal | null = null): Promise<ArrayBuffer> {
+    try {
+      return await this.downloadOnce(fid);
+    } catch (error) {
+      if (!isDownloadTimeoutError(error)) throw error;
+      // 用户已取消：不重试（取消 = 丢弃结果 + 停止后续，不假装能中断已发出的 TCP）
+      if (signal && signal.aborted) throw new QuarkDownloadCanceledError();
+      // 超时：退避 1 秒后重试 1 次
+      await this.sleep(QUARK_DOWNLOAD_RETRY_BACKOFF_MS);
+      if (signal && signal.aborted) throw new QuarkDownloadCanceledError();
+      try {
+        return await this.downloadOnce(fid);
+      } catch (second) {
+        if (second instanceof QuarkAuthError || second instanceof QuarkFileTooLargeError) throw second;
+        if (second instanceof QuarkDownloadCanceledError) throw second;
+        if (isDownloadTimeoutError(second)) {
+          throw new QuarkDownloadTimeoutError(
+            `下载超时（已重试 1 次）：${second instanceof Error ? second.message : String(second)}`,
+            true
+          );
+        }
+        throw second;
+      }
+    }
+  }
+
+  /** 单次下载（两跳）；失败统一映射为可诊断的错误类型。 */
+  private async downloadOnce(fid: string): Promise<ArrayBuffer> {
+    let downloadUrl: string;
+    try {
+      downloadUrl = await this.resolveDownloadUrl(fid);
+    } catch (error) {
+      throw this.mapDownloadError(error);
+    }
+    let response: QuarkHttpResponse;
+    try {
+      response = await this.requestRaw(downloadUrl, {
+        headers: { Accept: "*/*" },
+        checkAuth: false,
+      });
+    } catch (error) {
+      throw this.mapDownloadError(error);
+    }
     if (response.arrayBuffer && response.arrayBuffer.byteLength > 0) return response.arrayBuffer;
     if (typeof response.text === "string" && response.text) {
       const bytes = new TextEncoder().encode(response.text);
       return bytes.buffer as ArrayBuffer;
     }
     return new ArrayBuffer(0);
+  }
+
+  /** 下载错误归一：23018 → 文件过大；401 → 熔断；其它原样。 */
+  private mapDownloadError(error: unknown): unknown {
+    if (error instanceof QuarkAuthError) {
+      this.handleAuthExpired();
+      return error;
+    }
+    if (error instanceof QuarkApiError) {
+      if (error.code === QUARK_CODE_FILE_TOO_LARGE || /size limit/i.test(error.message)) {
+        return new QuarkFileTooLargeError(
+          "夸克拒绝下载该文件（code=23018，可能超过单文件下载上限）",
+          { code: error.code }
+        );
+      }
+      return error;
+    }
+    return error;
+  }
+
+  /** 401 熔断：清队列 + 暂停 60s + 同一失效期只回调一次（main.ts 只弹一次 Notice）。 */
+  private handleAuthExpired(): void {
+    this.downloadGate.failAuth(this.authCooldownMs);
+    if (this.authNotified) return;
+    this.authNotified = true;
+    try {
+      this.onAuthExpired?.();
+    } catch {
+      /* 回调失败不影响请求处理 */
+    }
   }
 
   /**
@@ -580,6 +759,8 @@ export class QuarkClient {
     const message = json && typeof json.message === "string" ? json.message : "";
     const needLogin = /require\s+login/i.test(message);
     if (status === 401 || code === 31001 || needLogin) {
+      // 0.2.4：任何被判定为登录失效的响应都触发一次熔断（清队列 + 暂停 60s + 只提示一次）
+      this.handleAuthExpired();
       throw new QuarkAuthError(
         status === 401 ? "登录态失效（HTTP 401），请重新扫码" : `登录态失效（code=${code ?? "?"}${message ? ` ${message}` : ""}），请重新扫码`,
         { status, code }

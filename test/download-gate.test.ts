@@ -1,0 +1,302 @@
+/**
+ * 下载闸门与下载错误策略单测（0.2.4 A2/A3/A5/A6/A7）。
+ *
+ * 全部用注入的假 transport / 假时钟，不碰网络与真实 DOM。
+ */
+
+import { describe, expect, test } from "bun:test";
+
+import {
+  DownloadGate,
+  DownloadGateError,
+  normalizeGateConcurrency,
+} from "../src/client/downloadGate";
+import {
+  QuarkAuthError,
+  QuarkClient,
+  QuarkDownloadCanceledError,
+  QuarkDownloadTimeoutError,
+  QuarkFileTooLargeError,
+  TokenBucket,
+  type QuarkHttpResponse,
+  type QuarkTransport,
+} from "../src/client/QuarkClient";
+import { QuarkReadOnlyAdapter, diagCauseOf } from "../src/adapter/QuarkReadOnlyAdapter";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+const fastBucket = (): TokenBucket => new TokenBucket({ ratePerSecond: 10000, sleep: async () => {} });
+const fastSleep = async (): Promise<void> => {};
+
+function jsonResponse(status: number, body: unknown): QuarkHttpResponse {
+  return { status, headers: {}, text: JSON.stringify(body) };
+}
+
+function fileResponse(text: string): QuarkHttpResponse {
+  const bytes = new TextEncoder().encode(text);
+  return { status: 200, headers: {}, arrayBuffer: bytes.buffer as ArrayBuffer };
+}
+
+describe("DownloadGate：并发上限与排队（A2）", () => {
+  test("50 个并发任务：实际并发峰值 ≤ 配置值 2，其余排队", async () => {
+    const gate = new DownloadGate({ concurrency: 2 });
+    let running = 0;
+    let observedPeak = 0;
+    const tasks = Array.from({ length: 50 }, (_, index) =>
+      gate.run(async () => {
+        running += 1;
+        observedPeak = Math.max(observedPeak, running);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        running -= 1;
+        return index;
+      })
+    );
+    const results = await Promise.all(tasks);
+    expect(observedPeak).toBeLessThanOrEqual(2);
+    expect(gate.peak).toBeLessThanOrEqual(2);
+    expect(gate.peak).toBe(2);
+    expect(results.length).toBe(50);
+    expect(gate.active).toBe(0);
+    expect(gate.pending).toBe(0);
+  });
+
+  test("FIFO：并发 1 时按提交顺序执行", async () => {
+    const gate = new DownloadGate({ concurrency: 1 });
+    const order: number[] = [];
+    const tasks = [1, 2, 3].map((n) => gate.run(async () => order.push(n)));
+    await Promise.all(tasks);
+    expect(order).toEqual([1, 2, 3]);
+  });
+
+  test("高优先级插队（同优先级仍 FIFO）", async () => {
+    const gate = new DownloadGate({ concurrency: 1 });
+    const order: string[] = [];
+    const first = deferred<void>();
+    const running = gate.run(async () => {
+      order.push("running");
+      await first.promise;
+    });
+    const normal = gate.run(async () => order.push("normal"));
+    const high = gate.run(async () => order.push("high"), { priority: "high" });
+    first.resolve();
+    await Promise.all([running, normal, high]);
+    expect(order).toEqual(["running", "high", "normal"]);
+  });
+
+  test("401 熔断：清空排队任务并拒绝；新任务直接快速失败", async () => {
+    const gate = new DownloadGate({ concurrency: 1, now: () => 1000 });
+    const release = deferred<void>();
+    const running = gate.run(async () => {
+      await release.promise;
+      return "ok";
+    });
+    const queuedA = gate.run(async () => "a");
+    const queuedB = gate.run(async () => "b");
+    gate.failAuth(60_000);
+
+    await expect(queuedA).rejects.toBeInstanceOf(DownloadGateError);
+    await expect(queuedB).rejects.toBeInstanceOf(DownloadGateError);
+    await expect(gate.run(async () => "c")).rejects.toMatchObject({ kind: "auth-expired" });
+    expect(gate.isAuthExpired()).toBe(true);
+    expect(gate.authRetryAfterMs()).toBe(60_000);
+    release.resolve();
+    await expect(running).resolves.toBe("ok");
+
+    gate.resetAuth();
+    await expect(gate.run(async () => "d")).resolves.toBe("d");
+  });
+
+  test("取消信号：已取消的任务直接拒绝，不占并发", async () => {
+    const gate = new DownloadGate({ concurrency: 1 });
+    const signal = { aborted: true };
+    await expect(gate.run(async () => 1, { signal })).rejects.toMatchObject({ kind: "aborted" });
+    expect(gate.active).toBe(0);
+  });
+
+  test("setConcurrency：clamp 与「调小后不再多开」", async () => {
+    expect(normalizeGateConcurrency(0)).toBe(1);
+    expect(normalizeGateConcurrency(9)).toBe(8);
+    expect(normalizeGateConcurrency(undefined)).toBe(2);
+    expect(normalizeGateConcurrency(2.6)).toBe(2);
+    const gate = new DownloadGate({ concurrency: 3 });
+    expect(gate.setConcurrency(1)).toBe(1);
+    expect(gate.setConcurrency(2)).toBe(2);
+  });
+
+  test("任务异常不泄漏并发槽：失败后下一个仍能跑", async () => {
+    const gate = new DownloadGate({ concurrency: 1 });
+    await expect(gate.run(async () => { throw new Error("boom"); })).rejects.toThrow("boom");
+    await expect(gate.run(async () => "next")).resolves.toBe("next");
+    expect(gate.active).toBe(0);
+    expect(gate.started).toBe(2);
+  });
+});
+
+describe("QuarkClient：超时重试 / 23018 / 401 熔断（A3/A5/A6）", () => {
+  function makeClient(
+    handler: (url: string, attempt: number) => QuarkHttpResponse | Promise<QuarkHttpResponse>,
+    extra: Partial<{ onAuthExpired: () => void; gate: DownloadGate }> = {}
+  ) {
+    const calls: string[] = [];
+    const transport: QuarkTransport = async (request) => {
+      calls.push(request.url);
+      return handler(request.url, calls.length);
+    };
+    const client = new QuarkClient({
+      transport,
+      limiter: fastBucket(),
+      sleep: fastSleep,
+      ...extra,
+    });
+    return { client, calls };
+  }
+
+  const isDownloadPost = (url: string): boolean => url.includes("/file/download");
+
+  test("超时重试 1 次成功：transport 被调用 2 次", async () => {
+    const { client, calls } = makeClient((url, attempt) => {
+      if (isDownloadPost(url)) {
+        if (attempt === 1) throw new Error("Request failed. 请求超时");
+        return jsonResponse(200, { code: 0, data: [{ download_url: "https://cdn.example/f1" }] });
+      }
+      return fileResponse("hello");
+    });
+    const bytes = await client.downloadFile("fid-1");
+    expect(new TextDecoder().decode(bytes)).toBe("hello");
+    expect(calls.length).toBe(3); // 第一跳(超时) → 重试第一跳 → 第二跳
+  });
+
+  test("连续超时：抛 QuarkDownloadTimeoutError(retried=true)", async () => {
+    const { client, calls } = makeClient(() => {
+      throw new Error("Request failed. 请求超时");
+    });
+    await expect(client.downloadFile("fid-1")).rejects.toBeInstanceOf(QuarkDownloadTimeoutError);
+    try {
+      await client.downloadFile("fid-2");
+    } catch (error) {
+      expect((error as QuarkDownloadTimeoutError).retried).toBe(true);
+    }
+    expect(calls.length).toBe(4); // 每次下载 1 次 + 重试 1 次
+  });
+
+  test("code=23018：映射为 QuarkFileTooLargeError，文案中性、不重试", async () => {
+    const { client, calls } = makeClient((url) => {
+      if (isDownloadPost(url)) return jsonResponse(200, { code: 23018, message: "download file size limit" });
+      return fileResponse("x");
+    });
+    await expect(client.downloadFile("fid-big")).rejects.toBeInstanceOf(QuarkFileTooLargeError);
+    expect(calls.filter(isDownloadPost).length).toBe(1);
+    try {
+      await client.downloadFile("fid-big");
+    } catch (error) {
+      expect((error as QuarkFileTooLargeError).message).toContain("code=23018");
+      expect((error as QuarkFileTooLargeError).message).toContain("可能超过单文件下载上限");
+    }
+  });
+
+  test("连续 10 个 401：只回调一次，之后快速失败且不再发请求", async () => {
+    let notified = 0;
+    const { client, calls } = makeClient(
+      () => jsonResponse(401, { code: 31001, message: "require login [guest]" }),
+      { onAuthExpired: () => { notified += 1; } }
+    );
+    const results = await Promise.allSettled(
+      Array.from({ length: 10 }, (_, index) => client.downloadFile(`fid-${index}`))
+    );
+    expect(results.every((item) => item.status === "rejected")).toBe(true);
+    expect(notified).toBe(1);
+    expect(client.isAuthExpired()).toBe(true);
+    const callsAfterStorm = calls.length;
+    await expect(client.downloadFile("fid-late")).rejects.toBeInstanceOf(DownloadGateError);
+    expect(calls.length).toBe(callsAfterStorm);
+  });
+
+  test("取消后不重试：超时且已取消 → QuarkDownloadCanceledError，只发 1 次请求", async () => {
+    let calls = 0;
+    const transport: QuarkTransport = async () => {
+      calls += 1;
+      throw new Error("Request failed. 请求超时");
+    };
+    const client = new QuarkClient({ transport, limiter: fastBucket(), sleep: fastSleep });
+    const signal = { aborted: false };
+    const pending = client.downloadFile("fid-1", { signal });
+    signal.aborted = true; // 第一次超时后（重试前）用户点了取消
+    await expect(pending).rejects.toBeInstanceOf(QuarkDownloadCanceledError);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
+  function makeAdapter(downloadImpl: (fid: string, options?: { signal?: { aborted: boolean } | null }) => Promise<ArrayBuffer>) {
+    const puts: string[] = [];
+    const logs: Array<{ cause?: string; started: number }> = [];
+    const index = {
+      entries: [{ path: "notes/a.md", type: "file" as const, fid: "fid-a", parentFid: "0", size: 2048, mtime: 1 }],
+    };
+    const cache = {
+      has: () => false,
+      get: () => null,
+      getResourceUrl: () => "",
+      put: (path: string) => { puts.push(path); return { cached: true }; },
+      enqueuePrefetch: () => undefined,
+    };
+    let started = 0;
+    let lastToken: { aborted: boolean } | null = null;
+    const adapter = new QuarkReadOnlyAdapter({
+      index,
+      cache,
+      client: { downloadFile: downloadImpl },
+      baseAdapter: {} as never,
+      diag: (entry) => logs.push({ cause: entry.cause, started }),
+      downloadUi: {
+        begin: () => {
+          started += 1;
+          lastToken = { aborted: false };
+          return lastToken;
+        },
+        end: () => undefined,
+      },
+    });
+    return { adapter, puts, logs, cancel: () => { if (lastToken) lastToken.aborted = true; } };
+  }
+
+  test("取消后不写缓存、不重试、抛 canceled，日志 cause=canceled", async () => {
+    let calls = 0;
+    const { adapter, puts, logs, cancel } = makeAdapter(async () => {
+      calls += 1;
+      cancel(); // 下载返回前用户点了「取消」
+      return new TextEncoder().encode("hello").buffer as ArrayBuffer;
+    });
+    await expect(adapter.read("/notes/a.md")).rejects.toBeInstanceOf(QuarkDownloadCanceledError);
+    expect(calls).toBe(1);
+    expect(puts.length).toBe(0);
+    expect(logs.length).toBe(1);
+    expect(logs[0].cause).toBe("canceled");
+  });
+
+  test("同一错误对象只记一条日志（download 与 read 不重复记）", async () => {
+    const { adapter, logs } = makeAdapter(async () => {
+      throw new Error("Request failed. 请求超时");
+    });
+    await expect(adapter.read("/notes/a.md")).rejects.toThrow();
+    expect(logs.length).toBe(1);
+    expect(logs[0].cause).toBe("timeout");
+  });
+
+  test("diagCauseOf：各错误类型映射到 cause", () => {
+    expect(diagCauseOf(new QuarkFileTooLargeError("x", { code: 23018 }))).toBe("size");
+    expect(diagCauseOf(new QuarkAuthError("401"))).toBe("auth");
+    expect(diagCauseOf(new QuarkDownloadCanceledError())).toBe("canceled");
+    expect(diagCauseOf(new QuarkDownloadTimeoutError("t", true))).toBe("timeout");
+    expect(diagCauseOf(new DownloadGateError("auth-expired", "x"))).toBe("auth");
+    expect(diagCauseOf(new Error("other"))).toBe("unknown");
+  });
+});

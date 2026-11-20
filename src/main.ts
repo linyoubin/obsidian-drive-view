@@ -41,6 +41,8 @@ import {
 } from "./ui/QuarkSettingsTab";
 import type { QuarkFlowEvent, QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSettingsTab";
 import { GoogleDriveSettingTab } from "./ui/SettingsTab";
+import { DownloadNoticeBook } from "./client/downloadUi";
+import type { DownloadNoticeLike } from "./client/downloadUi";
 import { normalizeVaultPath } from "./utils/pathUtils";
 import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
 import type { DiagAdapterLike } from "./utils/diagLog";
@@ -145,6 +147,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkDiag: DiagLogger | null = null;
   private quarkSettingsTab: QuarkSettingsTab | null = null;
   private lastQuarkLoginState: QuarkUiSnapshot["loginState"] | null = null;
+  private quarkDownloadBook: DownloadNoticeBook | null = null;
+  private quarkAuthExpired = false;
   private lastSettingsRefreshAt = 0;
 
   private statusBarItemEl: HTMLElement | null = null;
@@ -441,7 +445,21 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     });
     await this.quarkCookieStore.load();
 
-    this.quarkClient = new QuarkClient({ transport: quarkTransport, cookieStore: this.quarkCookieStore });
+    // 0.2.4 A4′：下载中「正在下载 … [取消]」单例提示（取消 = 丢弃结果 + 不重试 + 不写缓存）
+    this.quarkDownloadBook = new DownloadNoticeBook(
+      {
+        create: (message) => new Notice(message, 0),
+        attachCancel: (notice, onCancel) => this.attachDownloadCancel(notice, onCancel),
+      },
+      { thresholdBytes: () => this.settings.quarkMaxFileBytes }
+    );
+    this.quarkClient = new QuarkClient({
+      transport: quarkTransport,
+      cookieStore: this.quarkCookieStore,
+      downloadConcurrency: this.settings.quarkDownloadConcurrency,
+      // 401：清队列 + 暂停 60s，同一失效期只回调一次 → 这里只弹一次提醒
+      onAuthExpired: () => this.onQuarkAuthExpired(),
+    });
     this.quarkCache = new ContentCache({ maxBytes: DEFAULT_CONTENT_CACHE_BYTES });
     this.quarkIndex = new IndexStore({
       createBackend: createIdbBackend({ dbName: indexDbNameForVault(this.app.vault.getName()) }),
@@ -460,6 +478,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       baseAdapter: this.mounter.getOriginalAdapter(),
       // 只在 adapter 的 catch 分支被调用：记录 path/fid/阶段（不改读写行为）
       diag: (entry) => this.quarkDiag?.log(entry),
+      downloadUi: {
+        begin: (info) => this.quarkDownloadBook!.begin(info),
+        end: (token, outcome) => this.quarkDownloadBook!.end(token, outcome),
+      },
     });
 
     this.quarkStatusBarEl = this.addStatusBarItem();
@@ -651,6 +673,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         if (ok) {
           await this.quarkCookieStore.save();
           this.lastPersistedQuarkCookie = this.quarkCookieStore.getHeader();
+          // 重新扫码成功：解除 401 熔断与「已过期」状态
+          this.quarkAuthExpired = false;
+          this.quarkClient.resetAuth();
           this.refreshQuarkUi();
           new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），继续…`, 4000);
         }
@@ -824,11 +849,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public quarkSnapshot(): QuarkUiSnapshot {
     if (!this.quarkCookieStore || !this.quarkIndex || !this.quarkCache) return EMPTY_QUARK_SNAPSHOT;
     const cookieNames = this.quarkCookieStore.names();
-    const loginState = this.quarkCookieStore.isEmpty
-      ? "none"
-      : this.quarkCookieStore.hasLoginCookie()
-        ? "active"
-        : "expired";
+    const loginState = this.quarkAuthExpired
+      ? "expired"
+      : this.quarkCookieStore.isEmpty
+        ? "none"
+        : this.quarkCookieStore.hasLoginCookie()
+          ? "active"
+          : "expired";
     const meta = this.quarkIndex.metaInfo;
     const status = this.quarkIndex.status;
     return {
@@ -847,7 +874,52 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       scannedFolders: this.quarkProgress.scanned,
       pendingFolders: this.quarkProgress.pending,
       currentFolder: this.quarkProgress.current,
+      downloadConcurrency: this.settings.quarkDownloadConcurrency,
+      maxFileBytes: this.settings.quarkMaxFileBytes,
     };
+  }
+
+  /** 在下载提示里追加「取消」按钮（A4′）：点一下只标记 canceled，不假装中断 TCP。 */
+  private attachDownloadCancel(notice: DownloadNoticeLike, onCancel: () => void): void {
+    const el = notice.noticeEl as
+      | { createEl?: (tag: string, options?: { text?: string }) => HTMLElement }
+      | undefined;
+    if (!el || typeof el.createEl !== "function") return;
+    try {
+      const button = el.createEl("button", { text: "取消" });
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        onCancel();
+      });
+    } catch (error) {
+      console.warn("[Quark] attach download cancel failed:", error);
+    }
+  }
+
+  /** 401 熔断回调（同一失效期客户端只回调一次）：只弹一次提醒并刷新 tooltip。 */
+  private onQuarkAuthExpired(): void {
+    if (!this.quarkAuthExpired) {
+      new Notice("夸克：登录已失效，请重新扫码（点左侧「同步夸克」图标）", 10000);
+    }
+    this.quarkAuthExpired = true;
+    this.refreshQuarkUi();
+  }
+
+  /** 设置页：下载并发（1–3）改完立即生效。 */
+  public async quarkSetDownloadConcurrency(value: number): Promise<void> {
+    const numeric = Number.isFinite(value) ? Math.round(value) : 2;
+    const concurrency = Math.min(3, Math.max(1, numeric));
+    await this.updateSettings({ quarkDownloadConcurrency: concurrency });
+    this.quarkClient?.setDownloadConcurrency(concurrency);
+    this.refreshQuarkUi();
+  }
+
+  /** 设置页：大文件提醒阈值（MB，仅提示，不拦截）。 */
+  public async quarkSetMaxFileMb(mb: number): Promise<void> {
+    const numeric = Number.isFinite(mb) ? mb : 50;
+    const safeMb = Math.max(0, Math.min(10240, numeric));
+    await this.updateSettings({ quarkMaxFileBytes: Math.round(safeMb * 1024 * 1024) });
+    this.refreshQuarkUi();
   }
 
   private updateQuarkRibbonTooltip(): void {

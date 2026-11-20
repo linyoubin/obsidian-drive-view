@@ -23,6 +23,9 @@ export const DIAG_MSG_MAX = 200;
 /** 「导出诊断」最多带走的行数。 */
 export const DIAG_TAIL_LINES = 200;
 
+/** 失败原因分类（0.2.4 A7）。 */
+export type DiagCause = "timeout" | "size" | "auth" | "http" | "canceled" | "unknown";
+
 export interface DiagEntry {
   stage: DiagStage;
   /** 库内路径（根目录用 `/`）。 */
@@ -32,6 +35,10 @@ export interface DiagEntry {
   /** 原始错误消息（会被截断与脱敏）。 */
   message: string;
   level?: "error" | "warn";
+  /** 失败原因分类；写进日志的 `cause=` 字段。 */
+  cause?: DiagCause;
+  /** 是否重试过（超时重试 1 次后仍失败为 true）。 */
+  retried?: boolean;
 }
 
 /**
@@ -51,7 +58,9 @@ export function formatDiagLine(entry: DiagEntry, now: Date = new Date()): string
   const path = entry.path && entry.path !== "" ? entry.path : "/";
   const fid = entry.fid && entry.fid !== "" ? entry.fid : "-";
   const msg = redactDiagMessage(entry.message).replace(/\s+/g, " ").trim().slice(0, DIAG_MSG_MAX);
-  return `[${now.toISOString()}] level=${level} stage=${entry.stage} path=${path} fid=${fid} msg=${msg}`;
+  const cause = entry.cause ? ` cause=${entry.cause}` : "";
+  const retried = entry.retried === true ? " retried=true" : "";
+  return `[${now.toISOString()}] level=${level} stage=${entry.stage} path=${path} fid=${fid}${cause}${retried} msg=${msg}`;
 }
 
 function utf8Length(text: string): number {

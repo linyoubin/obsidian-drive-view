@@ -177,6 +177,14 @@ export interface QuarkSettings {
    * 最近一次索引建立的毫秒时间戳（0 = 从未建立）。
    */
   quarkLastIndexBuiltAt: number;
+  /**
+   * 下载并发上限（1–3，默认 2；真机并发风暴后加，0.2.4）。
+   */
+  quarkDownloadConcurrency: number;
+  /**
+   * 大文件**提醒阈值**（字节，默认 50 MB，0 = 不提醒）；**仅影响提示文案，不拦截下载**（0.2.4 A6′）。
+   */
+  quarkMaxFileBytes: number;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -185,6 +193,8 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkRootPath: "/",
   quarkRootChosenAt: 0,
   quarkLastIndexBuiltAt: 0,
+  quarkDownloadConcurrency: 2,
+  quarkMaxFileBytes: 50 * 1024 * 1024,
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */
