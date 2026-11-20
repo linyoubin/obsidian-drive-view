@@ -42,6 +42,8 @@ import {
 import type { QuarkFlowEvent, QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSettingsTab";
 import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { normalizeVaultPath } from "./utils/pathUtils";
+import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
+import type { DiagAdapterLike } from "./utils/diagLog";
 
 /** 运行期 Notice 的扩展能力（obsidian.d.ts 只声明了构造函数）。 */
 type NoticeWithMessage = {
@@ -49,6 +51,53 @@ type NoticeWithMessage = {
   noticeEl?: { setText?: (text: string) => void };
   hide?: () => void;
 };
+
+/**
+ * 模块级单例（0.2.3 A2）：同步进度**只用一个 Notice 实例**，每扫完一个目录
+ * `setMessage` 更新文案。真机反馈「状态信息有时候没有弹出来」正是反复 `new Notice` 造成的。
+ */
+let quarkSyncNotice: (Notice & NoticeWithMessage) | null = null;
+let quarkSyncNoticeTimer: number | null = null;
+
+function setNoticeMessage(notice: Notice & NoticeWithMessage, message: string): void {
+  if (typeof notice.setMessage === "function") notice.setMessage(message);
+  else if (notice.noticeEl && typeof notice.noticeEl.setText === "function") {
+    notice.noticeEl.setText(message);
+  }
+}
+
+/** 显示/更新同一个进度 Notice（duration 0，直到结束才消失）。 */
+function showQuarkSyncNotice(message: string): void {
+  if (quarkSyncNoticeTimer !== null) {
+    window.clearTimeout(quarkSyncNoticeTimer);
+    quarkSyncNoticeTimer = null;
+  }
+  if (!quarkSyncNotice) {
+    quarkSyncNotice = new Notice(message, 0) as Notice & NoticeWithMessage;
+    return;
+  }
+  setNoticeMessage(quarkSyncNotice, message);
+}
+
+/** 结束时把单例 Notice 换成结果文案，`hideAfterMs` 后自动消失（默认 8 秒）。 */
+function finishQuarkSyncNotice(message: string, hideAfterMs = 8000): void {
+  showQuarkSyncNotice(message);
+  const notice = quarkSyncNotice;
+  quarkSyncNoticeTimer = window.setTimeout(() => {
+    quarkSyncNoticeTimer = null;
+    if (notice && typeof notice.hide === "function") notice.hide();
+    if (quarkSyncNotice === notice) quarkSyncNotice = null;
+  }, hideAfterMs);
+}
+
+function hideQuarkSyncNotice(): void {
+  if (quarkSyncNoticeTimer !== null) {
+    window.clearTimeout(quarkSyncNoticeTimer);
+    quarkSyncNoticeTimer = null;
+  }
+  if (quarkSyncNotice && typeof quarkSyncNotice.hide === "function") quarkSyncNotice.hide();
+  quarkSyncNotice = null;
+}
 
 /** 夸克网络出口：唯一的 `requestUrl` 调用点（QuarkClient 只拿到这个函数）。 */
 const quarkTransport: QuarkTransport = async (request) => {
@@ -93,6 +142,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkProgress = { scanned: 0, pending: 0, current: "" };
   private lastPersistedQuarkCookie = "";
   private quarkRibbonEl: HTMLElement | null = null;
+  private quarkDiag: DiagLogger | null = null;
+  private quarkSettingsTab: QuarkSettingsTab | null = null;
+  private lastQuarkLoginState: QuarkUiSnapshot["loginState"] | null = null;
+  private lastSettingsRefreshAt = 0;
 
   private statusBarItemEl: HTMLElement | null = null;
   private pollIntervalId: number | null = null;
@@ -190,6 +243,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   public async onunload(): Promise<void> {
     this.stopPollingTimer();
+    hideQuarkSyncNotice();
     await this.mounter.unmount(this.driveAdapter);
     // 夸克只读库：若是我们挂的，随插件卸载一起还原原生 adapter
     if (this.quarkMounted) {
@@ -391,23 +445,33 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCache = new ContentCache({ maxBytes: DEFAULT_CONTENT_CACHE_BYTES });
     this.quarkIndex = new IndexStore({
       createBackend: createIdbBackend({ dbName: indexDbNameForVault(this.app.vault.getName()) }),
-      onStatusChange: () => this.updateQuarkStatusBar(),
+      onStatusChange: () => this.refreshQuarkUi(),
+    });
+    // 诊断日志（0.2.3 A5）：写 `<vault>/.obsidian/plugins/drive-view/quark-debug.log`，
+    // 走原生 adapter（`.obsidian/**` 已转发），不引 fs/node 依赖；失败绝不影响主流程。
+    this.quarkDiag = new DiagLogger({
+      adapter: this.mounter.getOriginalAdapter() as unknown as DiagAdapterLike,
+      onError: (error) => console.warn("[Quark] diag write failed:", error),
     });
     this.quarkAdapter = new QuarkReadOnlyAdapter({
       index: this.quarkIndex,
       cache: this.quarkCache,
       client: this.quarkClient,
       baseAdapter: this.mounter.getOriginalAdapter(),
+      // 只在 adapter 的 catch 分支被调用：记录 path/fid/阶段（不改读写行为）
+      diag: (entry) => this.quarkDiag?.log(entry),
     });
 
     this.quarkStatusBarEl = this.addStatusBarItem();
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
 
-    // 唯一交互入口：左侧 ribbon（title 三态，手机端靠它看状态）
+    // 唯一交互入口：左侧 ribbon（title 四态，手机端靠它看状态；每次状态变化刷新）
     this.quarkRibbonEl = this.addRibbonIcon("refresh-cw", describeRibbonTooltip(this.quarkSnapshot()), () => {
       void this.onQuarkRibbonClick().catch((error) => {
         console.error("[Quark] ribbon action failed:", error);
-        new Notice(`夸克同步失败：${error instanceof Error ? error.message : String(error)}`);
+        new Notice(
+          `夸克同步失败：${error instanceof Error ? error.message : String(error)}\n详情见 ${DIAG_LOG_PATH}`
+        );
       });
     });
 
@@ -422,14 +486,15 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
     });
 
-    this.addSettingTab(new QuarkSettingsTab(this.app, this));
+    this.quarkSettingsTab = new QuarkSettingsTab(this.app, this);
+    this.addSettingTab(this.quarkSettingsTab);
 
     this.app.workspace.onLayoutReady(async () => {
       try {
         await this.bootstrapQuark();
       } catch (error) {
         console.warn("[Quark] bootstrap failed:", error);
-        this.updateQuarkStatusBar();
+        this.refreshQuarkUi();
       }
     });
   }
@@ -450,7 +515,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     } else {
       new Notice("夸克：点左侧「同步夸克」图标扫码登录", 6000);
     }
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
   }
 
   /**
@@ -539,7 +604,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     const previousFid = this.settings.quarkRootFid || "0";
     const previousPath = this.settings.quarkRootPath || "/";
     await this.updateSettings({ quarkRootFid: fid, quarkRootPath: path, quarkRootChosenAt: Date.now() });
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
     if (fid === previousFid && path === previousPath) return;
 
     new Notice(`夸克：库根已切换到 ${describeRootPath(path)}，索引将重建`, 8000);
@@ -550,7 +615,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     await this.quarkIndex.clearAll();
     this.quarkCache.clear();
     await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
     // T-11：改库根后**不自动同步**，由用户确认后再跑（回到确认框 / 点同步）
   }
 
@@ -586,7 +651,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         if (ok) {
           await this.quarkCookieStore.save();
           this.lastPersistedQuarkCookie = this.quarkCookieStore.getHeader();
-          this.updateQuarkStatusBar();
+          this.refreshQuarkUi();
           new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），继续…`, 4000);
         }
         await this.runQuarkFlow({ type: "login", ok, snapshot: this.quarkSnapshot() }).catch((error) => {
@@ -614,12 +679,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkScanSignal = { aborted: false };
     this.quarkProgress = { scanned: 0, pending: 0, current: "/" };
     const startedAt = Date.now();
-    this.updateQuarkStatusBar();
-    // T-11 addendum A9：常驻 Notice（duration 0），每扫完一个目录刷新文案
-    const progressNotice = new Notice(
-      describeSyncProgressNotice(this.settings.quarkRootPath, 0, 0, "/"),
-      0
-    ) as Notice & NoticeWithMessage;
+    // 变化点②同步开始：统一刷新（ribbon title / 状态栏 / 设置页）
+    this.refreshQuarkUi();
+    // 0.2.3 A2：同步进度走模块级单例 Notice —— 只 new 一次，之后每扫完一个目录 setMessage
+    showQuarkSyncNotice(describeSyncProgressNotice(this.settings.quarkRootPath, 0, 0, "/"));
 
     try {
       const result = await this.quarkIndex.scan({
@@ -632,28 +695,33 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
             pending: progress.pendingFolders.length,
             current: this.quarkProgress.current,
           };
-          this.updateQuarkStatusBar();
-          this.updateSyncNotice(progressNotice);
+          this.refreshQuarkUi();
+          showQuarkSyncNotice(
+            describeSyncProgressNotice(
+              this.settings.quarkRootPath,
+              this.quarkProgress.scanned,
+              this.quarkProgress.pending,
+              this.quarkProgress.current
+            )
+          );
         },
       });
 
       const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (result.aborted) {
-        this.hideSyncNotice(progressNotice);
-        new Notice(describeSyncCancel(result.progress.scannedFolders.length), 7000);
+        finishQuarkSyncNotice(describeSyncCancel(result.progress.scannedFolders.length), 8000);
         return;
       }
 
       const diff = result.diff;
-      this.hideSyncNotice(progressNotice);
-      // 完成文案按验收原文：五项统计一行，5 秒后自动消失
-      new Notice(
+      // 完成：同一个 Notice 实例换成结果文案，8 秒后自动消失
+      finishQuarkSyncNotice(
         describeSyncResult(
           this.quarkIndex.entryCount,
           { added: diff.added.length, changed: diff.changed.length, removed: diff.removed.length },
           seconds
         ),
-        5000
+        8000
       );
       await this.updateSettings({ quarkLastIndexBuiltAt: this.quarkIndex.metaInfo.builtAt });
 
@@ -664,13 +732,16 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         await this.mounter.reconcileFullVault(this.createQuarkMountFacade());
       }
     } catch (error) {
-      this.hideSyncNotice(progressNotice);
       console.error("[Quark] sync failed:", error);
-      new Notice(`夸克：同步失败（${error instanceof Error ? error.message : String(error)}）`, 8000);
+      // 同一个单例 Notice 换成失败文案；附诊断日志位置（A5）
+      finishQuarkSyncNotice(
+        `夸克：同步失败（${error instanceof Error ? error.message : String(error)}）\n详情见 ${DIAG_LOG_PATH}`,
+        8000
+      );
     } finally {
       this.quarkIndexing = false;
       this.quarkScanSignal = null;
-      this.updateQuarkStatusBar();
+      this.refreshQuarkUi();
     }
   }
 
@@ -694,13 +765,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private async mountQuark(): Promise<void> {
     if (this.mounter.isMounted()) {
       this.quarkMounted = this.mounter.isMounted();
-      this.updateQuarkStatusBar();
+      this.refreshQuarkUi();
       return;
     }
     if (this.quarkIndex.entryCount === 0) return;
     await this.mounter.mount(this.createQuarkMountFacade());
     this.quarkMounted = true;
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
     new Notice(`夸克：只读库已挂载（${this.quarkIndex.entryCount} 条）`, 5000);
   }
 
@@ -714,13 +785,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       new Notice("夸克：只读库当前未挂载");
     }
     this.quarkCache.clear();
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
   }
 
   public quarkClearCache(): void {
     this.quarkCache.clear();
     new Notice("夸克：内存缓存已清空");
-    this.updateQuarkStatusBar();
+    this.refreshQuarkUi();
   }
 
   /**
@@ -779,38 +850,76 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
   }
 
-  /** 刷新常驻进度 Notice（obsidian.d.ts 没有 setMessage，用运行期能力兜底）。 */
-  private updateSyncNotice(notice: Notice & NoticeWithMessage): void {
-    const text = describeSyncProgressNotice(
-      this.settings.quarkRootPath,
-      this.quarkProgress.scanned,
-      this.quarkProgress.pending,
-      this.quarkProgress.current
-    );
-    if (typeof notice.setMessage === "function") notice.setMessage(text);
-    else if (notice.noticeEl && typeof notice.noticeEl.setText === "function") notice.noticeEl.setText(text);
-  }
-
-  private hideSyncNotice(notice: Notice & NoticeWithMessage): void {
-    if (typeof notice.hide === "function") notice.hide();
-  }
-
   private updateQuarkRibbonTooltip(): void {
     if (!this.quarkRibbonEl) return;
     this.quarkRibbonEl.setAttr("title", describeRibbonTooltip(this.quarkSnapshot()));
   }
 
-  private updateQuarkStatusBar(): void {
-    if (!this.quarkStatusBarEl || !this.quarkIndex || !this.quarkCache) return;
+  /**
+   * 统一状态刷新点（0.2.3 A3）：一次更新 ribbon title + 状态栏 + 设置页（节流 1 秒）。
+   * 六个变化点都调它：登录成功、同步开始、同步结束、挂载完成、卸载、cookie 过期。
+   */
+  private refreshQuarkUi(): void {
+    if (!this.quarkIndex || !this.quarkCache) return;
     const snapshot = this.quarkSnapshot();
-    this.quarkStatusBarEl.setText(describeStatusBar(snapshot));
-    this.quarkStatusBarEl.setAttr(
-      "title",
-      `夸克只读 · ${describeIndexState(snapshot)} · 缓存 ${describeCacheState(
-        snapshot.cacheBytes,
-        snapshot.cacheMaxBytes
-      )}`
-    );
+    // 第六个变化点：cookie 过期（登录态从 active 掉到 expired 时提示一次）
+    if (snapshot.loginState === "expired" && this.lastQuarkLoginState === "active") {
+      new Notice("夸克：登录已过期，请重新扫码（点左侧「同步夸克」图标）", 8000);
+    }
+    this.lastQuarkLoginState = snapshot.loginState;
+
+    if (this.quarkStatusBarEl) {
+      this.quarkStatusBarEl.setText(describeStatusBar(snapshot));
+      this.quarkStatusBarEl.setAttr(
+        "title",
+        `夸克只读 · ${describeIndexState(snapshot)} · 缓存 ${describeCacheState(
+          snapshot.cacheBytes,
+          snapshot.cacheMaxBytes
+        )}`
+      );
+    }
     this.updateQuarkRibbonTooltip();
+    this.refreshQuarkSettingsTab();
+  }
+
+  /** 设置页若正打开着，按 1 秒节流重绘（同步中每目录刷新会太频繁）。 */
+  private refreshQuarkSettingsTab(): void {
+    const tab = this.quarkSettingsTab;
+    if (!tab) return;
+    const container = (tab as unknown as { containerEl?: HTMLElement }).containerEl;
+    if (!container || !container.isConnected) return;
+    const now = Date.now();
+    if (now - this.lastSettingsRefreshAt < 1000) return;
+    this.lastSettingsRefreshAt = now;
+    try {
+      tab.display();
+    } catch (error) {
+      console.warn("[Quark] settings refresh failed:", error);
+    }
+  }
+
+  /** 设置页「导出诊断」：最近 200 行复制到剪贴板（A7），剪贴板不可用时报错不崩。 */
+  public async quarkExportDiagnostics(): Promise<void> {
+    try {
+      const adapter = this.mounter.getOriginalAdapter();
+      const text = (await adapter.exists(DIAG_LOG_PATH)) ? await adapter.read(DIAG_LOG_PATH) : "";
+      const tail = tailDiagLines(text, DIAG_TAIL_LINES);
+      if (!tail) {
+        new Notice("夸克：诊断日志为空（还没有失败记录）", 5000);
+        return;
+      }
+      const lines = tail.split("\n").length;
+      try {
+        await navigator.clipboard.writeText(tail);
+        new Notice(`夸克：已复制最近 ${lines} 行诊断日志`, 5000);
+      } catch (error) {
+        new Notice(
+          `夸克：剪贴板不可用，请手动打开 ${DIAG_LOG_PATH}（${error instanceof Error ? error.message : String(error)}）`,
+          10000
+        );
+      }
+    } catch (error) {
+      new Notice(`夸克：导出诊断失败（${error instanceof Error ? error.message : String(error)}）`, 8000);
+    }
   }
 }

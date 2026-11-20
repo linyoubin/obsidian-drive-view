@@ -395,17 +395,33 @@ describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
     ).toBe("/知识库_云端");
   });
 
-  test("describeRibbonTooltip 三态互不相同（手机端靠 title 看状态）", () => {
+  test("describeRibbonTooltip 四态互不相同（手机端靠 title 看状态）", () => {
     const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
     const none = settingsTab.describeRibbonTooltip(snapshot({ loginState: "none" }));
-    const loggedIn = settingsTab.describeRibbonTooltip(snapshot({ loginState: "active" }));
-    const mounted = settingsTab.describeRibbonTooltip(
-      snapshot({ loginState: "active", mounted: true, builtAt })
+    const loggedIn = settingsTab.describeRibbonTooltip(
+      snapshot({ loginState: "active", indexCount: 0 })
     );
-    expect(none).toBe("同步夸克 · 未登录");
-    expect(loggedIn).toBe("同步夸克 · 已登录");
-    expect(mounted).toBe("同步夸克 · 已挂载（索引 2026-11-20 15:40）");
-    expect(new Set([none, loggedIn, mounted]).size).toBe(3);
+    const syncing = settingsTab.describeRibbonTooltip(
+      snapshot({
+        loginState: "active",
+        indexing: true,
+        scannedFolders: 12,
+        pendingFolders: 30,
+        currentFolder: "/技术",
+      })
+    );
+    const synced = settingsTab.describeRibbonTooltip(
+      snapshot({ loginState: "active", indexCount: 128, builtAt })
+    );
+    expect(none).toBe("Quark Vault · 未登录");
+    expect(loggedIn).toBe("Quark Vault · 已登录");
+    expect(syncing).toBe("Quark Vault · 同步中 29% · /技术");
+    expect(synced).toBe("Quark Vault · 已同步（索引 2026-11-20 15:40 · 128 条）");
+    expect(new Set([none, loggedIn, syncing, synced]).size).toBe(4);
+    // 登录已过期：不误报「未登录」，提示要重新扫码
+    expect(settingsTab.describeRibbonTooltip(snapshot({ loginState: "expired" }))).toBe(
+      "Quark Vault · 已登录（过期）"
+    );
   });
 
   test("库根是否选过决定点 ribbon 后是选根还是确认框（0.2.2 顺序）", () => {
@@ -446,13 +462,27 @@ describe("同步进度：百分比与文案（T-11 addendum）", () => {
     expect(settingsTab.describeSyncCancel(12)).toBe("已取消同步（已扫 12 个目录，索引保留上一版）");
   });
 
-  test("ribbon tooltip 同步中显示百分比与当前目录，结束后恢复三态", () => {
+  test("单例 Notice 四段文案（开始 / 进度 / 完成 / 取消）互不相同且不含 cookie 值", () => {
+    const start = settingsTab.describeSyncProgressNotice("/知识库_云端", 0, 0, "/");
+    const progress = settingsTab.describeSyncProgressNotice("/知识库_云端", 12, 30, "/技术");
+    const done = settingsTab.describeSyncResult(128, { added: 3, changed: 4, removed: 5 }, "12.3");
+    const cancel = settingsTab.describeSyncCancel(12);
+    expect(new Set([start, progress, done, cancel]).size).toBe(4);
+    for (const text of [start, progress, done, cancel]) expect(text).not.toContain("=");
+    expect(progress).toBe("同步 /知识库_云端：已扫 12 · 待扫 30 · 约 29% · 正在扫描 /技术");
+  });
+
+  test("ribbon tooltip 同步中显示百分比与当前目录，结束后回到已同步", () => {
     const syncing = settingsTab.describeRibbonTooltip(
       snapshot({ loginState: "active", indexing: true, scannedFolders: 12, pendingFolders: 30, currentFolder: "/技术" })
     );
-    expect(syncing).toBe("同步夸克 · 同步中 29% · /技术");
-    const idle = settingsTab.describeRibbonTooltip(snapshot({ loginState: "active", mounted: true }));
-    expect(idle).toContain("已挂载");
+    expect(syncing).toBe("Quark Vault · 同步中 29% · /技术");
+    const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
+    const idle = settingsTab.describeRibbonTooltip(
+      snapshot({ loginState: "active", indexCount: 15, builtAt })
+    );
+    expect(idle).toContain("已同步");
+    expect(idle).toContain("15 条");
   });
 
   test("设置页索引态同步显示三段信息", () => {

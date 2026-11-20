@@ -38,6 +38,8 @@ export interface QuarkHost {
   quarkChooseRoot(): Promise<void>;
   quarkClearCache(): void;
   quarkExitReadOnly(): Promise<void>;
+  /** 0.2.3 A7：最近 200 行诊断日志复制到剪贴板。 */
+  quarkExportDiagnostics(): Promise<void>;
 }
 
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
@@ -187,22 +189,30 @@ export function describeSyncResult(
   return `已同步 ${entryCount} 条 · 新增 ${diff.added} · 变更 ${diff.changed} · 删除 ${diff.removed} · 耗时 ${seconds}s`;
 }
 
-/** ribbon tooltip 三态（A6）：手机端看不到状态栏，靠这个 title 看状态。 */
+/**
+ * ribbon tooltip 四态（0.2.3 A4，手机端看不到状态栏，全靠这个 title）：
+ *   - 未登录：`Quark Vault · 未登录`
+ *   - 已登录：`Quark Vault · 已登录`
+ *   - 同步中：`Quark Vault · 同步中 29% · /技术`
+ *   - 已同步：`Quark Vault · 已同步（索引 15:40 · 128 条）`
+ * 登录已过期显示「已登录（过期）」，提示需要重新扫码。
+ */
 export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
   if (snapshot.indexing) {
     const current = snapshot.currentFolder && snapshot.currentFolder !== "" ? snapshot.currentFolder : "/";
-    return `同步夸克 · 同步中 ${estimateScanPercent(
+    return `Quark Vault · 同步中 ${estimateScanPercent(
       snapshot.scannedFolders,
       snapshot.pendingFolders
     )}% · ${current}`;
   }
-  if (snapshot.mounted) {
-    return `同步夸克 · 已挂载（索引 ${formatBuiltAt(snapshot.builtAt)}）`;
+  if (snapshot.loginState === "active") {
+    if (snapshot.indexCount > 0) {
+      return `Quark Vault · 已同步（索引 ${formatBuiltAt(snapshot.builtAt)} · ${snapshot.indexCount} 条）`;
+    }
+    return "Quark Vault · 已登录";
   }
-  if (snapshot.loginState === "active" || snapshot.loginState === "expired") {
-    return "同步夸克 · 已登录";
-  }
-  return "同步夸克 · 未登录";
+  if (snapshot.loginState === "expired") return "Quark Vault · 已登录（过期）";
+  return "Quark Vault · 未登录";
 }
 
 /**
@@ -378,5 +388,15 @@ export class QuarkSettingsTab extends settingTabBase() {
     container.createEl("p", {
       text: "只读：写操作一律拒绝；正文与附件只进内存（8 MB LRU），不占用本地空间。",
     });
+
+    // 0.2.3 A7：出错时把最近 200 行诊断日志复制走（日志不含 cookie 与正文）
+    new Setting(container)
+      .setName("诊断")
+      .setDesc("打开失败等异常会记到 .obsidian/plugins/drive-view/quark-debug.log（不含 cookie 与正文）")
+      .addButton((button: any) =>
+        button.setButtonText("导出诊断").onClick(async () => {
+          await this.host.quarkExportDiagnostics();
+        })
+      );
   }
 }

@@ -56,6 +56,17 @@ export interface QuarkDownloadClient {
   downloadFile(fid: string): Promise<ArrayBuffer>;
 }
 
+/** 诊断阶段名（与 `src/utils/diagLog.ts` 的 `DiagStage` 对齐）。 */
+export type QuarkAdapterDiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort";
+
+/** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5）。 */
+export type QuarkAdapterDiagSink = (entry: {
+  stage: QuarkAdapterDiagStage;
+  path: string;
+  fid: string;
+  message: string;
+}) => void;
+
 export interface QuarkReadOnlyAdapterOptions {
   index: QuarkIndexReader;
   cache: QuarkCacheLike;
@@ -66,6 +77,8 @@ export interface QuarkReadOnlyAdapterOptions {
   configDir?: string;
   /** 本插件目录，默认 `.obsidian/plugins/quark-vault`。 */
   pluginDir?: string;
+  /** 可选诊断出口（失败时记录 path/fid/阶段）；不传则完全无副作用。 */
+  diag?: QuarkAdapterDiagSink | null;
 }
 
 /** 索引里查不到该路径（不是只读错误，是「库里有快照但不含此文件」）。 */
@@ -90,6 +103,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly baseAdapter: DataAdapter;
   private readonly configDir: string;
   private readonly pluginDir: string;
+  private readonly diag?: QuarkAdapterDiagSink | null;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -101,6 +115,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.baseAdapter = options.baseAdapter;
     this.configDir = normalizeVaultPath(options.configDir ?? DEFAULT_CONFIG_DIR);
     this.pluginDir = normalizeVaultPath(options.pluginDir ?? DEFAULT_PLUGIN_DIR);
+    this.diag = options.diag ?? null;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -115,13 +130,21 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return this.baseAdapter.getResourcePath(normalizedPath);
     }
     const clean = normalizeVaultPath(normalizedPath);
-    const url = this.cache.getResourceUrl(clean);
-    if (url) return url;
-    if (clean) {
-      const entry = this.findEntry(clean);
-      this.cache.enqueuePrefetch([{ path: clean, size: entry ? entry.size : undefined }]);
+    let fid = "-";
+    try {
+      const url = this.cache.getResourceUrl(clean);
+      if (url) return url;
+      if (clean) {
+        const entry = this.findEntry(clean);
+        if (entry) fid = entry.fid;
+        this.cache.enqueuePrefetch([{ path: clean, size: entry ? entry.size : undefined }]);
+      }
+      return "";
+    } catch (error) {
+      // 诊断：打开失败时记录读的是哪个 path/fid（不改行为：照旧抛出）
+      this.reportDiag("getResourcePath", clean, fid, error);
+      throw error;
     }
-    return "";
   }
 
   // ---------------------------------------------------------------- 读 5
@@ -167,29 +190,50 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     const clean = normalizeVaultPath(normalizedPath);
     const files: string[] = [];
     const folders: string[] = [];
-    for (const entry of this.index.entries) {
-      if (getParentPath(entry.path) !== clean) continue;
-      if (isDirectoryLike(entry)) folders.push(entry.path);
-      else files.push(entry.path);
+    let sorting = false;
+    try {
+      for (const entry of this.index.entries) {
+        if (getParentPath(entry.path) !== clean) continue;
+        if (isDirectoryLike(entry)) folders.push(entry.path);
+        else files.push(entry.path);
+      }
+      sorting = true;
+      files.sort((a, b) => a.localeCompare(b));
+      folders.sort((a, b) => a.localeCompare(b));
+      sorting = false;
+      return { files, folders };
+    } catch (error) {
+      // 诊断：区分「列目录」与「排序」两个阶段（不改行为：照旧抛出）
+      this.reportDiag(sorting ? "sort" : "list", clean, "-", error);
+      throw error;
     }
-    files.sort((a, b) => a.localeCompare(b));
-    folders.sort((a, b) => a.localeCompare(b));
-    return { files, folders };
   }
 
   async read(normalizedPath: string): Promise<string> {
     if (this.shouldForward(normalizedPath)) {
       return this.baseAdapter.read(normalizedPath);
     }
-    const buffer = await this.loadBinary(normalizedPath);
-    return arrayBufferToString(buffer);
+    try {
+      const buffer = await this.loadBinary(normalizedPath);
+      return arrayBufferToString(buffer);
+    } catch (error) {
+      // 诊断：read 阶段（含 download 阶段会另记一条）
+      this.reportDiag("read", normalizedPath, this.fidOf(normalizedPath), error);
+      throw error;
+    }
   }
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
     if (this.shouldForward(normalizedPath)) {
       return this.baseAdapter.readBinary(normalizedPath);
     }
-    return await this.loadBinary(normalizedPath);
+    try {
+      return await this.loadBinary(normalizedPath);
+    } catch (error) {
+      // 诊断：readBinary 阶段
+      this.reportDiag("readBinary", normalizedPath, this.fidOf(normalizedPath), error);
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------- 抛错 12
@@ -299,8 +343,39 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (!entry) throw new QuarkEntryNotFoundError(clean);
     if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
 
-    const buffer = await this.client.downloadFile(entry.fid);
+    let buffer: ArrayBuffer;
+    try {
+      buffer = await this.client.downloadFile(entry.fid);
+    } catch (error) {
+      // 诊断：download 阶段（fid 就是请求用的 fid）
+      this.reportDiag("download", clean, entry.fid, error);
+      throw error;
+    }
     this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
     return buffer;
+  }
+
+  /** 诊断出口：任何异常都不允许影响读路径。 */
+  private reportDiag(
+    stage: QuarkAdapterDiagStage,
+    path: string,
+    fid: string,
+    error: unknown
+  ): void {
+    try {
+      this.diag?.({
+        stage,
+        path: path || "/",
+        fid: fid || "-",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } catch {
+      /* 诊断日志失败不影响读写 */
+    }
+  }
+
+  private fidOf(normalizedPath: string): string {
+    const entry = this.findEntry(normalizeVaultPath(normalizedPath));
+    return entry ? entry.fid : "-";
   }
 }
