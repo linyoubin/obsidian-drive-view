@@ -226,6 +226,20 @@ export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
 }
 
 /**
+ * ribbon 图标四态（0.2.5 A6）：图标本身随状态变化，不重建 ribbon。
+ *   - 未登录 / 登录过期 → `log-in`
+ *   - 已登录未挂载 → `cloud`
+ *   - 已挂载待命 → `refresh-cw`
+ *   - 同步中 → `loader`（旋转类），结束后回到 `refresh-cw`
+ */
+export function describeRibbonIcon(snapshot: QuarkUiSnapshot): "log-in" | "cloud" | "refresh-cw" | "loader" {
+  if (snapshot.indexing) return "loader";
+  if (snapshot.loginState !== "active") return "log-in";
+  if (!snapshot.mounted) return "cloud";
+  return "refresh-cw";
+}
+
+/**
  * 状态栏文案（A5 三态）：
  *   - 未登录：`Quark 只读：未登录`
  *   - 已登录未挂载：`Quark 只读：已登录未挂载`
@@ -347,7 +361,7 @@ export class QuarkSettingsTab extends settingTabBase() {
     if (!Setting) return;
     const container = this.containerEl;
     container.empty();
-    container.createEl("h2", { text: "Quark（只读库）" });
+    container.createEl("h2", { text: "Quark Vault（只读库）" });
 
     const snapshot = this.host.quarkSnapshot();
 

@@ -17,6 +17,7 @@
 import { CookieStore, collectSetCookieValues } from "../auth/CookieStore";
 import { DEFAULT_AUTH_COOLDOWN_MS, DEFAULT_DOWNLOAD_CONCURRENCY, DownloadGate } from "./downloadGate";
 import type { GateSignal } from "./downloadGate";
+import { InflightRequests } from "./inflight";
 
 /** 桌面 Chrome UA（与已跑通探针一致；手机端 UA 策略见 v3 §9.4 Q6，暂沿用）。 */
 export const QUARK_DEFAULT_UA =
@@ -390,6 +391,8 @@ export class QuarkClient {
   private readonly onAuthExpired?: () => void;
   /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
   private authNotified = false;
+  /** 0.2.5：同一 fid 的进行中下载（去重表，完成即清理）。 */
+  private readonly inflight = new InflightRequests();
 
   private riskStreak = 0;
   private breakerOpenUntil = 0;
@@ -605,14 +608,48 @@ export class QuarkClient {
    * 下载文件内容（签名 URL 第二跳，仍带 Cookie 头，因为 CDN 侧也要登录态）。
    *
    * 0.2.4：
-   *   - 所有下载走全局并发闸门 `downloadGate`（默认 ≤2，真机并发风暴后加）；
+   *   - 所有下载走全局并发闸门 `downloadGate`（默认 ≤2）；
    *   - 超时退避 1s 重试 **1 次**，仍失败抛 `QuarkDownloadTimeoutError(retried=true)`；
    *   - `code=23018`（夸克单文件下载上限）映射为 `QuarkFileTooLargeError`，不重试；
    *   - 401 → `authExpired`（清队列 + 暂停 60s + 只回调一次），后续下载直接快速失败。
+   *
+   * 0.2.5：同一 fid 的并发请求在**发起网络请求之前**按 fid 合并（in-flight 去重）——
+   * 连续点同一个文件 10 次只会发 1 次请求；取消只放弃**调用方自己**的等待，
+   * 共享的那次下载继续（其它调用方照常拿到结果并写缓存）。
    */
   async downloadFile(fid: string, options: { signal?: GateSignal | null } = {}): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
-    return this.downloadGate.run(() => this.downloadWithRetry(fid, signal), { signal });
+    // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
+    const shared = this.inflight.run(fid, () =>
+      this.downloadGate.run(() => this.downloadWithRetry(fid))
+    );
+    if (!signal) return shared;
+    return this.raceCallerCancel(shared, signal);
+  }
+
+  /**
+   * 调用方取消：只让**这一个调用方**提前 reject，共享下载不受影响。
+   * `requestUrl` 没有 AbortSignal，这里用轻量轮询感知 `signal.aborted`（默认 50ms）。
+   */
+  private raceCallerCancel<T>(shared: Promise<T>, signal: GateSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(new QuarkDownloadCanceledError());
+    return new Promise<T>((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (!signal.aborted) return;
+        clearInterval(timer);
+        reject(new QuarkDownloadCanceledError());
+      }, 50);
+      shared.then(
+        (value) => {
+          clearInterval(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearInterval(timer);
+          reject(error);
+        }
+      );
+    });
   }
 
   private async downloadWithRetry(fid: string, signal: GateSignal | null = null): Promise<ArrayBuffer> {

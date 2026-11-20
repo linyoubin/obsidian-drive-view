@@ -219,18 +219,28 @@ describe("QuarkClient：超时重试 / 23018 / 401 熔断（A3/A5/A6）", () => 
     expect(calls.length).toBe(callsAfterStorm);
   });
 
-  test("取消后不重试：超时且已取消 → QuarkDownloadCanceledError，只发 1 次请求", async () => {
+  test("调用方取消 = 只放弃自己的等待（不取消共享下载，0.2.5 A5）", async () => {
+    const gate = { promise: null as unknown as Promise<QuarkHttpResponse>, resolve: (_v: QuarkHttpResponse) => {} };
+    const downstream = new Promise<QuarkHttpResponse>((resolve) => {
+      gate.resolve = resolve;
+    });
     let calls = 0;
-    const transport: QuarkTransport = async () => {
+    const transport: QuarkTransport = async (request) => {
       calls += 1;
-      throw new Error("Request failed. 请求超时");
+      if (request.url.includes("/file/download")) {
+        return jsonResponse(200, { code: 0, data: [{ download_url: "https://cdn.example/f" }] });
+      }
+      return downstream;
     };
     const client = new QuarkClient({ transport, limiter: fastBucket(), sleep: fastSleep });
     const signal = { aborted: false };
-    const pending = client.downloadFile("fid-1", { signal });
-    signal.aborted = true; // 第一次超时后（重试前）用户点了取消
-    await expect(pending).rejects.toBeInstanceOf(QuarkDownloadCanceledError);
-    expect(calls).toBe(1);
+    const canceled = client.downloadFile("fid-1", { signal });
+    const other = client.downloadFile("fid-1");
+    signal.aborted = true;
+    await expect(canceled).rejects.toBeInstanceOf(QuarkDownloadCanceledError);
+    gate.resolve(fileResponse("shared"));
+    await expect(other).resolves.toBeInstanceOf(ArrayBuffer);
+    expect(calls).toBe(2); // 共享下载只发 1 次签名 URL + 1 次 CDN
   });
 });
 

@@ -1,4 +1,5 @@
 import { Notice, Platform, Plugin, requestUrl } from "obsidian";
+import * as obsidianRuntime from "obsidian";
 import type { DataAdapter } from "obsidian";
 import { GoogleDriveDataAdapter } from "./adapter/GoogleDriveDataAdapter";
 import { QuarkReadOnlyAdapter } from "./adapter/QuarkReadOnlyAdapter";
@@ -30,6 +31,7 @@ import {
   QuarkSettingsTab,
   describeCacheState,
   describeIndexState,
+  describeRibbonIcon,
   describeRibbonTooltip,
   describeRootPath,
   describeRootState,
@@ -488,7 +490,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.refreshQuarkUi();
 
     // 唯一交互入口：左侧 ribbon（title 四态，手机端靠它看状态；每次状态变化刷新）
-    this.quarkRibbonEl = this.addRibbonIcon("refresh-cw", describeRibbonTooltip(this.quarkSnapshot()), () => {
+    this.quarkRibbonEl = this.addRibbonIcon(describeRibbonIcon(this.quarkSnapshot()), describeRibbonTooltip(this.quarkSnapshot()), () => {
       void this.onQuarkRibbonClick().catch((error) => {
         console.error("[Quark] ribbon action failed:", error);
         new Notice(
@@ -922,9 +924,20 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.refreshQuarkUi();
   }
 
+  /**
+   * ribbon 图标 + title 一起刷新（0.2.5 A6）：图标随四态切换，不重建 ribbon。
+   * `setIcon` 从运行期取（obsidian.d.ts 未声明），移动端缺失时只退化为 title 变化。
+   */
   private updateQuarkRibbonTooltip(): void {
     if (!this.quarkRibbonEl) return;
-    this.quarkRibbonEl.setAttr("title", describeRibbonTooltip(this.quarkSnapshot()));
+    const snapshot = this.quarkSnapshot();
+    try {
+      const setIconFn = (obsidianRuntime as unknown as { setIcon?: (el: HTMLElement, icon: string) => void }).setIcon;
+      if (typeof setIconFn === "function") setIconFn(this.quarkRibbonEl, describeRibbonIcon(snapshot));
+    } catch (error) {
+      console.warn("[Quark] setIcon failed:", error);
+    }
+    this.quarkRibbonEl.setAttr("title", describeRibbonTooltip(snapshot));
   }
 
   /**

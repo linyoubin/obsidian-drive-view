@@ -527,3 +527,38 @@ describe("同步进度：百分比与文案（T-11 addendum）", () => {
     expect(text).toBe("已同步 0 条 · 新增 0 · 变更 0 · 删除 0 · 耗时 0.4s");
   });
 });
+// ------------------------------------------------------------------ ribbon 图标与设置页标题（0.2.5 A6/A7）
+
+describe("ribbon 图标四态与设置页标题（0.2.5）", () => {
+  test("图标随状态切换：未登录 / 已登录未挂载 / 已挂载待命 / 同步中 各不相同", () => {
+    const icons = [
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "none" })),
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: false })),
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true })),
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: true })),
+    ];
+    expect(icons).toEqual(["log-in", "cloud", "refresh-cw", "loader"]);
+    expect(new Set(icons).size).toBe(4);
+  });
+
+  test("登录过期显示 log-in（提示重新扫码）", () => {
+    expect(settingsTab.describeRibbonIcon(snapshot({ loginState: "expired" }))).toBe("log-in");
+  });
+
+  test("同步中优先 loader；结束后回到 refresh-cw", () => {
+    expect(
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: true }))
+    ).toBe("loader");
+    expect(
+      settingsTab.describeRibbonIcon(snapshot({ loginState: "active", mounted: true, indexing: false }))
+    ).toBe("refresh-cw");
+  });
+
+  test("设置页标题：只有 Quark 设置页含 Quark Vault，Google Drive 页恢复 Drive View", async () => {
+    const quark = await Bun.file(new URL("../src/ui/QuarkSettingsTab.ts", import.meta.url)).text();
+    const drive = await Bun.file(new URL("../src/ui/SettingsTab.ts", import.meta.url)).text();
+    expect(quark).toContain("Quark Vault");
+    expect(drive).not.toContain("Quark Vault");
+    expect(drive).toContain("Drive View");
+  });
+});

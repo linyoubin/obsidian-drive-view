@@ -6,11 +6,16 @@ import { ManualOAuthModal } from "./MobileAuthModal";
 export class GoogleDriveSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: GoogleDriveVaultPlugin) {
     super(app, plugin);
+    // 0.2.5 A7：manifest 里已是 Quark 品牌名，两个设置页默认会同名。
+    // 这里尽量给 Google Drive 设置页一个可分辨的运行期名字（Obsidian 无公开的 per-tab title API）。
+    (this as unknown as { name?: string }).name = "Drive View";
   }
 
   public display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    // 页面内标题（不改 Obsidian 侧边栏里的插件名，仅让用户能区分两页）
+    containerEl.createEl("h2", { text: "Drive View（Google Drive）" });
 
     // Status Banner
     const statusBanner = containerEl.createDiv({
@@ -85,7 +90,7 @@ export class GoogleDriveSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Use Custom OAuth Credentials (Full Drive & Shared Folders)")
       .setDesc(
-        "By default, Quark Vault requests per-file access (drive.file) for folders created by this app. Enable this to provide your own Google Cloud Web Client ID & Secret for full Drive and shared folder access."
+        "By default, Drive View (Google Drive) requests per-file access (drive.file) for folders created by this app. Enable this to provide your own Google Cloud Web Client ID & Secret for full Drive and shared folder access."
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.useCustomCredentials).onChange(async (val) => {
