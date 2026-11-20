@@ -162,9 +162,17 @@ export interface QuarkSettings {
    */
   quarkCookie: string;
   /**
-   * 夸克根目录 fid（一期固定 `"0"`）。
+   * 库根目录的夸克 fid（默认 `"0"` = 整个网盘根；用户选了目录则是那个目录的 fid）。
    */
   quarkRootFid: string;
+  /**
+   * 库根目录的展示路径，如 `/知识库_云端`（默认 `"/"`）。
+   */
+  quarkRootPath: string;
+  /**
+   * 用户最近一次选择库根的时间戳（0 = 从未选过）。ribbon 首次点击据此先弹目录选择器。
+   */
+  quarkRootChosenAt: number;
   /**
    * 最近一次索引建立的毫秒时间戳（0 = 从未建立）。
    */
@@ -174,6 +182,8 @@ export interface QuarkSettings {
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkCookie: "",
   quarkRootFid: "0",
+  quarkRootPath: "/",
+  quarkRootChosenAt: 0,
   quarkLastIndexBuiltAt: 0,
 };
 

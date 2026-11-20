@@ -15,6 +15,8 @@ export type QuarkLoginState = "none" | "active" | "expired";
 export interface QuarkUiSnapshot {
   loginState: QuarkLoginState;
   cookieNameCount: number;
+  rootPath: string;
+  rootChosen: boolean;
   indexCount: number;
   builtAt: number;
   version: number;
@@ -31,6 +33,7 @@ export interface QuarkUiSnapshot {
 export interface QuarkHost {
   quarkSnapshot(): QuarkUiSnapshot;
   quarkOpenQrModal(): Promise<void>;
+  quarkChooseRoot(): Promise<void>;
   quarkClearCache(): void;
   quarkExitReadOnly(): Promise<void>;
 }
@@ -38,6 +41,8 @@ export interface QuarkHost {
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   loginState: "none",
   cookieNameCount: 0,
+  rootPath: "/",
+  rootChosen: false,
   indexCount: 0,
   builtAt: 0,
   version: 0,
@@ -104,6 +109,23 @@ export function describeCacheState(cacheBytes: number, cacheMaxBytes: number): s
 /** 挂载态：已挂载（只读）/ 未挂载。 */
 export function describeMountedState(mounted: boolean): string {
   return mounted ? "已挂载（只读）" : "未挂载";
+}
+
+/** 库根文案：`/知识库_云端`；未选过时提示去选。 */
+export function describeRootState(snapshot: QuarkUiSnapshot): string {
+  if (!snapshot.rootChosen) return "未选择（点「选择库根目录」）";
+  return snapshot.rootPath && snapshot.rootPath !== "/" ? snapshot.rootPath : "根目录（整个网盘）";
+}
+
+/** ribbon tooltip 三态（A6）：手机端看不到状态栏，靠这个 title 看状态。 */
+export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
+  if (snapshot.mounted) {
+    return `同步夸克 · 已挂载（索引 ${formatBuiltAt(snapshot.builtAt)}）`;
+  }
+  if (snapshot.loginState === "active" || snapshot.loginState === "expired") {
+    return "同步夸克 · 已登录";
+  }
+  return "同步夸克 · 未登录";
 }
 
 /**
@@ -186,6 +208,16 @@ export class QuarkSettingsTab extends settingTabBase() {
     container.createEl("h2", { text: "Quark（只读库）" });
 
     const snapshot = this.host.quarkSnapshot();
+
+    new Setting(container)
+      .setName("库根目录")
+      .setDesc(describeRootState(snapshot))
+      .addButton((button: any) =>
+        button.setButtonText("选择库根目录").setCta().onClick(async () => {
+          await this.host.quarkChooseRoot();
+          this.display();
+        })
+      );
 
     new Setting(container)
       .setName("登录状态")

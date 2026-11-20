@@ -234,6 +234,8 @@ export class QuarkQrModal extends modalBase() {
     this.stopCountdown();
     this.setStatus(`${describeQrState(done.state)}：${done.message}`);
     this.pushTimeline(`done | ${done.state} | poll=${done.pollCount}`);
+    // A7：登录成功立刻关窗，同步在后台继续（不要求用户手动关）
+    if (done.state === "success") this.close();
     await this.options.onDone?.(done);
   }
 

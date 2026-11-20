@@ -3,6 +3,7 @@ import type { DataAdapter } from "obsidian";
 import { GoogleDriveDataAdapter } from "./adapter/GoogleDriveDataAdapter";
 import { QuarkReadOnlyAdapter } from "./adapter/QuarkReadOnlyAdapter";
 import { VaultMounter } from "./adapter/VaultMounter";
+import type { VaultMountable } from "./adapter/VaultMounter";
 import { CookieStore } from "./auth/CookieStore";
 import { GoogleOAuthManager } from "./auth/GoogleOAuth";
 import { QuarkQrAuth } from "./auth/QuarkQrAuth";
@@ -21,12 +22,15 @@ import {
   SyncState,
 } from "./types";
 import type { GoogleDriveSettings, PluginSettings } from "./types";
+import { QuarkFolderPickerModal } from "./ui/QuarkFolderPickerModal";
 import { QuarkQrModal, QuarkSyncConfirmModal, describeSyncPrompt } from "./ui/QuarkQrModal";
 import {
   EMPTY_QUARK_SNAPSHOT,
   QuarkSettingsTab,
   describeCacheState,
   describeIndexState,
+  describeRibbonTooltip,
+  describeRootState,
   describeStatusBar,
   planQuarkRibbonAction,
 } from "./ui/QuarkSettingsTab";
@@ -76,6 +80,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkScanSignal: { aborted: boolean } | null = null;
   private quarkProgress = { scanned: 0, pending: 0 };
   private lastPersistedQuarkCookie = "";
+  private quarkRibbonEl: HTMLElement | null = null;
 
   private statusBarItemEl: HTMLElement | null = null;
   private pollIntervalId: number | null = null;
@@ -360,13 +365,14 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCookieStore = new CookieStore({
       app: this.app,
       storageKey: QUARK_COOKIE_STORAGE_KEY,
-      loadData: async () => this.settings as unknown as Record<string, unknown>,
+      loadData: async () => ({ [QUARK_COOKIE_STORAGE_KEY]: this.settings.quarkCookie }),
       saveData: async (data) => {
         // 只在 Cookie 真变化时落盘，避免每个响应都写 data.json
-        const next = data[QUARK_COOKIE_STORAGE_KEY];
-        if (typeof next === "string" && next === this.lastPersistedQuarkCookie) return;
-        this.lastPersistedQuarkCookie = typeof next === "string" ? next : "";
-        await this.updateSettings(data as Partial<PluginSettings>);
+        const raw = data[QUARK_COOKIE_STORAGE_KEY];
+        const next = typeof raw === "string" ? raw : "";
+        if (next === this.lastPersistedQuarkCookie) return;
+        this.lastPersistedQuarkCookie = next;
+        await this.updateSettings({ quarkCookie: next });
       },
       onPersistError: (error) => console.warn("[Quark] cookie persist failed:", error),
     });
@@ -388,13 +394,15 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkStatusBarEl = this.addStatusBarItem();
     this.updateQuarkStatusBar();
 
-    // 唯一交互入口：左侧 ribbon
-    this.addRibbonIcon("refresh-cw", "同步夸克", () => {
+    // 唯一交互入口：左侧 ribbon（title 三态，手机端靠它看状态）
+    this.quarkRibbonEl = this.addRibbonIcon("refresh-cw", describeRibbonTooltip(this.quarkSnapshot()), () => {
       void this.onQuarkRibbonClick().catch((error) => {
         console.error("[Quark] ribbon action failed:", error);
         new Notice(`夸克同步失败：${error instanceof Error ? error.message : String(error)}`);
       });
     });
+
+    this.updateQuarkRibbonTooltip();
 
     // 命令面板只作内部兜底（不暴露扫码/挂载等主流程）
     this.addCommand({
@@ -438,6 +446,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   /** ribbon 点击（A3/A4 的分支判定走纯函数，便于单测）。 */
   public async onQuarkRibbonClick(): Promise<void> {
+    // A5：从未选过库根 → 先弹目录选择器，选完再继续原流程（扫码 / 确认同步）
+    if (!this.settings.quarkRootChosenAt) {
+      const chosen = await this.pickQuarkRoot();
+      if (!chosen) return;
+    }
     const action = planQuarkRibbonAction(this.quarkSnapshot());
     if (action === "login") {
       await this.quarkOpenQrModal();
@@ -446,6 +459,58 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     const confirmed = await this.confirmQuarkSync();
     if (!confirmed) return;
     await this.quarkSync("手动同步");
+  }
+
+  /** 设置页按钮入口：打开目录选择器。 */
+  public async quarkChooseRoot(): Promise<void> {
+    await this.pickQuarkRoot();
+  }
+
+  /** 目录选择器：true = 选定并已应用；false = 取消。 */
+  private pickQuarkRoot(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const modal = new QuarkFolderPickerModal({
+        app: this.app,
+        client: this.quarkClient,
+        initialFid: this.settings.quarkRootFid || "0",
+        initialPath: this.settings.quarkRootPath || "/",
+        onChoose: async (fid, path) => {
+          finish(true);
+          await this.applyQuarkRoot(fid, path);
+        },
+        onCancel: () => finish(false),
+      });
+      modal.open();
+    });
+  }
+
+  /**
+   * 应用新的库根（A4）：改了库根 → 先卸载旧库、清空旧快照（含 meta.rootFid）、
+   * 再按新库根重建索引；两个库的条目绝不混在一起。
+   */
+  private async applyQuarkRoot(fid: string, path: string): Promise<void> {
+    const previousFid = this.settings.quarkRootFid || "0";
+    const previousPath = this.settings.quarkRootPath || "/";
+    await this.updateSettings({ quarkRootFid: fid, quarkRootPath: path, quarkRootChosenAt: Date.now() });
+    this.updateQuarkStatusBar();
+    if (fid === previousFid && path === previousPath) return;
+
+    new Notice(`夸克：库根切换到 ${path}，将重建索引…`, 6000);
+    if (this.quarkMounted) {
+      await this.mounter.unmount(this.createQuarkMountFacade());
+      this.quarkMounted = false;
+    }
+    await this.quarkIndex.clearAll();
+    this.quarkCache.clear();
+    await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
+    this.updateQuarkStatusBar();
+    await this.quarkSync("库根切换后重建");
   }
 
   /** 确认框：显示上次同步时间与条目数（A4）。 */
@@ -599,8 +664,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
    * 这里用一个最小 facade 满足它，从而既走 `VaultMounter.mount()`（不改其源码），
    * 又不需要让 Quark 适配器继承 Drive 的类。
    */
-  private createQuarkMountFacade(): GoogleDriveDataAdapter {
-    const adapter = this.quarkAdapter as unknown as DataAdapter;
+  private createQuarkMountFacade(): VaultMountable {
+    const adapter = this.quarkAdapter;
     const index = this.quarkIndex;
     const facade = {
       createProxiedAdapter: (): DataAdapter => adapter,
@@ -608,20 +673,15 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         getAllEntries: () =>
           index.entries.map((entry) => ({
             path: entry.path,
-            name: entry.path.split("/").pop() ?? entry.path,
             type: entry.type,
             ctime: entry.mtime,
             mtime: entry.mtime,
             size: entry.size,
-            driveId: entry.fid,
-            parentId: entry.parentFid,
-            dirty: false,
-            contentCached: false,
           })),
       },
       flushAllPendingUploads: async (): Promise<void> => undefined,
     };
-    return facade as unknown as GoogleDriveDataAdapter;
+    return facade;
   }
 
   /** 状态快照（设置页 / 状态栏 / ribbon 分支判定共用）。 */
@@ -638,6 +698,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     return {
       loginState,
       cookieNameCount: cookieNames.length,
+      rootPath: this.settings.quarkRootPath || "/",
+      rootChosen: (this.settings.quarkRootChosenAt ?? 0) > 0,
       indexCount: this.quarkIndex.entryCount,
       builtAt: meta.builtAt || this.settings.quarkLastIndexBuiltAt,
       version: meta.version,
@@ -651,6 +713,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
   }
 
+  private updateQuarkRibbonTooltip(): void {
+    if (!this.quarkRibbonEl) return;
+    this.quarkRibbonEl.setAttr("title", describeRibbonTooltip(this.quarkSnapshot()));
+  }
+
   private updateQuarkStatusBar(): void {
     if (!this.quarkStatusBarEl || !this.quarkIndex || !this.quarkCache) return;
     const snapshot = this.quarkSnapshot();
@@ -662,5 +729,6 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         snapshot.cacheMaxBytes
       )}`
     );
+    this.updateQuarkRibbonTooltip();
   }
 }

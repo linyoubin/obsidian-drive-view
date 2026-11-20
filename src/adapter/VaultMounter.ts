@@ -1,9 +1,25 @@
 import { App, DataAdapter, MarkdownView, TFile, TFolder } from "obsidian";
 import { getParentPath, isConfigOrInternalPath } from "../utils/pathUtils";
-import {
-  GoogleDriveDataAdapter,
-  ObsidianVaultRawEvent,
-} from "./GoogleDriveDataAdapter";
+import { ObsidianVaultRawEvent } from "./GoogleDriveDataAdapter";
+
+/**
+ * VaultMounter 实际只依赖这三样能力，因此入口参数不再绑定 Google Drive 的具体类（T-10 放宽）：
+ * 夸克只读适配器也能挂载，且调用方不需要任何类型断言。
+ */
+export interface VaultMountable {
+  createProxiedAdapter(): DataAdapter;
+  cache: { getAllEntries(): unknown[] };
+  flushAllPendingUploads?(): Promise<void> | void;
+}
+
+/** `cache.getAllEntries()` 返回的树条目（只用到这几个字段）。 */
+interface VaultTreeEntry {
+  path: string;
+  type: "file" | "folder";
+  ctime?: number;
+  mtime?: number;
+  size?: number;
+}
 
 type InternalVault = App["vault"] & {
   fileMap?: Record<string, TFile | TFolder>;
@@ -42,10 +58,10 @@ export class VaultMounter {
   }
 
   /**
-   * Swaps `app.vault.adapter` with the proxied `GoogleDriveDataAdapter` and reconciles
+   * Swaps `app.vault.adapter` with the proxied adapter (Google Drive or Quark) and reconciles
    * Obsidian's Vault fileMap and MetadataCache with the virtual file tree.
    */
-  public async mount(driveAdapter: GoogleDriveDataAdapter): Promise<void> {
+  public async mount(mountable: VaultMountable): Promise<void> {
     if (!this.originalAdapter) {
       this.originalAdapter = this.app.vault.adapter;
     }
@@ -60,20 +76,20 @@ export class VaultMounter {
       // Ignore if stopWatch is not supported on this platform
     }
 
-    this.app.vault.adapter = driveAdapter.createProxiedAdapter();
+    this.app.vault.adapter = mountable.createProxiedAdapter();
     this.mounted = true;
 
-    await this.reconcileFullVault(driveAdapter);
+    await this.reconcileFullVault(mountable);
   }
 
   /**
    * Flushes pending writes and restores the original native `DataAdapter`.
    */
-  public async unmount(driveAdapter?: GoogleDriveDataAdapter): Promise<void> {
+  public async unmount(mountable?: VaultMountable): Promise<void> {
     if (!this.mounted || !this.originalAdapter) return;
 
     try {
-      await driveAdapter?.flushAllPendingUploads();
+      await mountable?.flushAllPendingUploads?.();
     } catch (err) {
       console.warn("[VaultMounter] Error flushing pending uploads on unmount:", err);
     }
@@ -170,15 +186,15 @@ export class VaultMounter {
   }
 
   /**
-   * Reconciles Obsidian's `Vault.fileMap` with all entries in `driveAdapter.cache`.
+   * Reconciles Obsidian's `Vault.fileMap` with all entries in `mountable.cache`.
    */
-  public async reconcileFullVault(driveAdapter: GoogleDriveDataAdapter): Promise<void> {
+  public async reconcileFullVault(mountable: VaultMountable): Promise<void> {
     const internalVault = this.app.vault as InternalVault;
     const configDir = this.app.vault.configDir;
 
-    const entries = driveAdapter.cache
-      .getAllEntries()
-      .filter((e) => !isConfigOrInternalPath(e.path, configDir));
+    const entries = (mountable.cache.getAllEntries() as VaultTreeEntry[]).filter(
+      (e) => !isConfigOrInternalPath(e.path, configDir)
+    );
     const virtualPaths = new Set(entries.map((e) => e.path));
 
     // 1. Remove any stale files or accidentally-indexed config folders from Vault.fileMap
@@ -208,7 +224,7 @@ export class VaultMounter {
         this.applyVaultRawEvent({
           type: "file-created",
           path: entry.path,
-          stat: { ctime: entry.ctime, mtime: entry.mtime, size: entry.size },
+          stat: { ctime: entry.ctime ?? 0, mtime: entry.mtime ?? 0, size: entry.size ?? 0 },
         });
       }
     }

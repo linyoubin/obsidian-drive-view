@@ -428,7 +428,9 @@ describe("IndexStore：扫描与断点续扫（A4）", () => {
     const progress = (await store.getProgress()) as ScanProgress;
     expect(progress.done).toBe(false);
     expect(progress.pendingFolders.length).toBeGreaterThan(0);
-    expect(store.entryCount).toBeGreaterThan(0);
+    // 原子替换语义：已扫条目在临时 Map/进度里，但内存索引没换（旧索引原样保留）
+    expect(progress.entryCount).toBeGreaterThan(0);
+    expect(store.entryCount).toBe(0);
   });
 });
 
@@ -525,5 +527,46 @@ describe("IndexStore：IDB 异常恢复（A5）", () => {
     await store.writeSnapshot([entry("a.md")], { rootFid: "0" });
     expect(store.entryCount).toBe(1);
     expect(store.metaInfo.rootFid).toBe("0");
+  });
+});
+
+// ------------------------------------------------------------------ 原子替换（T-10 A9）
+
+describe("IndexStore：扫描的原子替换（T-10 A9）", () => {
+  const oldEntries = [entry("old.md", { fid: "fid-old" })];
+
+  test("扫描失败时内存索引原样保留（同步期间树不会变空）", async () => {
+    const backend = new MemoryIndexBackend({ entries: oldEntries });
+    const store = new IndexStore({ createBackend: async () => backend, now: () => 9000 });
+    await store.load();
+    expect(store.entryCount).toBe(1);
+
+    await expect(
+      store.scan({
+        rootFid: "root",
+        list: async () => {
+          throw new Error("network down");
+        },
+      })
+    ).rejects.toThrow("network down");
+    // 旧索引没被清空
+    expect(store.entryCount).toBe(1);
+    expect(store.entries[0].path).toBe("old.md");
+  });
+
+  test("扫描成功后一次性换成新索引（旧条目整体消失，不混用）", async () => {
+    const backend = new MemoryIndexBackend({ entries: oldEntries });
+    const store = new IndexStore({ createBackend: async () => backend, now: () => 9100 });
+    await store.load();
+
+    const result = await store.scan({
+      rootFid: "root",
+      list: async (folder) => (folder.path === "" ? [entry("new.md")] : []),
+    });
+
+    expect(result.completed).toBe(true);
+    expect(store.entryCount).toBe(1);
+    expect(store.entries[0].path).toBe("new.md");
+    expect(store.entries.some((item) => item.path === "old.md")).toBe(false);
   });
 });

@@ -695,9 +695,18 @@ export class IndexStore {
     let progress = await this.exec((backend) => backend.loadProgress());
     const resuming =
       progress !== null && !progress.done && progress.rootFid === rootFid && progress.entryCount > 0;
-    if (!resuming) {
+
+    // 原子替换（T-10 A9）：新条目先攒在临时 Map 里，扫完才一次性换掉 this.entriesMap，
+    // 所以同步期间已挂载的树不会变空；失败/取消时旧索引原样保留。
+    let next: Map<string, IndexEntry>;
+    if (resuming) {
+      next = new Map();
+      for (const entry of await this.exec((backend) => backend.loadEntries())) {
+        next.set(entry.path, cloneEntry(entry));
+      }
+    } else {
       progress = freshProgress(rootFid, this.now());
-      this.entriesMap.clear();
+      next = new Map();
       await this.exec((backend) => backend.clearEntries());
     }
     const started = progress as ScanProgress;
@@ -732,7 +741,7 @@ export class IndexStore {
       for (const child of children) {
         const normalized = this.normalizeEntry(child);
         if (!normalized) continue;
-        this.entriesMap.set(normalized.path, normalized);
+        next.set(normalized.path, normalized);
         batch.push(normalized);
         if (
           normalized.type === "folder" &&
@@ -745,7 +754,7 @@ export class IndexStore {
       if (batch.length > 0) await this.exec((backend) => backend.putEntries(batch));
 
       started.scannedFolders.push(folder.path);
-      started.entryCount = this.entriesMap.size;
+      started.entryCount = next.size;
       started.updatedAt = this.now();
       await this.persistProgress(started);
       if (options.onProgress) {
@@ -757,7 +766,7 @@ export class IndexStore {
       }
     }
 
-    const snapshot = Array.from(this.entriesMap.values());
+    const snapshot = Array.from(next.values());
     const diff = diffEntries(previous, snapshot);
     started.done = true;
     started.entryCount = snapshot.length;
@@ -767,6 +776,8 @@ export class IndexStore {
       await backend.saveMeta(this.meta);
       await backend.saveProgress(started);
     });
+    // 到这里才原子替换内存视图（失败/取消都走不到这一行）
+    this.entriesMap = next;
     this.lastDiff = diff;
     this.emitStatus();
     return {

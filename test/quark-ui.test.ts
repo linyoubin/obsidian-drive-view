@@ -270,3 +270,63 @@ describe("QuarkSettingsTab：状态栏三态（A6）", () => {
     expect(settingsTab.formatBuiltAt(local)).toBe("2026-11-20 09:05");
   });
 });
+
+// ------------------------------------------------------------------ 库根选择（T-10）
+
+const picker = await import("../src/ui/QuarkFolderPickerModal");
+
+describe("QuarkFolderPickerModal：库根路径拼接（T-10 A3）", () => {
+  test("joinQuarkPath：根下与二级目录", () => {
+    expect(picker.joinQuarkPath("/", "知识库_云端")).toBe("/知识库_云端");
+    expect(picker.joinQuarkPath("/知识库_云端", "笔记")).toBe("/知识库_云端/笔记");
+    expect(picker.joinQuarkPath("/知识库_云端/", "笔记")).toBe("/知识库_云端/笔记");
+  });
+
+  test("normalizeQuarkPath：多重斜杠、反斜杠、空串都归一到规范路径", () => {
+    expect(picker.normalizeQuarkPath("//a//b/")).toBe("/a/b");
+    expect(picker.normalizeQuarkPath("a\\b")).toBe("/a/b");
+    expect(picker.normalizeQuarkPath("")).toBe("/");
+    expect(picker.normalizeQuarkPath(undefined)).toBe("/");
+    expect(picker.normalizeQuarkPath("/")).toBe("/");
+  });
+
+  test("describeQuarkPath：根目录给人看的文案", () => {
+    expect(picker.describeQuarkPath("/")).toBe("根目录（整个网盘）");
+    expect(picker.describeQuarkPath("/知识库_云端")).toBe("/知识库_云端");
+    expect(picker.describeQuarkPath("")).toBe("根目录（整个网盘）");
+  });
+});
+
+describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
+  test("describeRootState：未选 / 根目录 / 指定目录", () => {
+    expect(settingsTab.describeRootState(snapshot())).toContain("未选择");
+    expect(
+      settingsTab.describeRootState(snapshot({ rootChosen: true, rootPath: "/" }))
+    ).toBe("根目录（整个网盘）");
+    expect(
+      settingsTab.describeRootState(snapshot({ rootChosen: true, rootPath: "/知识库_云端" }))
+    ).toBe("/知识库_云端");
+  });
+
+  test("describeRibbonTooltip 三态互不相同（手机端靠 title 看状态）", () => {
+    const builtAt = new Date(2026, 10, 20, 15, 40).getTime();
+    const none = settingsTab.describeRibbonTooltip(snapshot({ loginState: "none" }));
+    const loggedIn = settingsTab.describeRibbonTooltip(snapshot({ loginState: "active" }));
+    const mounted = settingsTab.describeRibbonTooltip(
+      snapshot({ loginState: "active", mounted: true, builtAt })
+    );
+    expect(none).toBe("同步夸克 · 未登录");
+    expect(loggedIn).toBe("同步夸克 · 已登录");
+    expect(mounted).toBe("同步夸克 · 已挂载（索引 2026-11-20 15:40）");
+    expect(new Set([none, loggedIn, mounted]).size).toBe(3);
+  });
+
+  test("库根是否选过不影响 ribbon 的登录/同步分支（A5 只决定先弹选择器）", () => {
+    const notChosen = snapshot({ loginState: "active", rootChosen: false });
+    const chosen = snapshot({ loginState: "active", rootChosen: true });
+    expect(settingsTab.planQuarkRibbonAction(notChosen)).toBe("sync");
+    expect(settingsTab.planQuarkRibbonAction(chosen)).toBe("sync");
+    expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootChosen).toBe(false);
+    expect(settingsTab.EMPTY_QUARK_SNAPSHOT.rootPath).toBe("/");
+  });
+});
