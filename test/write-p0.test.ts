@@ -1,30 +1,39 @@
 /**
- * P0 回归（0.2.7 真机「文件保存失败 / undefined is not an object (evaluating 'o.then')」）：
+ * 只读写失败 → 回滚（0.2.8）：
  *
- * `DataAdapter` 的写方法签名全是 Promise，Obsidian 拿到返回值会直接 `.then()`。
- * 本测试逐个覆盖 12 个写方法，硬性要求：
- *   ① 调用时**绝不同步抛异常**（`expect(fn).not.toThrow()`）；
- *   ② 返回值是 **Promise**（有 `.then`）；
- *   ③ `await` 后 reject 且 `instanceof ReadOnlyError`。
+ * 用户原话：「不应该是保存失败就回滚掉吗？然后就可以操作其他文件了」。
+ * 策略：
+ *   ① 12 个写方法**仍 reject `ReadOnlyError`**（不假装成功）；
+ *   ② 拒绝前回调 `onReadonlyWrite`，main 用它把该笔记的视图按云端内容重载（回滚）；
+ *   ③ 同一 path **10 秒内只回滚一次、只提示一次**（防抖，防止回滚触发的加载又触发写）。
  */
 
 import { describe, expect, test } from "bun:test";
 
-import { QuarkReadOnlyAdapter } from "../src/adapter/QuarkReadOnlyAdapter";
+import {
+  QuarkReadOnlyAdapter,
+  createReadonlyRollback,
+} from "../src/adapter/QuarkReadOnlyAdapter";
+import type { ReadonlyRollbackLeaf } from "../src/adapter/QuarkReadOnlyAdapter";
 import { ReadOnlyError } from "../src/adapter/readonlyError";
 
-function makeAdapter(): QuarkReadOnlyAdapter {
+function makeAdapter(options: { onReadonlyWrite?: (info: { operation: string; path: string }) => void } = {}) {
   return new QuarkReadOnlyAdapter({
-    index: { entries: [] },
+    index: {
+      entries: [
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: 3, mtime: 1 },
+      ],
+    },
     cache: {
       has: () => false,
       get: () => null,
-      getResourceUrl: () => "",
+      getResourceUrl: "",
       put: () => ({ cached: true }),
       enqueuePrefetch: () => undefined,
     },
-    client: { downloadFile: async () => new ArrayBuffer(0) },
+    client: { downloadFile: async () => new TextEncoder().encode("abc").buffer as ArrayBuffer },
     baseAdapter: {} as never,
+    onReadonlyWrite: options.onReadonlyWrite,
   });
 }
 
@@ -38,7 +47,7 @@ const WRITE_CALLS: WriteCall[] = [
   { name: "writeBinary", invoke: (adapter) => adapter.writeBinary("notes/a.md", new ArrayBuffer(4)) },
   { name: "append", invoke: (adapter) => adapter.append("notes/a.md", "+line") },
   { name: "appendBinary", invoke: (adapter) => adapter.appendBinary("notes/a.md", new ArrayBuffer(4)) },
-  { name: "process", invoke: (adapter) => adapter.process("notes/a.md", (text) => text) },
+  { name: "process", invoke: (adapter) => adapter.process("notes/a.md", (text) => `${text}-x`) },
   { name: "mkdir", invoke: (adapter) => adapter.mkdir("notes/new-dir") },
   { name: "trashSystem", invoke: (adapter) => adapter.trashSystem("notes/a.md") },
   { name: "trashLocal", invoke: (adapter) => adapter.trashLocal("notes/a.md") },
@@ -48,8 +57,24 @@ const WRITE_CALLS: WriteCall[] = [
   { name: "copy", invoke: (adapter) => adapter.copy("notes/a.md", "notes/c.md") },
 ];
 
-describe("P0：12 个写方法必须返回 rejected Promise（绝不同步抛）", () => {
-  test("逐个方法：调用不抛 + 返回 Promise（有 .then）+ await 后 reject ReadOnlyError", async () => {
+interface FakeLeaf extends ReadonlyRollbackLeaf {
+  setViewStateCalls: number;
+}
+
+function makeLeaf(path: string): FakeLeaf {
+  const leaf: FakeLeaf = {
+    view: { file: { path } },
+    setViewStateCalls: 0,
+    getViewState: () => ({ type: "markdown", state: { file: path } }),
+    setViewState: async () => {
+      leaf.setViewStateCalls += 1;
+    },
+  };
+  return leaf;
+}
+
+describe("写失败 → 回滚视图（0.2.8）", () => {
+  test("12 个写方法仍 reject ReadOnlyError（不假装成功）", async () => {
     expect(WRITE_CALLS.length).toBe(12);
     for (const { name, invoke } of WRITE_CALLS) {
       const adapter = makeAdapter();
@@ -58,63 +83,100 @@ describe("P0：12 个写方法必须返回 rejected Promise（绝不同步抛）
         pending = invoke(adapter);
       }).not.toThrow();
       expect(pending).toBeInstanceOf(Promise);
-      expect(typeof (pending as Promise<unknown>).then).toBe("function");
-      await expect(pending as Promise<unknown>).rejects.toBeInstanceOf(ReadOnlyError);
-      expect(name.length).toBeGreaterThan(0);
+      let caught: unknown = null;
+      try {
+        await pending;
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ReadOnlyError);
+      expect((caught as ReadOnlyError).operation).toBe(name);
     }
   });
 
-  test("ReadOnlyError 仍带 operation 与 path（错误信息可用）", async () => {
-    const adapter = makeAdapter();
-    let pending: Promise<unknown> | undefined;
-    expect(() => {
-      pending = adapter.write("/notes/a.md", "x");
-    }).not.toThrow();
-    try {
-      await pending;
-      throw new Error("should not resolve");
-    } catch (error) {
-      expect(error).toBeInstanceOf(ReadOnlyError);
-      expect((error as ReadOnlyError).operation).toBe("write");
-      expect((error as ReadOnlyError).path).toBe("notes/a.md");
-      expect((error as ReadOnlyError).message).toContain("只读");
-    }
-  });
-
-  test("读方法与同步方法也返回正确形状（不被 P0 修复波及）", async () => {
-    const adapter = makeAdapter();
-    expect(adapter.getName()).toBe("quark-readonly");
-    expect(typeof adapter.getResourcePath("")).toBe("string");
-    for (const pending of [
-      adapter.exists("notes/a.md"),
-      adapter.stat("notes/a.md"),
-      adapter.list(""),
-      adapter.read("notes/a.md").catch(() => null),
-      adapter.readBinary("notes/a.md").catch(() => null),
-    ]) {
-      expect(pending).toBeInstanceOf(Promise);
-      expect(typeof (pending as Promise<unknown>).then).toBe("function");
-      await pending;
-    }
-  });
-
-  test("`.obsidian/**` 转发分支仍是 base adapter 的 Promise（不是 reject）", async () => {
-    const adapter = new QuarkReadOnlyAdapter({
-      index: { entries: [] },
-      cache: {
-        has: () => false,
-        get: () => null,
-        getResourceUrl: () => "",
-        put: () => ({ cached: true }),
-        enqueuePrefetch: () => undefined,
+  test("写失败 → 回滚：setViewState 调 1 次，onRollback reloaded=true", async () => {
+    const leaf = makeLeaf("notes/a.md");
+    const rollbacks: Array<{ path: string; reloaded: boolean }> = [];
+    const notices: string[] = [];
+    const rollback = createReadonlyRollback({
+      workspace: { iterateAllLeaves: (callback) => callback(leaf) },
+      onRollback: (info) => {
+        rollbacks.push({ path: info.path, reloaded: info.reloaded });
+        if (info.reloaded) notices.push("只读库：该文件已回滚到云端版本（修改未保存）");
       },
-      client: { downloadFile: async () => new ArrayBuffer(0) },
-      baseAdapter: {
-        write: async () => undefined,
-        mkdir: async () => undefined,
-      } as never,
     });
-    await expect(adapter.write(".obsidian/config.json", "{}")).resolves.toBeUndefined();
-    await expect(adapter.mkdir(".obsidian/plugins/x")).resolves.toBeUndefined();
+    const adapter = makeAdapter({ onReadonlyWrite: rollback });
+    await expect(adapter.write("notes/a.md", "x")).rejects.toBeInstanceOf(ReadOnlyError);
+    expect(leaf.setViewStateCalls).toBe(1);
+    expect(rollbacks).toEqual([{ path: "notes/a.md", reloaded: true }]);
+    expect(notices.length).toBe(1);
+  });
+
+  test("同一 path 连续 5 次失败：只回滚 1 次、只提示 1 次（10s 防抖）", async () => {
+    const leaf = makeLeaf("notes/a.md");
+    let rollbackCalls = 0;
+    let noticeCount = 0;
+    const rollback = createReadonlyRollback({
+      workspace: { iterateAllLeaves: (callback) => callback(leaf) },
+      onRollback: ({ reloaded }) => {
+        rollbackCalls += 1;
+        if (reloaded) noticeCount += 1;
+      },
+    });
+    const adapter = makeAdapter({ onReadonlyWrite: rollback });
+    for (let i = 0; i < 5; i += 1) {
+      await expect(adapter.write("notes/a.md", `v${i}`)).rejects.toBeInstanceOf(ReadOnlyError);
+    }
+    expect(leaf.setViewStateCalls).toBe(1);
+    expect(rollbackCalls).toBe(1);
+    expect(noticeCount).toBe(1);
+  });
+
+  test("10 秒后允许再次回滚（注入时钟）；不同 path 各自独立", () => {
+    let now = 0;
+    const leafA = makeLeaf("notes/a.md");
+    const leafB = makeLeaf("notes/b.md");
+    const rollback = createReadonlyRollback({
+      workspace: { iterateAllLeaves: (callback) => [leafA, leafB].forEach(callback) },
+      now: () => now,
+    });
+    rollback({ operation: "write", path: "notes/a.md" });
+    rollback({ operation: "write", path: "notes/a.md" });
+    expect(leafA.setViewStateCalls).toBe(1);
+    now = 5_000; // 10s 内 → 不再回滚
+    rollback({ operation: "write", path: "notes/a.md" });
+    expect(leafA.setViewStateCalls).toBe(1);
+    now = 10_000; // 满 10s → 允许再次回滚
+    rollback({ operation: "write", path: "notes/a.md" });
+    expect(leafA.setViewStateCalls).toBe(2);
+    // 另一个 path 不受影响
+    rollback({ operation: "write", path: "notes/b.md" });
+    expect(leafB.setViewStateCalls).toBe(1);
+  });
+
+  test("找不到打开着的视图（后台保存）：只回调日志（reloaded=false），不重载", () => {
+    const other = makeLeaf("notes/other.md");
+    const rollbacks: Array<{ path: string; reloaded: boolean }> = [];
+    const rollback = createReadonlyRollback({
+      workspace: { iterateAllLeaves: (callback) => callback(other) },
+      onRollback: (info) => rollbacks.push({ path: info.path, reloaded: info.reloaded }),
+    });
+    rollback({ operation: "write", path: "notes/a.md" });
+    expect(other.setViewStateCalls).toBe(0);
+    expect(rollbacks).toEqual([{ path: "notes/a.md", reloaded: false }]);
+  });
+
+  test("日志内容：`rollback cause=readonly`（stage=write, level=info）", () => {
+    const lines: Array<{ stage: string; message: string; level?: string }> = [];
+    const rollback = createReadonlyRollback({
+      workspace: { iterateAllLeaves: (callback) => callback(makeLeaf("notes/a.md")) },
+      onRollback: ({ path }) => {
+        lines.push({ stage: "write", message: "rollback cause=readonly", level: "info", path } as never);
+      },
+    });
+    rollback({ operation: "write", path: "notes/a.md" });
+    expect(lines[0].stage).toBe("write");
+    expect(lines[0].level).toBe("info");
+    expect(lines[0].message).toBe("rollback cause=readonly");
   });
 });

@@ -12,7 +12,7 @@
  */
 
 /** 允许出现在日志里的阶段名（`download` = client 下载失败）。 */
-export type DiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort" | "index";
+export type DiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort" | "index" | "write";
 
 /** 日志文件（库内路径，走 Obsidian adapter 写）。 */
 export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";
@@ -24,7 +24,7 @@ export const DIAG_MSG_MAX = 200;
 export const DIAG_TAIL_LINES = 200;
 
 /** 失败原因分类（0.2.4 A7）。 */
-export type DiagCause = "timeout" | "size" | "auth" | "http" | "canceled" | "unknown";
+export type DiagCause = "timeout" | "size" | "auth" | "http" | "canceled" | "readonly" | "unknown";
 
 export interface DiagEntry {
   stage: DiagStage;

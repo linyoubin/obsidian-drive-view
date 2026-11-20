@@ -113,6 +113,73 @@ export interface QuarkReadOnlyAdapterOptions {
   diag?: QuarkAdapterDiagSink | null;
   /** 可选下载提示 + 取消（0.2.4 A4′）；不传则下载时无提示。 */
   downloadUi?: QuarkDownloadUi | null;
+  /**
+   * 写被拒后的回调（0.2.8）：main 用它做「回滚视图到云端版本」。
+   * 写操作仍然 reject `ReadOnlyError`（不假装成功），这里只是通知。
+   */
+  onReadonlyWrite?: (info: { operation: string; path: string }) => void;
+}
+
+/** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
+export interface ReadonlyRollbackLeaf {
+  view?: { file?: { path?: string } | null } | null;
+  getViewState(): unknown;
+  setViewState(state: unknown): Promise<void>;
+}
+
+/** 回滚用到的 workspace 最小形状（`app.workspace` 结构上满足）。 */
+export interface ReadonlyRollbackWorkspace {
+  iterateAllLeaves(callback: (leaf: ReadonlyRollbackLeaf) => void): void;
+}
+
+/**
+ * 写失败 → 回滚视图（0.2.8）。
+ *
+ * 用户原话：「不应该是保存失败就回滚掉吗？然后就可以操作其他文件了」。
+ * 做法：同一 path 在 `windowMs`（默认 10s）内**只回滚一次、只提示一次**；
+ * 回滚 = 用 `setViewState(getViewState())` 强制按 adapter 内容重载，编辑缓冲被云端版本覆盖。
+ * 找不到打开着的视图（后台保存）时只回调日志、不重载。
+ *
+ * 注意：回滚触发的是 `read`，不会再触发写，因此不会形成环路；防抖只是双保险。
+ */
+export function createReadonlyRollback(options: {
+  workspace: ReadonlyRollbackWorkspace;
+  now?: () => number;
+  windowMs?: number;
+  onRollback?: (info: { path: string; reloaded: boolean; operation: string }) => void;
+}): (info: { operation: string; path: string }) => void {
+  const lastAt = new Map<string, number>();
+  const now = options.now ?? (() => Date.now());
+  const windowMs = options.windowMs ?? 10_000;
+  return (info) => {
+    const path = info.path;
+    const at = now();
+    const previous = lastAt.get(path);
+    if (previous !== undefined && at - previous < windowMs) return; // 10s 内只回滚一次
+    lastAt.set(path, at);
+
+    let reloaded = false;
+    try {
+      options.workspace.iterateAllLeaves((leaf) => {
+        if (reloaded) return;
+        const leafPath = leaf?.view?.file?.path;
+        if (!leafPath || leafPath !== path) return;
+        reloaded = true;
+        try {
+          void Promise.resolve(leaf.setViewState(leaf.getViewState())).catch(() => undefined);
+        } catch {
+          /* 移动端 setViewState 异常不影响其它文件 */
+        }
+      });
+    } catch {
+      /* workspace 不可用：只记日志 */
+    }
+    try {
+      options.onRollback?.({ path, reloaded, operation: info.operation });
+    } catch {
+      /* 提示/日志失败不影响 Obsidian 的保存流程 */
+    }
+  };
 }
 
 /** 同一个错误对象只记一条日志（download 与 read 不再各记一条，0.2.4 A7）。 */
@@ -142,6 +209,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly pluginDir: string;
   private readonly diag?: QuarkAdapterDiagSink | null;
   private readonly downloadUi?: QuarkDownloadUi | null;
+  private readonly onReadonlyWrite?: (info: { operation: string; path: string }) => void;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -155,6 +223,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.pluginDir = normalizeVaultPath(options.pluginDir ?? DEFAULT_PLUGIN_DIR);
     this.diag = options.diag ?? null;
     this.downloadUi = options.downloadUi ?? null;
+    this.onReadonlyWrite = options.onReadonlyWrite;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -275,32 +344,48 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     }
   }
 
-  // ---------------------------------------------------------------- 抛错 12
+  // ---------------------------------------------------------------- 写 12（只读 no-op，0.2.8）
+
+  /**
+   * 0.2.8：写操作**仍然 reject**（`ReadOnlyError`），但拒绝前先通知 main 做「回滚视图」：
+   * 用户要的是「保存失败就回滚掉，然后可以继续操作其它文件」，而不是静默假装成功。
+   * `.obsidian/**` 与插件目录仍原样转发给 base adapter（真写进本地）。
+   */
+  private rejectWrite(operation: string, normalizedPath: string): Promise<never> {
+    const path = normalizeVaultPath(normalizedPath);
+    try {
+      this.onReadonlyWrite?.({ operation, path });
+    } catch {
+      /* 回滚/提示失败不影响拒绝写 */
+    }
+    return Promise.reject(new ReadOnlyError(operation, path));
+  }
 
   async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.write(normalizedPath, data, options);
-    return Promise.reject(new ReadOnlyError("write", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("write", normalizedPath);
   }
 
   async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.writeBinary(normalizedPath, data, options);
     }
-    return Promise.reject(new ReadOnlyError("writeBinary", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("writeBinary", normalizedPath);
   }
 
   async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.append(normalizedPath, data, options);
-    return Promise.reject(new ReadOnlyError("append", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("append", normalizedPath);
   }
 
   async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.appendBinary(normalizedPath, data, options);
     }
-    return Promise.reject(new ReadOnlyError("appendBinary", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("appendBinary", normalizedPath);
   }
 
+  /** 只读下 `process` 返回**原始内容**（不执行 fn、不写回）。 */
   async process(
     normalizedPath: string,
     fn: (data: string) => string,
@@ -309,47 +394,47 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.process(normalizedPath, fn, options);
     }
-    return Promise.reject(new ReadOnlyError("process", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("process", normalizedPath);
   }
 
   async mkdir(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.mkdir(normalizedPath);
-    return Promise.reject(new ReadOnlyError("mkdir", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("mkdir", normalizedPath);
   }
 
-  /** 注意：抛错而不是 `return false`——否则上层会误判「已删除」。 */
+  /** 只读下删除一律被拒（上层会看到「只读」错误，而不是误判成功）。 */
   async trashSystem(normalizedPath: string): Promise<boolean> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashSystem(normalizedPath);
-    return Promise.reject(new ReadOnlyError("trashSystem", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("trashSystem", normalizedPath);
   }
 
   async trashLocal(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashLocal(normalizedPath);
-    return Promise.reject(new ReadOnlyError("trashLocal", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("trashLocal", normalizedPath);
   }
 
   async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.rmdir(normalizedPath, recursive);
-    return Promise.reject(new ReadOnlyError("rmdir", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("rmdir", normalizedPath);
   }
 
   async remove(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.remove(normalizedPath);
-    return Promise.reject(new ReadOnlyError("remove", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("remove", normalizedPath);
   }
 
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.rename(normalizedPath, normalizedNewPath);
     }
-    return Promise.reject(new ReadOnlyError("rename", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("rename", normalizedPath);
   }
 
   async copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.copy(normalizedPath, normalizedNewPath);
     }
-    return Promise.reject(new ReadOnlyError("copy", normalizeVaultPath(normalizedPath)));
+    return this.rejectWrite("copy", normalizedPath);
   }
 
   // ---------------------------------------------------------------- 内部

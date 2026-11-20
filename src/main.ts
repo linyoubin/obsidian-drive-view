@@ -2,7 +2,8 @@ import { Notice, Platform, Plugin, requestUrl } from "obsidian";
 import * as obsidianRuntime from "obsidian";
 import type { DataAdapter } from "obsidian";
 import { GoogleDriveDataAdapter } from "./adapter/GoogleDriveDataAdapter";
-import { QuarkReadOnlyAdapter } from "./adapter/QuarkReadOnlyAdapter";
+import { QuarkReadOnlyAdapter, createReadonlyRollback } from "./adapter/QuarkReadOnlyAdapter";
+import type { ReadonlyRollbackLeaf } from "./adapter/QuarkReadOnlyAdapter";
 import { VaultMounter } from "./adapter/VaultMounter";
 import type { VaultMountable } from "./adapter/VaultMounter";
 import { CookieStore } from "./auth/CookieStore";
@@ -153,6 +154,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private lastRibbonTitleAt = 0;
   private quarkDownloadBook: DownloadNoticeBook | null = null;
   private quarkAuthExpired = false;
+  private quarkRollback: ((info: { operation: string; path: string }) => void) | null = null;
   private lastSettingsRefreshAt = 0;
 
   private statusBarItemEl: HTMLElement | null = null;
@@ -475,6 +477,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     });
     // 诊断日志（0.2.3 A5）：写 `<vault>/.obsidian/plugins/drive-view/quark-debug.log`，
     // 走原生 adapter（`.obsidian/**` 已转发），不引 fs/node 依赖；失败绝不影响主流程。
+    this.initQuarkRollback();
     this.quarkDiag = new DiagLogger({
       adapter: this.mounter.getOriginalAdapter() as unknown as DiagAdapterLike,
       onError: (error) => console.warn("[Quark] diag write failed:", error),
@@ -490,6 +493,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         begin: (info) => this.quarkDownloadBook!.begin(info),
         end: (token, outcome) => this.quarkDownloadBook!.end(token, outcome),
       },
+      // 0.2.8：写操作仍 reject ReadOnlyError；拒绝前回调这里做「回滚视图到云端版本」
+      onReadonlyWrite: (info) => this.quarkRollback?.(info),
     });
 
     this.quarkStatusBarEl = this.addStatusBarItem();
@@ -921,6 +926,40 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
   }
 
+  /**
+   * 写失败 → 回滚视图（0.2.8）。用户要的是「保存失败就回滚掉，然后可以继续操作其它文件」：
+   * 同一 path 10 秒内只回滚一次、只提示一次；回滚 = 按 adapter 内容强制重载视图。
+   * 找不到打开着的视图（后台保存）只记日志。
+   */
+  private initQuarkRollback(): void {
+    // obsidian.d.ts 未声明 iterateAllLeaves，运行期从 workspace 取
+    const workspace = this.app.workspace as unknown as {
+      iterateAllLeaves(callback: (leaf: unknown) => void): void;
+    };
+    this.quarkRollback = createReadonlyRollback({
+      workspace: {
+        iterateAllLeaves: (callback: (leaf: ReadonlyRollbackLeaf) => void) =>
+          workspace.iterateAllLeaves((leaf) => callback(leaf as ReadonlyRollbackLeaf)),
+      },
+      onRollback: ({ path, reloaded }) => {
+        if (reloaded) {
+          new Notice("只读库：该文件已回滚到云端版本（修改未保存）", 8000);
+        }
+        try {
+          this.quarkDiag?.log({
+            level: "info",
+            stage: "write",
+            path: path || "/",
+            fid: "-",
+            message: "rollback cause=readonly",
+          });
+        } catch {
+          /* 日志失败不影响回滚 */
+        }
+      },
+    });
+  }
+
   /** 在下载提示里追加「取消」按钮（A4′）：点一下只标记 canceled，不假装中断 TCP。 */
   private attachDownloadCancel(notice: DownloadNoticeLike, onCancel: () => void): void {
     const el = notice.noticeEl as
@@ -955,6 +994,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkClient?.setDownloadConcurrency(concurrency);
     this.refreshQuarkUi();
   }
+
 
   /** 设置页：大文件提醒阈值（MB，仅提示，不拦截）。 */
   public async quarkSetMaxFileMb(mb: number): Promise<void> {

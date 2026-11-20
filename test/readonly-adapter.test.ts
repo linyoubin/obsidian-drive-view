@@ -364,7 +364,7 @@ describe("QuarkReadOnlyAdapter：getResourcePath 同步两分支（A4）", () =>
 
 // ------------------------------------------------------------------ A6：12 个写方法
 
-describe("QuarkReadOnlyAdapter：12 个写方法一律抛 ReadOnlyError（A6）", () => {
+describe("QuarkReadOnlyAdapter：12 个写方法抛 ReadOnlyError（A6，0.2.8 写失败由 main 回滚）", () => {
   test("逐个遍历 12 个写方法：instanceof ReadOnlyError + 消息含「只读」+ operation 正确", async () => {
     expect(WRITE_CALLS.length).toBe(12);
     for (const [operation, call] of WRITE_CALLS) {
