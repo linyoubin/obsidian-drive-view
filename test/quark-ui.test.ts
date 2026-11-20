@@ -199,39 +199,32 @@ describe("QuarkQrModal：倒计时与状态文案", () => {
 
 // ------------------------------------------------------------------ ribbon 分支
 
-// ------------------------------------------------------------------ 流程顺序（0.2.2）
+// ------------------------------------------------------------------ 流程顺序（0.2.7：登录 → 选根 → 确认框）
 
-describe("点「同步夸克」的流程顺序（0.2.2：先扫码 → 再选根 → 自动同步）", () => {
-  test("① 未登录 + 未选根：点 → 扫码 → 选根 → 选定即同步", () => {
+describe("点「同步夸克」的流程顺序（0.2.7：永远不自动同步）", () => {
+  test("① 未登录 + 未选根：点 → 扫码 → 选根 → 确认框", () => {
     const none = snapshot({ loginState: "none", rootChosen: false });
     expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: none })).toEqual({ action: "login" });
     expect(settingsTab.reduceQuarkFlow({ type: "login", ok: true, snapshot: none })).toEqual({
       action: "choose-root",
     });
-    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({
-      action: "sync",
-      reason: "首次同步",
-    });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({ action: "confirm" });
   });
 
-  test("② 未登录 + 已选根：扫码成功 → 直接同步（不弹确认框）", () => {
+  test("② 未登录 + 已选根：点 → 扫码 → 确认框（不弹同步、不自动跑）", () => {
     const chosen = snapshot({ loginState: "none", rootChosen: true });
     expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: chosen })).toEqual({ action: "login" });
     expect(settingsTab.reduceQuarkFlow({ type: "login", ok: true, snapshot: chosen })).toEqual({
-      action: "sync",
-      reason: "登录后自动同步",
+      action: "confirm",
     });
   });
 
-  test("③ 已登录 + 未选根：点 → 选根 → 选定即同步", () => {
+  test("③ 已登录 + 未选根：点 → 选根 → 确认框", () => {
     const active = snapshot({ loginState: "active", rootChosen: false });
     expect(settingsTab.reduceQuarkFlow({ type: "click", snapshot: active })).toEqual({
       action: "choose-root",
     });
-    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({
-      action: "sync",
-      reason: "首次同步",
-    });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({ action: "confirm" });
   });
 
   test("④ 已登录 + 已选根：点 → 确认框；选「现在同步」才跑、选「取消」就停", () => {
@@ -262,16 +255,33 @@ describe("点「同步夸克」的流程顺序（0.2.2：先扫码 → 再选根
     });
   });
 
+  test("反向断言：登录成功不触发 sync（已选根/未选根都不行）", () => {
+    for (const rootChosen of [false, true]) {
+      const result = settingsTab.reduceQuarkFlow({
+        type: "login",
+        ok: true,
+        snapshot: snapshot({ loginState: "active", rootChosen }),
+      });
+      expect(result.action).not.toBe("sync");
+      expect(["confirm", "choose-root"]).toContain(result.action);
+    }
+  });
+
+  test("反向断言：选根成功不触发 sync（含「修改库根」路径，一律回确认框）", () => {
+    const first = settingsTab.reduceQuarkFlow({ type: "root", ok: true });
+    expect(first.action).not.toBe("sync");
+    expect(first).toEqual({ action: "confirm" });
+    const afterChange = settingsTab.reduceQuarkFlow({ type: "root", ok: true, returnToConfirm: true });
+    expect(afterChange.action).not.toBe("sync");
+    expect(afterChange).toEqual({ action: "confirm" });
+  });
+
   test("补：确认框「修改库根」→ 选完回确认框（不直接开跑）；中途取消也终止", () => {
     expect(settingsTab.reduceQuarkFlow({ type: "confirm", choice: "change-root" })).toEqual({
       action: "choose-root",
     });
-    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true, returnToConfirm: true })).toEqual({
-      action: "confirm",
-    });
-    expect(
-      settingsTab.reduceQuarkFlow({ type: "root", ok: false, returnToConfirm: true }).action
-    ).toBe("stop");
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: true })).toEqual({ action: "confirm" });
+    expect(settingsTab.reduceQuarkFlow({ type: "root", ok: false }).action).toBe("stop");
   });
 
   test("登录已过期（expired）按未登录处理：先扫码，不看库根", () => {

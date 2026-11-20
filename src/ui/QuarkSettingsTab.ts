@@ -316,6 +316,20 @@ export type QuarkFlowAction =
  * 取消扫码 → 终止，不选根、不同步；取消选根 → 终止并提示必须选根（登录状态保留）。
  * 确认框里「修改库根」→ 选完回确认框，不直接开跑。
  */
+/**
+ * 点「同步夸克」后的状态机（0.2.7：**永远不自动同步**）：
+ * 固定三段顺序「登录 → 选库根 → 确认框」，每段“已满足”就跳过；
+ * 扫码成功、选根成功都**只推进到下一段**，绝不直接开跑，一律以确认框收尾。
+ *
+ * | 点之前的状态 | 点击后的流程 |
+ * |---|---|
+ * | 未登录 + 未选根 | 扫码 → 选根 → 确认框 |
+ * | 未登录 + 已选根 | 扫码 → 确认框 |
+ * | 已登录 + 未选根 | 选根 → 确认框 |
+ * | 已登录 + 已选根 | 确认框 |
+ *
+ * 任何阶段取消 → 终止；确认框「修改库根」→ 选新根 → 回到确认框（不自动开跑）。
+ */
 export function reduceQuarkFlow(event: QuarkFlowEvent): QuarkFlowAction {
   switch (event.type) {
     case "click":
@@ -323,13 +337,12 @@ export function reduceQuarkFlow(event: QuarkFlowEvent): QuarkFlowAction {
       return event.snapshot.rootChosen ? { action: "confirm" } : { action: "choose-root" };
     case "login":
       if (!event.ok) return { action: "stop", notice: null };
-      return event.snapshot.rootChosen
-        ? { action: "sync", reason: "登录后自动同步" }
-        : { action: "choose-root" };
+      // 0.2.7：登录成功**不自动同步**，只推进到「选根」或「确认框」
+      return event.snapshot.rootChosen ? { action: "confirm" } : { action: "choose-root" };
     case "root":
       if (!event.ok) return { action: "stop", notice: QUARK_ROOT_REQUIRED_NOTICE };
-      // 从确认框「修改库根」来的回确认框；登录后/首次选根的直接同步
-      return event.returnToConfirm ? { action: "confirm" } : { action: "sync", reason: "首次同步" };
+      // 0.2.7：选根成功也**不自动同步**，一律回到确认框
+      return { action: "confirm" };
     case "confirm":
       if (event.choice === "cancel") return { action: "stop", notice: null };
       if (event.choice === "change-root") return { action: "choose-root" };

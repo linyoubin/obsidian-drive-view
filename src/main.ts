@@ -583,7 +583,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           await this.quarkSync(action.reason);
           return;
         case "login":
-          // 扫码弹窗自己管生命周期；登录成功后从 onDone 回灌 `{ type: "login" }` 继续走选根/同步
+          // 扫码弹窗自己管生命周期；登录成功后从 onDone 回灌 `{ type: "login" }` 继续走「选根 → 确认框」
           await this.quarkOpenQrModal();
           return;
         case "choose-root": {
@@ -595,7 +595,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           const choice = await this.confirmQuarkSync();
           if (choice === "change-root") {
             const chosen = await this.pickQuarkRoot();
-            action = reduceQuarkFlow({ type: "root", ok: chosen, returnToConfirm: true });
+            // 0.2.7：修改库根后一律回到确认框，不自动开跑
+            action = reduceQuarkFlow({ type: "root", ok: chosen });
           } else {
             action = reduceQuarkFlow({ type: "confirm", choice });
           }
