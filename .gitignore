@@ -3,3 +3,8 @@ main.js
 data.json
 *.log
 .DS_Store
+
+# 探针：cookie 与运行报告不进版本库
+probe/cookie.txt
+probe/report-*.json
+.tmp/
