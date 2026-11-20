@@ -233,9 +233,11 @@ describe("CookieStore：set-cookie 解析与合并", () => {
   test("CookieStore.applySetCookie：响应头合并回写并导出 `k=v; k2=v2`", () => {
     const store = new CookieStore({ pairs: "__pus=false; _UP_D_=seed" });
     const applied = store.applySetCookie({
-      "set-cookie": ["__pus=true; Path=/", "__puus=false; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT"],
+      // Expires 用未来时间：删除型语义（T-07）已落地，过去时间会被当作「删除该 cookie」
+      "set-cookie": ["__pus=true; Path=/", "__puus=false; Path=/; Expires=Sat, 21 Oct 2033 07:28:00 GMT"],
     });
     expect(applied.names).toEqual(["__pus", "__puus"]);
+    expect(applied.removed).toEqual([]);
     expect(applied.total).toBe(3);
     expect(store.getHeader()).toBe("__pus=true; _UP_D_=seed; __puus=false");
     expect(store.has("__puus")).toBe(true);
@@ -250,6 +252,38 @@ describe("CookieStore：set-cookie 解析与合并", () => {
     expect(store.getHeader()).toBe("__pus=true");
     expect(splitSetCookieValue("")).toEqual([]);
     expect(splitSetCookieValue(undefined)).toEqual([]);
+  });
+
+  test("删除语义：`Max-Age<=0` 从集合里移除同 name 项（A7）", () => {
+    const store = new CookieStore({ pairs: "__pus=true; __kps=keep; __puus=false" });
+    const applied = store.applySetCookie({
+      "set-cookie": ["__pus=; Max-Age=0; Path=/", "__puus=; Max-Age=-1; Path=/"],
+    });
+    expect(applied.removed.slice().sort()).toEqual(["__pus", "__puus"]);
+    expect(applied.names).toEqual([]);
+    expect(store.has("__pus")).toBe(false);
+    expect(store.getHeader()).toBe("__kps=keep");
+  });
+
+  test("删除语义：`Expires` 已过期即删除；删不存在的 name 不报错（A7）", () => {
+    const now = Date.parse("2026-11-20T00:00:00Z");
+    const store = new CookieStore({ pairs: "__pus=true; _UP_D_=keep" });
+    const applied = store.applySetCookie(
+      { "set-cookie": ["__pus=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT", "__nope=; Max-Age=0"] },
+      now
+    );
+    expect(applied.removed).toEqual(["__pus", "__nope"]);
+    expect(store.has("__pus")).toBe(false);
+    expect(store.getHeader()).toBe("_UP_D_=keep");
+
+    // 未来的 Expires 不算删除
+    const alive = new CookieStore({ pairs: "_UP_D_=keep" });
+    const kept = alive.applySetCookie(
+      { "set-cookie": ["__pus=true; Expires=Sat, 21 Oct 2033 07:28:00 GMT"] },
+      now
+    );
+    expect(kept.removed).toEqual([]);
+    expect(alive.has("__pus")).toBe(true);
   });
 
   test("parseCookieHeader：支持 `k=v; k2=v2` 与 `Cookie:` 前缀回读", () => {

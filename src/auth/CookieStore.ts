@@ -124,6 +124,96 @@ export function setCookiePairsOf(raws: string[]): string[] {
   return out;
 }
 
+/** 一条 `set-cookie` 的解析结果（只取本仓库需要的字段）。 */
+export interface ParsedSetCookie {
+  raw: string;
+  /** `name=value` 部分（已剥离属性）；非法条目为空串。 */
+  pair: string;
+  name: string;
+  value: string;
+  /** 删除型：`Max-Age<=0` 或 `Expires` 已过期。 */
+  deleted: boolean;
+  maxAge: number | null;
+  expiresAt: number | null;
+}
+
+/**
+ * 解析一条 `set-cookie` 原文（属性部分只关心 `Max-Age` 与 `Expires`）。
+ *
+ * 删除语义（服务端注销 cookie 的标准做法）：`Max-Age<=0`，或 `Expires` 早于当前时间，
+ * 都表示「删掉这个 name」。真机未观察到，但 `session` cookie 失效时会出现（保守实现）。
+ */
+export function parseSetCookie(raw: string, now: number = Date.now()): ParsedSetCookie {
+  const text = String(raw == null ? "" : raw).trim();
+  if (!text) {
+    return { raw: "", pair: "", name: "", value: "", deleted: false, maxAge: null, expiresAt: null };
+  }
+  const pair = cookiePairOf(text);
+  const name = cookieNameOf(pair);
+  const value = pair ? pair.slice(pair.indexOf("=") + 1) : "";
+  let maxAge: number | null = null;
+  let expiresAt: number | null = null;
+
+  const chunks = text.split(";");
+  for (let i = 1; i < chunks.length; i += 1) {
+    const attribute = chunks[i].trim();
+    if (!attribute) continue;
+    const eq = attribute.indexOf("=");
+    const key = (eq >= 0 ? attribute.slice(0, eq) : attribute).trim().toLowerCase();
+    const attrValue = eq >= 0 ? attribute.slice(eq + 1).trim() : "";
+    if (key === "max-age") {
+      const parsed = Number(attrValue);
+      if (Number.isFinite(parsed)) maxAge = parsed;
+    } else if (key === "expires") {
+      const parsed = Date.parse(attrValue);
+      if (Number.isFinite(parsed)) expiresAt = parsed;
+    }
+  }
+
+  const deleted = name !== "" && ((maxAge !== null && maxAge <= 0) || (expiresAt !== null && expiresAt <= now));
+  return { raw: text, pair, name, value, deleted, maxAge, expiresAt };
+}
+
+/** 该条 `set-cookie` 是否表示删除（`Max-Age<=0` 或 `Expires` 已过期）。 */
+export function isSetCookieDeletion(raw: string, now: number = Date.now()): boolean {
+  return parseSetCookie(raw, now).deleted;
+}
+
+/**
+ * 把一批 `set-cookie` 原文应用到 Cookie 集合：删除型移除同 name 项，其余按 name 覆盖合并。
+ *
+ * @returns `applied` = 本次写入的 name；`removed` = 本次删除的 name
+ */
+export function mergeSetCookies(
+  pairs: string[],
+  raws: string[],
+  now: number = Date.now()
+): { pairs: string[]; applied: string[]; removed: string[] } {
+  const live: string[] = [];
+  const applied: string[] = [];
+  const removed: string[] = [];
+
+  for (const raw of raws) {
+    const parsed = parseSetCookie(raw, now);
+    if (!parsed.name) continue;
+    if (parsed.deleted) {
+      if (removed.indexOf(parsed.name) < 0) removed.push(parsed.name);
+      continue;
+    }
+    live.push(parsed.pair);
+    if (applied.indexOf(parsed.name) < 0) applied.push(parsed.name);
+  }
+
+  let next = mergeCookiePairs(pairs, live);
+  if (removed.length > 0) {
+    next = next.filter((pair) => {
+      const name = cookieNameOf(pair);
+      return name !== "" && removed.indexOf(name) < 0;
+    });
+  }
+  return { pairs: next, applied, removed };
+}
+
 /** 解析一条 Cookie 头字符串（允许带 `Cookie:` 前缀）。 */
 export function parseCookieHeader(header: string | null | undefined): string[] {
   if (header == null) return [];
@@ -273,20 +363,20 @@ export class CookieStore {
 
   /**
    * 合并一个响应的 `set-cookie` 并回写。
-   * @returns 本次响应涉及的 Cookie 名（用于日志与「换 Cookie 是否成功」判定）
+   *
+   * 删除型条目（`Max-Age<=0` / `Expires` 已过期）会从集合里移除同 name 项。
+   *
+   * @returns `names` = 本次写入的 name（用于日志与「换 Cookie 是否成功」判定）、
+   *          `removed` = 本次删除的 name
    */
-  applySetCookie(headers: HeaderBag | Record<string, unknown> | null | undefined): { names: string[]; header: string; total: number } {
+  applySetCookie(
+    headers: HeaderBag | Record<string, unknown> | null | undefined,
+    now: number = Date.now()
+  ): { names: string[]; header: string; total: number; removed: string[] } {
     const raws = collectSetCookieValues(headers);
-    const incoming = setCookiePairsOf(raws);
-    const incomingNames: string[] = [];
-    for (const pair of incoming) {
-      const name = cookieNameOf(pair);
-      if (name && incomingNames.indexOf(name) < 0) incomingNames.push(name);
-    }
-    if (incoming.length > 0) {
-      this.pairs = mergeCookiePairs(this.pairs, incoming);
-    }
-    return { names: incomingNames, header: this.getHeader(), total: this.pairs.length };
+    const result = mergeSetCookies(this.pairs, raws, now);
+    this.pairs = result.pairs;
+    return { names: result.applied, header: this.getHeader(), total: this.pairs.length, removed: result.removed };
   }
 
   clear(): void {
