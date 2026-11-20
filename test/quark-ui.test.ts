@@ -414,13 +414,14 @@ describe("同步进度：百分比与文案（T-11 addendum）", () => {
     expect(lines[2]).toBe("将执行：全量刷新索引");
   });
 
-  test("完成文案：统计四项 + 耗时（且可带库根）", () => {
-    const text = settingsTab.describeSyncResult("/知识库_云端", 128, { added: 3, changed: 4, removed: 5 }, "12.3");
-    expect(text).toContain("已同步 128 条");
-    expect(text).toContain("新增 3");
-    expect(text).toContain("变更 4");
-    expect(text).toContain("删除 5");
-    expect(text).toContain("耗时 12.3s");
-    expect(text).toContain("库根 /知识库_云端");
+  test("完成文案：五项统计一行（Notice 5 秒自动消失，不含 cookie）", () => {
+    const text = settingsTab.describeSyncResult(128, { added: 3, changed: 4, removed: 5 }, "12.3");
+    expect(text).toBe("已同步 128 条 · 新增 3 · 变更 4 · 删除 5 · 耗时 12.3s");
+    expect(text).not.toContain("=");
+  });
+
+  test("完成文案：0 条 / 0 增删 也要可读（首同步空库）", () => {
+    const text = settingsTab.describeSyncResult(0, { added: 0, changed: 0, removed: 0 }, "0.4");
+    expect(text).toBe("已同步 0 条 · 新增 0 · 变更 0 · 删除 0 · 耗时 0.4s");
   });
 });

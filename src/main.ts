@@ -613,20 +613,20 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (result.aborted) {
         this.hideSyncNotice(progressNotice);
-        new Notice(`夸克：${describeSyncCancel(result.progress.scannedFolders.length)}`, 7000);
+        new Notice(describeSyncCancel(result.progress.scannedFolders.length), 7000);
         return;
       }
 
       const diff = result.diff;
       this.hideSyncNotice(progressNotice);
+      // 完成文案按验收原文：五项统计一行，5 秒后自动消失
       new Notice(
-        `夸克：${describeSyncResult(
-          this.settings.quarkRootPath,
+        describeSyncResult(
           this.quarkIndex.entryCount,
           { added: diff.added.length, changed: diff.changed.length, removed: diff.removed.length },
           seconds
-        )}`,
-        8000
+        ),
+        5000
       );
       await this.updateSettings({ quarkLastIndexBuiltAt: this.quarkIndex.metaInfo.builtAt });
 

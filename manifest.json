@@ -1,9 +1,9 @@
 {
   "id": "drive-view",
-  "name": "Drive View",
+  "name": "Quark Vault",
   "version": "0.2.1",
   "minAppVersion": "1.5.0",
-  "description": "Use a Google Drive folder as your vault, with a local cache for fast access on desktop and mobile.",
+  "description": "把夸克网盘里的指定目录当作 Obsidian 只读知识库：扫码登录、索引常驻、正文按需下载、不占本地空间。",
   "author": "Alex Sherman",
   "authorUrl": "https://asherman.io",
   "isDesktopOnly": false

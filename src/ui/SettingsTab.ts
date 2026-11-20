@@ -85,7 +85,7 @@ export class GoogleDriveSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Use Custom OAuth Credentials (Full Drive & Shared Folders)")
       .setDesc(
-        "By default, Drive View requests per-file access (drive.file) for folders created by this app. Enable this to provide your own Google Cloud Web Client ID & Secret for full Drive and shared folder access."
+        "By default, Quark Vault requests per-file access (drive.file) for folders created by this app. Enable this to provide your own Google Cloud Web Client ID & Secret for full Drive and shared folder access."
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.useCustomCredentials).onChange(async (val) => {

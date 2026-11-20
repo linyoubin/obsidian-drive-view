@@ -173,14 +173,18 @@ export function describeSyncCancel(scanned: number): string {
   return `已取消同步（已扫 ${scanned} 个目录，索引保留上一版）`;
 }
 
-/** 同步完成文案：`已同步 N 条 · 新增 a · 变更 b · 删除 c · 耗时 Xs（库根 /x）`（T-11 A5）。 */
+/**
+ * 同步完成文案：`已同步 N 条 · 新增 a · 变更 b · 删除 c · 耗时 Xs`（T-11 A5）。
+ *
+ * 库根不在这行里重复：同步全程的常驻 Notice 已带库根，设置页/确认框也各有一处，
+ * 这里保持一行可扫读，Notice 5 秒自动消失。
+ */
 export function describeSyncResult(
-  rootPath: string,
   entryCount: number,
   diff: { added: number; changed: number; removed: number },
   seconds: string
 ): string {
-  return `已同步 ${entryCount} 条 · 新增 ${diff.added} · 变更 ${diff.changed} · 删除 ${diff.removed} · 耗时 ${seconds}s（库根 ${describeRootPath(rootPath)}）`;
+  return `已同步 ${entryCount} 条 · 新增 ${diff.added} · 变更 ${diff.changed} · 删除 ${diff.removed} · 耗时 ${seconds}s`;
 }
 
 /** ribbon tooltip 三态（A6）：手机端看不到状态栏，靠这个 title 看状态。 */
