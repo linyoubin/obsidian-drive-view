@@ -279,26 +279,26 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
 
   async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.write(normalizedPath, data, options);
-    throw new ReadOnlyError("write", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("write", normalizeVaultPath(normalizedPath)));
   }
 
   async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.writeBinary(normalizedPath, data, options);
     }
-    throw new ReadOnlyError("writeBinary", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("writeBinary", normalizeVaultPath(normalizedPath)));
   }
 
   async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.append(normalizedPath, data, options);
-    throw new ReadOnlyError("append", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("append", normalizeVaultPath(normalizedPath)));
   }
 
   async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.appendBinary(normalizedPath, data, options);
     }
-    throw new ReadOnlyError("appendBinary", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("appendBinary", normalizeVaultPath(normalizedPath)));
   }
 
   async process(
@@ -309,47 +309,47 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.process(normalizedPath, fn, options);
     }
-    throw new ReadOnlyError("process", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("process", normalizeVaultPath(normalizedPath)));
   }
 
   async mkdir(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.mkdir(normalizedPath);
-    throw new ReadOnlyError("mkdir", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("mkdir", normalizeVaultPath(normalizedPath)));
   }
 
   /** 注意：抛错而不是 `return false`——否则上层会误判「已删除」。 */
   async trashSystem(normalizedPath: string): Promise<boolean> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashSystem(normalizedPath);
-    throw new ReadOnlyError("trashSystem", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("trashSystem", normalizeVaultPath(normalizedPath)));
   }
 
   async trashLocal(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.trashLocal(normalizedPath);
-    throw new ReadOnlyError("trashLocal", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("trashLocal", normalizeVaultPath(normalizedPath)));
   }
 
   async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.rmdir(normalizedPath, recursive);
-    throw new ReadOnlyError("rmdir", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("rmdir", normalizeVaultPath(normalizedPath)));
   }
 
   async remove(normalizedPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) return await this.baseAdapter.remove(normalizedPath);
-    throw new ReadOnlyError("remove", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("remove", normalizeVaultPath(normalizedPath)));
   }
 
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.rename(normalizedPath, normalizedNewPath);
     }
-    throw new ReadOnlyError("rename", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("rename", normalizeVaultPath(normalizedPath)));
   }
 
   async copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     if (this.shouldForward(normalizedPath)) {
       return await this.baseAdapter.copy(normalizedPath, normalizedNewPath);
     }
-    throw new ReadOnlyError("copy", normalizeVaultPath(normalizedPath));
+    return Promise.reject(new ReadOnlyError("copy", normalizeVaultPath(normalizedPath)));
   }
 
   // ---------------------------------------------------------------- 内部

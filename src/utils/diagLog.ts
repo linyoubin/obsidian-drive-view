@@ -12,7 +12,7 @@
  */
 
 /** 允许出现在日志里的阶段名（`download` = client 下载失败）。 */
-export type DiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort";
+export type DiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort" | "index";
 
 /** 日志文件（库内路径，走 Obsidian adapter 写）。 */
 export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";
@@ -34,7 +34,7 @@ export interface DiagEntry {
   fid?: string;
   /** 原始错误消息（会被截断与脱敏）。 */
   message: string;
-  level?: "error" | "warn";
+  level?: "error" | "warn" | "info";
   /** 失败原因分类；写进日志的 `cause=` 字段。 */
   cause?: DiagCause;
   /** 是否重试过（超时重试 1 次后仍失败为 true）。 */

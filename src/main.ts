@@ -759,6 +759,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         return;
       }
 
+      // 0.2.7 索引诊断：entries/dirs/sample（用户反馈「只能看到一个文件」，先看索引里到底有什么）
+      this.logQuarkIndexDiag();
       const diff = result.diff;
       // 完成：同一个 Notice 实例换成结果文案，8 秒后自动消失
       finishQuarkSyncNotice(
@@ -789,6 +791,24 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       this.quarkScanSignal = null;
       // 变化点③同步结束：title 立即刷新（从「同步中」回到「已同步」）
       this.refreshQuarkUi(true);
+    }
+  }
+
+  /** 索引诊断（0.2.7）：同步完成后记录条目数 / 目录数 / 前 5 条路径，便于对照真机表现。 */
+  private logQuarkIndexDiag(): void {
+    try {
+      const entries = this.quarkIndex.entries;
+      const dirs = entries.filter((entry) => entry.type === "folder").length;
+      const sample = entries.slice(0, 5).map((entry) => entry.path).join(",");
+      this.quarkDiag?.log({
+        level: "info",
+        stage: "index",
+        path: this.settings.quarkRootPath || "/",
+        fid: "-",
+        message: `entries=${entries.length} dirs=${dirs} sample=${sample}`,
+      });
+    } catch (error) {
+      console.warn("[Quark] index diag failed:", error);
     }
   }
 
