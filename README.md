@@ -36,3 +36,10 @@ Copy `main.js` and `manifest.json` into your stub vault's plugin directory:
 - **On Mobile (iOS / Android):**
   - **Option A (Fastest):** Click **Copy Auth Bundle** in the Desktop plugin settings and paste it into the **Quick Cross-Device Auth Bundle** field on Mobile.
   - **Option B (Direct Mobile Sign-In):** Tap **Sign in with Google** on Mobile, approve access in your mobile browser, copy the resulting `http://127.0.0.1/?code=...` URL from your browser's address bar, and paste it into the modal.
+
+## 来源与许可 / Attribution
+
+本项目基于 [alex-sherman/obsidian-drive-view](https://github.com/alex-sherman/obsidian-drive-view) 改造（MIT License），
+原始版权声明见仓库根 `LICENSE`。夸克网盘相关的客户端、扫码登录与适配层由本仓库新增。
+
+本项目为个人自用的第三方客户端，与夸克网盘官方无关。
