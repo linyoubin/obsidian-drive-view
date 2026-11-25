@@ -18,7 +18,14 @@ declare module "obsidian" {
   }
 
   export interface DataAdapter {
+    /** 同步：adapter 名字（`FileSystemAdapter` / `quark-readonly` …）。 */
     getName(): string;
+    /** 同步：桌面端本地库根目录（虚拟库没有，返回空串）。 */
+    getBasePath(): string;
+    /** 同步：库内路径 → 平台绝对路径（虚拟库返回 `/` + 库内路径）。 */
+    getFullPath(normalizedPath: string): string;
+    /** 同步：库内路径 → 可直接给 `<img src>` 的资源地址（未命中返回空串）。 */
+    getResourcePath(normalizedPath: string): string;
     exists(normalizedPath: string, sensitive?: boolean): Promise<boolean>;
     stat(normalizedPath: string): Promise<Stat | null>;
     list(normalizedPath: string): Promise<ListedFiles>;
@@ -33,7 +40,6 @@ declare module "obsidian" {
       fn: (data: string) => string,
       options?: DataWriteOptions
     ): Promise<string>;
-    getResourcePath(normalizedPath: string): string;
     mkdir(normalizedPath: string): Promise<void>;
     trashSystem(normalizedPath: string): Promise<boolean>;
     trashLocal(normalizedPath: string): Promise<void>;

@@ -188,14 +188,15 @@ describe("diagLog：结构化字段（0.2.10）", () => {
     expect(line.endsWith("msg=")).toBe(true);
   });
 
-  test("sample 字段去换行并截断 60 字符（调用方截断，字段渲染再兜一层）", () => {
-    const sample = "第一行\n第二行" + "x".repeat(80);
+  test("字段值去换行并截断 120 字符（0.2.18：不再有 sample 正文字段）", () => {
+    const value = "第一行\n第二行" + "x".repeat(200);
     const line = formatDiagLine(
-      { level: "info", stage: "decode", path: "/a.md", fid: "f", message: "", fields: { bytes: 10, chars: 90, sample: sample.slice(0, 60).replace(/\s+/g, " ") } },
+      { level: "info", stage: "decode", path: "/a.md", fid: "f", message: "", fields: { bytes: 10, chars: 90, firstBytes: "e7acac", note: value } },
       fixedNow
     );
     expect(line).not.toContain("\n");
-    const field = line.split(" sample=")[1];
-    expect(field.length).toBeLessThanOrEqual(60 + " msg=".length + 1);
+    expect(line).not.toContain(" sample=");
+    const field = line.split(" note=")[1];
+    expect(field.length).toBeLessThanOrEqual(120 + " msg=".length);
   });
 });

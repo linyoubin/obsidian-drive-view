@@ -153,6 +153,11 @@ export class DownloadGate {
     return this.backgroundActive;
   }
 
+  /** 正在执行的 bulk 任务数（0.2.18：failAuth 后必须归零）。 */
+  get bulkActiveCount(): number {
+    return this.bulkActive;
+  }
+
   /** 排队中的任务数（两个通道合计）。 */
   get pending(): number {
     return this.interactiveQueue.length + this.backgroundQueue.length + this.bulkQueue.length;
@@ -212,13 +217,18 @@ export class DownloadGate {
 
   /**
    * 401 熔断：进入 `auth-expired` 状态（冷却 `cooldownMs`，默认 60s），
-   * 清空两个队列并让排队任务立即以 `auth-expired` 拒绝。已开始的任务不受影响（会自己失败）。
+   * 清空 interactive + background + bulk **三个队列**并让排队任务立即以 `auth-expired` 拒绝。
+   * 已开始的任务不受影响（会自己失败）。
+   *
+   * 0.2.18 B4：bulk 队列此前漏清 —— 只能靠「另一个任务跑完 → finally 里的 pump」顺带拒绝，
+   * 没有其它任务在跑时 bulk 任务会一直挂着。这里显式清三个队列并在末尾 `pump()` 兜底。
    */
   failAuth(cooldownMs: number = DEFAULT_AUTH_COOLDOWN_MS): void {
     this.authExpiredUntil = this.now() + Math.max(1, cooldownMs);
-    const rejected = [...this.interactiveQueue, ...this.backgroundQueue];
+    const rejected = [...this.interactiveQueue, ...this.backgroundQueue, ...this.bulkQueue];
     this.interactiveQueue = [];
     this.backgroundQueue = [];
+    this.bulkQueue = [];
     const error = new DownloadGateError(
       "auth-expired",
       "登录已失效，请重新扫码（下载已暂停）",
@@ -228,6 +238,8 @@ export class DownloadGate {
       this.emit("abandoned", item.priority, item.path, this.now() - item.enqueuedAt);
       item.reject(error);
     }
+    // 队列已空；pump 一次让「刚好在 start 里没被熔断拦住」的边界状态收敛（幂等）
+    this.pump();
   }
 
   /** 是否处于 401 冷却期。 */

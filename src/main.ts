@@ -2,7 +2,12 @@ import { Notice, Platform, Plugin, requestUrl } from "obsidian";
 import * as obsidianRuntime from "obsidian";
 import type { DataAdapter } from "obsidian";
 import { GoogleDriveDataAdapter } from "./adapter/GoogleDriveDataAdapter";
-import { QuarkReadOnlyAdapter, createReadonlyRollback } from "./adapter/QuarkReadOnlyAdapter";
+import {
+  QuarkReadOnlyAdapter,
+  createAttachmentWarmup,
+  createReadonlyRollback,
+  isQuarkAttachmentPath,
+} from "./adapter/QuarkReadOnlyAdapter";
 import type { ReadonlyRollbackLeaf } from "./adapter/QuarkReadOnlyAdapter";
 import { VaultMounter } from "./adapter/VaultMounter";
 import type { VaultMountable } from "./adapter/VaultMounter";
@@ -53,7 +58,7 @@ import { decideAfterLogin } from "./auth/loginDecision";
 import { AuthNoticeGate, QUARK_AUTH_FAILED_TEXT, QUARK_AUTH_READ_BLOCKED_TEXT } from "./ui/authNotice";
 import { planBulkMarkdown, runBulkPrefetch } from "./prefetch/bulkPrefetch";
 import { MdContentStore, createIdbMdBackend } from "./store/MdContentStore";
-import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
+import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, diagLogPath, tailDiagLines } from "./utils/diagLog";
 import type { DiagAdapterLike } from "./utils/diagLog";
 
 /** 运行期 Notice 的扩展能力（obsidian.d.ts 只声明了构造函数）。 */
@@ -175,6 +180,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkStatBg = { downloads: 0, bytes: 0 };
   private quarkStatBulk = { downloads: 0, bytes: 0 };
   private quarkFileOpenRef: { ref?: unknown } | null = null;
+  /** 0.2.18 B1：附件「点开才下」的预热入口（file-open → readBinary → 重绘，节流 ≥1s）。 */
+  private quarkAttachmentWarmup: ((path: string) => Promise<boolean>) | null = null;
+  /** 0.2.18 B2：诊断日志路径随 `app.vault.configDir` 变化（默认 `.obsidian/plugins/drive-view/…`）。 */
+  private quarkDiagPath = DIAG_LOG_PATH;
   private readonly quarkAuthGate = new AuthNoticeGate();
   private quarkAuthNotice: Notice | null = null;
   /** 0.2.13：md 磁盘缓存与统计。 */
@@ -522,11 +531,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       createBackend: createIdbBackend({ dbName: indexDbNameForVault(this.app.vault.getName()) }),
       onStatusChange: () => this.refreshQuarkUi(),
     });
-    // 诊断日志（0.2.3 A5）：写 `<vault>/.obsidian/plugins/drive-view/quark-debug.log`，
-    // 走原生 adapter（`.obsidian/**` 已转发），不引 fs/node 依赖；失败绝不影响主流程。
+    // 诊断日志（0.2.3 A5）：写 `<vault>/<configDir>/plugins/drive-view/quark-debug.log`，
+    // 0.2.18 B2：configDir 取自 `app.vault.configDir`（不再硬编码 `.obsidian`），走原生 adapter 转发。
     this.initQuarkRollback();
+    this.quarkDiagPath = diagLogPath(this.app.vault.configDir);
     this.quarkDiag = new DiagLogger({
       adapter: this.mounter.getOriginalAdapter() as unknown as DiagAdapterLike,
+      path: this.quarkDiagPath,
       onError: (error) => console.warn("[Quark] diag write failed:", error),
     });
     // 0.2.13：md 正文磁盘缓存（IDB，仅正文；附件永不进 IDB）
@@ -554,6 +565,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       cache: this.quarkCache,
       client: this.quarkClient,
       baseAdapter: this.mounter.getOriginalAdapter(),
+      // 0.2.18 B2：配置目录/插件目录跟随 `app.vault.configDir`（与 Drive 的传法一致）
+      configDir: this.app.vault.configDir,
+      pluginDir: `${this.app.vault.configDir}/plugins/drive-view`,
       // 只在 adapter 的 catch 分支被调用：记录 path/fid/阶段（不改读写行为）
       diag: (entry) => this.quarkDiag?.log(entry),
       downloadUi: {
@@ -584,6 +598,16 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
     });
 
+    // 0.2.18 B1：附件「点开才下」——file-open 打开 jpeg/png/pdf/mp3/mp4 等附件后主动下载并重绘
+    this.quarkAttachmentWarmup = createAttachmentWarmup({
+      readBinary: (path) => this.quarkAdapter.readBinary(path),
+      // 只重绘当前活动叶子（打开附件的就是它）；节流在 warmup 内（≥1s）
+      redraw: () => this.refreshActivePreview(),
+      onError: (path, error) => {
+        console.warn(`[Quark] attachment warmup failed: ${path}`, error);
+      },
+    });
+
     this.quarkStatusBarEl = this.addStatusBarItem();
     this.refreshQuarkUi();
 
@@ -603,7 +627,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         void this.onQuarkRibbonClick().catch((error) => {
           console.error("[Quark] ribbon action failed:", error);
           new Notice(
-            `夸克同步失败：${error instanceof Error ? error.message : String(error)}\n详情见 ${DIAG_LOG_PATH}`
+            `夸克同步失败：${error instanceof Error ? error.message : String(error)}\n详情见 ${this.quarkDiagPath}`
           );
         });
       },
@@ -919,7 +943,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       console.error("[Quark] sync failed:", error);
       // 同一个单例 Notice 换成失败文案；附诊断日志位置（A5）
       finishQuarkSyncNotice(
-        `夸克：同步失败（${error instanceof Error ? error.message : String(error)}）\n详情见 ${DIAG_LOG_PATH}`,
+        `夸克：同步失败（${error instanceof Error ? error.message : String(error)}）\n详情见 ${this.quarkDiagPath}`,
         8000
       );
     } finally {
@@ -959,6 +983,12 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       new Notice(QUARK_AUTH_READ_BLOCKED_TEXT, 8000);
     }
     this.quarkLastNotePrefetch = 0;
+    // 0.2.18 B1：打开的是非 md 附件（jpeg/png/pdf/mp3/mp4…）→ 点开才下，预热后重绘该叶子
+    if (path && isQuarkAttachmentPath(path)) {
+      void this.openQuarkAttachment(path);
+      this.refreshQuarkUi();
+      return;
+    }
     if (!path || !/\.(md|markdown)$/i.test(path) || !this.quarkAdapter) {
       this.refreshQuarkUi();
       return;
@@ -973,6 +1003,17 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     } catch {
       /* 预取失败不影响阅读 */
     }
+  }
+
+  /**
+   * 0.2.18 B1：附件「点开才下」——`readBinary` 预热缓存（下载即写 ContentCache），
+   * 完成后重绘该叶子让 `<img>/<video>/<audio>` 拿到 blob URL。
+   * 节流与并发去重都在 `createAttachmentWarmup` 内（同一 path ≥1s 只下一次）。
+   */
+  private async openQuarkAttachment(path: string): Promise<void> {
+    const warmup = this.quarkAttachmentWarmup;
+    if (!warmup) return;
+    await warmup(path);
   }
 
   /**
@@ -1473,7 +1514,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public async quarkExportDiagnostics(): Promise<void> {
     try {
       const adapter = this.mounter.getOriginalAdapter();
-      const text = (await adapter.exists(DIAG_LOG_PATH)) ? await adapter.read(DIAG_LOG_PATH) : "";
+      const text = (await adapter.exists(this.quarkDiagPath)) ? await adapter.read(this.quarkDiagPath) : "";
       const tail = tailDiagLines(text, DIAG_TAIL_LINES);
       if (!tail) {
         new Notice("夸克：诊断日志为空（还没有失败记录）", 5000);
@@ -1485,7 +1526,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         new Notice(`夸克：已复制最近 ${lines} 行诊断日志`, 5000);
       } catch (error) {
         new Notice(
-          `夸克：剪贴板不可用，请手动打开 ${DIAG_LOG_PATH}（${error instanceof Error ? error.message : String(error)}）`,
+          `夸克：剪贴板不可用，请手动打开 ${this.quarkDiagPath}（${error instanceof Error ? error.message : String(error)}）`,
           10000
         );
       }

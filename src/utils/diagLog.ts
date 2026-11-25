@@ -28,8 +28,24 @@ export type DiagStage =
   | "cache"
   | "auth";
 
-/** 日志文件（库内路径，走 Obsidian adapter 写）。 */
-export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";
+/** 默认配置目录（Obsidian 默认 `.obsidian`；运行期由 `app.vault.configDir` 覆盖，0.2.18 B2）。 */
+const DEFAULT_CONFIG_DIR = ".obsidian";
+/** 本插件目录（配置目录下的子目录），诊断日志落在这里。 */
+export const DIAG_PLUGIN_DIR = "plugins/drive-view";
+
+/**
+ * 0.2.18 B2：按配置目录生成日志路径，不再硬编码 `.obsidian`。
+ * `diagLogPath(".config")` → `.config/plugins/drive-view/quark-debug.log`。
+ */
+export function diagLogPath(configDir: string = DEFAULT_CONFIG_DIR): string {
+  const clean = String(configDir ?? "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  return `${clean || DEFAULT_CONFIG_DIR}/${DIAG_PLUGIN_DIR}/quark-debug.log`;
+}
+
+/** 默认日志文件（库内路径，走 Obsidian adapter 写）；自定义配置目录用 `diagLogPath(configDir)`。 */
+export const DIAG_LOG_PATH = diagLogPath();
 /** 环形上限：200 KB。 */
 export const DIAG_LOG_MAX_BYTES = 512 * 1024; // 0.2.11：200KB → 512KB（避免 md 的 read 行被图片洪流挤出窗口）
 /** 单条错误消息上限：200 字符。 */
@@ -65,7 +81,7 @@ export interface DiagEntry {
   cause?: DiagCause;
   /** 是否重试过（超时重试 1 次后仍失败为 true）。 */
   retried?: boolean;
-  /** 0.2.10：结构化字段（hop/status/code/urlLen/contentType/bytes/firstBytes/chars/hit/size/sample…）。 */
+  /** 0.2.10：结构化字段（hop/status/code/urlLen/contentType/bytes/firstBytes/chars/hit/size…）。 */
   fields?: DiagFields;
 }
 
@@ -92,7 +108,7 @@ export function formatDiagLine(entry: DiagEntry, now: Date = new Date()): string
   return `[${now.toISOString()}] level=${level} stage=${entry.stage} path=${path} fid=${fid}${fields}${cause}${retried} msg=${msg}`;
 }
 
-/** 结构化字段渲染：` hop=1 status=200`；值里的空白压成空格、截断 120 字符（sample 已在上游处理）。 */
+/** 结构化字段渲染：` hop=1 status=200`；值里的空白压成空格、截断 120 字符（调用方不写正文）。 */
 export function formatDiagFields(fields?: DiagFields): string {
   if (!fields) return "";
   let rendered = "";
@@ -151,7 +167,7 @@ export interface DiagAdapterLike {
 
 export interface DiagLoggerOptions {
   adapter: DiagAdapterLike;
-  /** 日志文件路径，默认 `DIAG_LOG_PATH`。 */
+  /** 日志文件路径，默认 `diagLogPath()`（随 `app.vault.configDir` 改变）。 */
   path?: string;
   /** 环形上限，默认 200 KB。 */
   maxBytes?: number;
@@ -175,7 +191,7 @@ export class DiagLogger {
 
   constructor(options: DiagLoggerOptions) {
     this.adapter = options.adapter;
-    this.path = options.path ?? DIAG_LOG_PATH;
+    this.path = options.path ?? diagLogPath();
     this.maxBytes = options.maxBytes ?? DIAG_LOG_MAX_BYTES;
     this.now = options.now ?? (() => new Date());
     this.onError = options.onError;

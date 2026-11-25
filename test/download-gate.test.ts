@@ -22,6 +22,7 @@ import {
   type QuarkTransport,
 } from "../src/client/QuarkClient";
 import { QuarkReadOnlyAdapter, diagCauseOf } from "../src/adapter/QuarkReadOnlyAdapter";
+import { formatDiagLine } from "../src/utils/diagLog";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -360,7 +361,7 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     return { adapter, entries };
   }
 
-  test("read 入口记 hit/size；decode 记 bytes/chars/sample（60 字符、去换行）", async () => {
+  test("read 入口记 hit/size；decode 记 bytes/chars/firstBytes(hex)", async () => {
     const longText = "标题\n" + "字".repeat(100);
     const { adapter, entries } = diagAdapter(longText);
     const text = await adapter.read("/notes/a.md");
@@ -370,9 +371,36 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     const decode = entries.find((entry) => entry.stage === "decode")!;
     expect(decode.fields!.bytes).toBe(new TextEncoder().encode(longText).length);
     expect(decode.fields!.chars).toBe(longText.length);
-    const sample = String(decode.fields!.sample);
-    expect(sample.length).toBeLessThanOrEqual(60);
-    expect(sample).not.toContain("\n");
+    expect(decode.fields!.sample).toBeUndefined();
+    expect(String(decode.fields!.firstBytes)).toMatch(/^[0-9a-f]+$/);
+  });
+
+  test("decode 日志行不含正文任何片段（0.2.18 SF2）", async () => {
+    // 独特字符串：只要日志里出现任意前缀就能被抓到
+    const secret = "SECRET-BODY-甲-9f3c";
+    const secretTail = "第二行内容也绝不能出现";
+    const text = `${secret}\n${secretTail}`;
+    const { adapter, entries } = diagAdapter(text);
+    await adapter.read("/notes/a.md");
+    const decode = entries.find((entry) => entry.stage === "decode")!;
+    expect(decode.fields!.sample).toBeUndefined();
+    // "SECRET-B" 的 UTF-8 字节
+    expect(String(decode.fields!.firstBytes)).toBe("5345435245542d42");
+    const line = formatDiagLine(
+      {
+        level: "info",
+        stage: "decode",
+        path: "/notes/a.md",
+        fid: "fa",
+        message: decode.message ?? "",
+        fields: decode.fields as Record<string, string | number | boolean>,
+      },
+      new Date("2026-11-20T08:00:00.000Z")
+    );
+    expect(line).not.toContain(secret);
+    expect(line).not.toContain("SECRET");
+    expect(line).not.toContain(secretTail);
+    expect(line).toContain("firstBytes=");
   });
 
   test("空内容：decode 记 cause=empty、不带 sample（正文绝不落日志）", async () => {
@@ -484,17 +512,62 @@ describe("DownloadGate：三级优先级（0.2.13）", () => {
   });
 });
 
-describe("DownloadGate：bulk 事件与取消（0.2.13）", () => {
-  test("bulk 任务事件带 prio=bulk；failAuth 清空 bulk 队列", async () => {
+// ------------------------------------------------------------------ 0.2.18 B4 failAuth 清空三队列
+
+describe("DownloadGate：failAuth 清空 interactive + background + bulk（0.2.18 B4）", () => {
+  test("pauseBulk 后 failAuth：bulk 队列立即清零、任务收 auth-expired、无悬挂 promise", async () => {
     const events: Array<{ state: string; priority: string }> = [];
-    const gate = new DownloadGate({ concurrency: 1, onEvent: (event) => events.push(event) });
-    const running = gate.run(async () => new Promise((resolve) => setTimeout(resolve, 5)), { priority: "bulk" });
-    const queued = gate.run(async () => "x", { priority: "bulk" });
-    gate.failAuth(1000);
-    await expect(queued).rejects.toThrow();
-    await running.catch(() => undefined);
-    expect(events.some((event) => event.priority === "bulk" && event.state === "queued")).toBe(true);
+    // pauseBulk 保证 bulk 任务**停在队列里**，不会靠另一个任务 .finally 的 pump 副作用被拒
+    const gate = new DownloadGate({ concurrency: 4, now: () => 1000, onEvent: (event) => events.push(event) });
+    gate.pauseBulk(3000);
+
+    let settled = 0;
+    const queued = gate.run(async () => "never", { priority: "bulk" });
+    const tracked = queued.then(
+      () => {
+        settled += 1;
+        return "resolved";
+      },
+      (error) => {
+        settled += 1;
+        throw error;
+      }
+    );
+    expect(gate.pending).toBe(1);
+
+    gate.failAuth(60_000);
+
+    // 改前：bulk 队列没被清，pending 仍是 1，要等别的任务 finally 才拒
+    expect(gate.pending).toBe(0);
+    await expect(tracked).rejects.toMatchObject({ kind: "auth-expired" });
+    expect(settled).toBe(1);
+    expect(gate.bulkActiveCount).toBe(0);
     expect(events.some((event) => event.priority === "bulk" && event.state === "abandoned")).toBe(true);
+  });
+
+  test("三个队列同时排空：interactive + background + bulk 全部以 auth-expired 拒绝", async () => {
+    const gate = new DownloadGate({ concurrency: 1, now: () => 1000 });
+    const release = deferred<void>();
+    const running = gate.run(
+      async () => {
+        await release.promise;
+        return "run";
+      },
+      { priority: "interactive" }
+    );
+    const interactive = gate.run(async () => "i2", { priority: "interactive" });
+    const background = gate.run(async () => "bg", { priority: "background" });
+    const bulk = gate.run(async () => "bulk", { priority: "bulk" });
+    expect(gate.pending).toBe(3);
+
+    gate.failAuth(1000);
+    expect(gate.pending).toBe(0);
+    await expect(interactive).rejects.toMatchObject({ kind: "auth-expired" });
+    await expect(background).rejects.toMatchObject({ kind: "auth-expired" });
+    await expect(bulk).rejects.toMatchObject({ kind: "auth-expired" });
+
+    release.resolve();
+    await expect(running).resolves.toBe("run");
   });
 });
 

@@ -130,7 +130,7 @@ export type QuarkAdapterDiagSink = (entry: {
   retried?: boolean;
   /** 0.2.10：info 级埋点（read/decode/download hop）。 */
   level?: "error" | "warn" | "info";
-  /** 0.2.10：结构化字段（hit/size/bytes/chars/sample/hop/status/code/urlLen/contentType/firstBytes）。 */
+  /** 0.2.10：结构化字段（hit/size/bytes/chars/firstBytes/hop/status/code/urlLen/contentType）。 */
   fields?: Record<string, string | number | boolean>;
 }) => void;
 
@@ -426,12 +426,12 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       const bytes = buffer.byteLength;
       const text = arrayBufferToString(buffer);
       const chars = text.length;
-      // 解码埋点：sample 仅 chars>0 时记录（前 60 字符、去换行），正文绝不写入
+      // 0.2.18 SF2：解码埋点只记字节/字符数与前 8 字节 hex，**绝不**记录正文片段
       if (chars > 0) {
         this.reportInfo("decode", clean, fid, {
           bytes,
           chars,
-          sample: text.slice(0, 60).replace(/\s+/g, " "),
+          firstBytes: firstBytesHex(buffer),
         });
       } else {
         this.reportDiagnostic({
@@ -864,4 +864,105 @@ export function decodeCause(error: unknown): QuarkDiagCause | null {
 export function errorText(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error ?? "");
   return text.replace(/\s+/g, " ").slice(0, 120);
+}
+
+/** 0.2.18 SF2：字节前 N 位转 hex（解码埋点用；只暴露字节值，不暴露正文）。 */
+export function firstBytesHex(buffer: ArrayBuffer, count = 8): string {
+  const bytes = new Uint8Array(buffer);
+  const size = Math.min(Math.max(0, count), bytes.length);
+  let hex = "";
+  for (let index = 0; index < size; index += 1) {
+    hex += bytes[index].toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+// ------------------------------------------------------------------ 0.2.18 B1：附件「点开才下」
+
+/** 附件打开预热的节流窗口：同一 path 1 秒内最多下一次（与重绘共用）。 */
+export const QUARK_ATTACHMENT_OPEN_THROTTLE_MS = 1000;
+
+/**
+ * 算作「附件」的扩展名：打开这些文件时主动 `readBinary` 预热缓存并重绘该叶子。
+ * `.md` / `.canvas` / `.base` 是 Obsidian 自己渲染的文档，不算附件（不主动下载）。
+ */
+export const QUARK_ATTACHMENT_EXTENSIONS: readonly string[] = [
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "svg",
+  "avif",
+  "ico",
+  "pdf",
+  "mp3",
+  "wav",
+  "m4a",
+  "ogg",
+  "flac",
+  "mp4",
+  "webm",
+  "mov",
+  "m4v",
+  "mkv",
+];
+
+/** 是否是「点开才下」的附件路径（大小写不敏感；md/canvas/base 不算）。 */
+export function isQuarkAttachmentPath(path: string): boolean {
+  const clean = normalizeVaultPath(path ?? "");
+  if (!clean) return false;
+  const slash = clean.lastIndexOf("/");
+  const name = slash >= 0 ? clean.slice(slash + 1) : clean;
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return false;
+  return QUARK_ATTACHMENT_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase());
+}
+
+/** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */
+export interface AttachmentWarmupHost {
+  readBinary(path: string): Promise<unknown>;
+  redraw(path: string): void;
+  /** 时间源（单测注入假时钟），默认 `Date.now`。 */
+  now?: () => number;
+  /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
+  onError?: (path: string, error: unknown) => void;
+}
+
+/**
+ * 0.2.18 B1：`file-open` → 附件预热。
+ *
+ * 返回 `(path) => Promise<boolean>`：true 表示「这次真的下载并重绘了」。
+ * 节流 ≥1s（`throttleMs`）：窗口内重复打开同一附件直接返回 false，不发第二次下载。
+ * 打开 md/canvas/base 或路径为空 → false，绝不触发附件下载。
+ */
+export function createAttachmentWarmup(
+  host: AttachmentWarmupHost,
+  throttleMs: number = QUARK_ATTACHMENT_OPEN_THROTTLE_MS
+): (path: string) => Promise<boolean> {
+  const now = host.now ?? (() => Date.now());
+  const window = Math.max(0, throttleMs);
+  const lastAt = new Map<string, number>();
+  return async (path: string): Promise<boolean> => {
+    const clean = normalizeVaultPath(path ?? "");
+    if (!isQuarkAttachmentPath(clean)) return false;
+    const at = now();
+    const previous = lastAt.get(clean);
+    if (previous !== undefined && at - previous < window) return false;
+    // 先占位：同一节流窗口内并发 file-open 也只发一次下载
+    lastAt.set(clean, at);
+    try {
+      await host.readBinary(clean);
+    } catch (error) {
+      host.onError?.(clean, error);
+      return false;
+    }
+    try {
+      host.redraw(clean);
+    } catch {
+      /* 重绘失败不影响已完成的下载 */
+    }
+    return true;
+  };
 }
