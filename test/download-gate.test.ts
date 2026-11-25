@@ -37,6 +37,16 @@ function deferred<T>() {
 const fastBucket = (): TokenBucket => new TokenBucket({ ratePerSecond: 10000, sleep: async () => {} });
 const fastSleep = async (): Promise<void> => {};
 
+/** 0.2.20 N7：日志里 sha8 的期望值（前 8 字节的 sha256 前 8 位 hex）。 */
+async function sha8Of(text: string, count = 8): Promise<string> {
+  const bytes = new TextEncoder().encode(text).slice(0, count);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 8);
+}
+
 function jsonResponse(status: number, body: unknown): QuarkHttpResponse {
   return { status, headers: {}, text: JSON.stringify(body) };
 }
@@ -361,7 +371,7 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     return { adapter, entries };
   }
 
-  test("read 入口记 hit/size；decode 记 bytes/chars/firstBytes(hex)", async () => {
+  test("read 入口记 hit/size；decode 只记 bytes/chars/sha8（无任何可还原字节）", async () => {
     const longText = "标题\n" + "字".repeat(100);
     const { adapter, entries } = diagAdapter(longText);
     const text = await adapter.read("/notes/a.md");
@@ -372,11 +382,13 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     expect(decode.fields!.bytes).toBe(new TextEncoder().encode(longText).length);
     expect(decode.fields!.chars).toBe(longText.length);
     expect(decode.fields!.sample).toBeUndefined();
-    expect(String(decode.fields!.firstBytes)).toMatch(/^[0-9a-f]+$/);
+    expect(decode.fields!.firstBytes).toBeUndefined();
+    expect(String(decode.fields!.sha8)).toMatch(/^[0-9a-f]{8}$/);
+    expect(String(decode.fields!.sha8)).toBe(await sha8Of(longText));
   });
 
-  test("decode 日志行不含正文任何片段（0.2.18 SF2）", async () => {
-    // 独特字符串：只要日志里出现任意前缀就能被抓到
+  test("decode 日志不可还原正文：无 sample、无原始 hex，只有不可逆 sha8（0.2.20 N7）", async () => {
+    // 独特字符串：只要日志里出现任意前缀/字节 hex 就能被抓到
     const secret = "SECRET-BODY-甲-9f3c";
     const secretTail = "第二行内容也绝不能出现";
     const text = `${secret}\n${secretTail}`;
@@ -384,8 +396,11 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     await adapter.read("/notes/a.md");
     const decode = entries.find((entry) => entry.stage === "decode")!;
     expect(decode.fields!.sample).toBeUndefined();
-    // "SECRET-B" 的 UTF-8 字节
-    expect(String(decode.fields!.firstBytes)).toBe("5345435245542d42");
+    expect(decode.fields!.firstBytes).toBeUndefined();
+    // "SECRET-B" 的 UTF-8 字节 hex（旧实现会写进 firstBytes）
+    expect(JSON.stringify(decode.fields)).not.toContain("5345435245542d42");
+    expect(String(decode.fields!.sha8)).toBe(await sha8Of(secret));
+
     const line = formatDiagLine(
       {
         level: "info",
@@ -400,7 +415,10 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     expect(line).not.toContain(secret);
     expect(line).not.toContain("SECRET");
     expect(line).not.toContain(secretTail);
-    expect(line).toContain("firstBytes=");
+    expect(line).not.toContain("5345435245542d42");
+    expect(line).toContain("sha8=");
+    expect(line).not.toContain("firstBytes=");
+    expect(line).not.toContain("sample=");
   });
 
   test("空内容：decode 记 cause=empty、不带 sample（正文绝不落日志）", async () => {
@@ -412,7 +430,7 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     expect(decode.message).toBe("empty-body");
   });
 
-  test("download 两跳：hop=1 带 status/code/urlLen；hop=2 带 contentType/bytes/firstBytes", async () => {
+  test("download 两跳：hop=1 带 status/code/urlLen；hop=2 带 contentType/bytes/sha8（无原始字节）", async () => {
     const entries: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
     const calls: string[] = [];
     const transport: QuarkTransport = async (request) => {
@@ -439,7 +457,10 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     expect(Number(hop1.fields!.urlLen)).toBeGreaterThan(0);
     const hop2 = entries.find((entry) => entry.fields?.hop === 2)!;
     expect(hop2.fields).toMatchObject({ status: 200, contentType: "text/markdown", bytes: 4 });
-    expect(String(hop2.fields!.firstBytes)).toBe("23206869"); // "# hi" 的前 4 字节
+    // 0.2.20 N7：不再写 content 的原始字节 hex
+    expect(hop2.fields!.firstBytes).toBeUndefined();
+    expect(JSON.stringify(hop2.fields)).not.toContain("23206869"); // "# hi" 的前 4 字节 hex
+    expect(String(hop2.fields!.sha8)).toBe(await sha8Of("# hi"));
   });
 });
 

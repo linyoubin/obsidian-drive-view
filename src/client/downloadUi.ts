@@ -141,7 +141,11 @@ export class DownloadNoticeBook {
     void token;
     if (!this.cancelAttached) {
       this.cancelAttached = true;
-      this.host.attachCancel(this.notice, () => this.cancelAll());
+      // 0.2.20 N1：用户按「取消」= 取消当前全部下载（含 interactive）。
+      // 改前走 `cancelAll()` 默认跳过 interactive，而当前正在下的往往正是 interactive → 按钮 no-op。
+      this.host.attachCancel(this.notice, () => {
+        this.cancelAll({ includeInteractive: true });
+      });
     }
     return token;
   }

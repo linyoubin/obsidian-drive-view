@@ -1,19 +1,25 @@
 /**
- * 0.2.18 SF5：`src/obsidian.d.ts` 的 DataAdapter 声明与 QuarkReadOnlyAdapter 一致性。
+ * 0.2.20 N8：DataAdapter 契约测试不再「自证」。
  *
- * 直接读 d.ts 文本做静态断言（不依赖 `obsidian` 运行时）：
- *   1. `QuarkReadOnlyAdapter.prototype` 上的每个方法（除明确列为「夸克扩展/私有辅助」的）都必须在
- *      `interface DataAdapter` 里有声明，缺一个就 fail 并打方法名；
- *   2. DataAdapter 的 22 个契约成员一个不少、反向也必须都有实现；
- *   3. 同步方法写 `string`，异步方法写 `Promise<T>`。
+ * 期望成员清单**硬编码自 Obsidian 官方 API 文档**（`DataAdapter`，共 21 个成员）：
+ *   https://docs.obsidian.md/Reference/TypeScript%20API/DataAdapter
+ *
+ * 与 `QuarkReadOnlyAdapter.prototype` 双向比对：
+ *   - 清单里的每个方法，adapter 必须实现（缺一个 fail 并打方法名）；
+ *   - adapter 的契约方法（去掉夸克扩展/私有辅助）不得多出清单之外的成员。
+ *
+ * 不再读 `src/obsidian.d.ts` 文本：d.ts 是给编译器的契约（`implements DataAdapter` 已由
+ * tsc 保证），这里只对「官方成员清单 vs 运行期实现」做独立校验，避免自证。
+ *
+ * 自检用例：故意从清单删一个 → 必须报 missing；故意塞一个不存在的 → 必须报 extra。
  */
 
 import { describe, expect, test } from "bun:test";
 
 import { QuarkReadOnlyAdapter } from "../src/adapter/QuarkReadOnlyAdapter";
 
-/** v3 §3 / Obsidian DataAdapter 的全部成员（0.2.18 口径）。 */
-const DATA_ADAPTER_MEMBERS = [
+/** Obsidian 官方 DataAdapter 的 21 个成员（来源见文件头注释）。 */
+const OFFICIAL_DATA_ADAPTER_MEMBERS = [
   "getName",
   "getBasePath",
   "getFullPath",
@@ -37,15 +43,12 @@ const DATA_ADAPTER_MEMBERS = [
   "trashLocal",
 ] as const;
 
-/** 同步返回 string 的成员；其余契约成员必须返回 `Promise<T>`。 */
-const SYNC_MEMBERS = new Set(["getName", "getBasePath", "getFullPath", "getResourcePath"]);
-
 /**
  * 不属于 DataAdapter 契约的 prototype 成员：
  *   - 夸克扩展：`readForBulk`（bulk 预取） / `prefetchNote`（按笔记预取）
  *   - 私有辅助方法（TS private 在运行期也在 prototype 上）
  */
-const NON_ADAPTER_MEMBERS = new Set([
+const NON_CONTRACT_MEMBERS = new Set([
   "constructor",
   "readForBulk",
   "prefetchNote",
@@ -63,69 +66,70 @@ const NON_ADAPTER_MEMBERS = new Set([
   "fidOf",
 ]);
 
-async function readDts(): Promise<string> {
-  return await Bun.file(new URL("../src/obsidian.d.ts", import.meta.url)).text();
+function contractMethodNames(): string[] {
+  return Object.getOwnPropertyNames(QuarkReadOnlyAdapter.prototype).filter(
+    (name) => !NON_CONTRACT_MEMBERS.has(name)
+  );
 }
 
-/** 取 `interface DataAdapter { ... }` 的正文（含成员声明行）。 */
-function dataAdapterBlock(source: string): string {
-  const start = source.indexOf("interface DataAdapter {");
-  if (start < 0) return "";
-  const rest = source.slice(start);
-  const end = rest.indexOf("\n  }");
-  return end < 0 ? rest : rest.slice(0, end);
+/** 双向比对：`expected` 是权威清单，`contractMethodNames()` 是运行期实现。 */
+function compareAdapterMembers(expected: readonly string[]): { missing: string[]; extra: string[] } {
+  const actual = new Set(contractMethodNames());
+  const wanted = new Set(expected);
+  return {
+    missing: [...wanted].filter((name) => !actual.has(name)),
+    extra: [...actual].filter((name) => !wanted.has(name)),
+  };
 }
 
-/** 取某个成员的完整声明（支持跨行签名，直到 `;`）。 */
-function memberSignature(block: string, name: string): string {
-  const lines = block.split("\n");
-  const head = new RegExp(`^\\s*${name}\\s*\\(`);
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!head.test(lines[index])) continue;
-    let signature = lines[index];
-    let cursor = index;
-    while (!signature.includes(";") && cursor + 1 < lines.length) {
-      cursor += 1;
-      signature += lines[cursor];
-    }
-    return signature;
-  }
-  return "";
-}
-
-describe("0.2.18 SF5 obsidian.d.ts ↔ QuarkReadOnlyAdapter 一致性", () => {
-  test("prototype 上每个契约方法都在 DataAdapter 里有声明（缺一个就 fail 并打名字）", async () => {
-    const block = dataAdapterBlock(await readDts());
-    expect(block.length).toBeGreaterThan(0);
-
-    const prototypeNames = Object.getOwnPropertyNames(QuarkReadOnlyAdapter.prototype).filter(
-      (name) => !NON_ADAPTER_MEMBERS.has(name)
-    );
-    const missing = prototypeNames.filter((name) => memberSignature(block, name) === "");
-    expect(missing, `DataAdapter 缺少声明：${missing.join(", ")}`).toEqual([]);
+describe("0.2.20 N8 DataAdapter 契约（官方 21 成员）双向比对", () => {
+  test("官方 21 个成员全部实现，且没有契约外成员", () => {
+    expect(OFFICIAL_DATA_ADAPTER_MEMBERS.length).toBe(21);
+    const { missing, extra } = compareAdapterMembers(OFFICIAL_DATA_ADAPTER_MEMBERS);
+    expect(missing, `QuarkReadOnlyAdapter 缺少实现：${missing.join(", ")}`).toEqual([]);
+    expect(extra, `QuarkReadOnlyAdapter 多出契约外成员：${extra.join(", ")}`).toEqual([]);
   });
 
-  test("DataAdapter 22 个契约成员全部声明且 adapter 都有实现", async () => {
-    const block = dataAdapterBlock(await readDts());
-    const missingInDts = DATA_ADAPTER_MEMBERS.filter((name) => memberSignature(block, name) === "");
-    expect(missingInDts, `DataAdapter 缺少声明：${missingInDts.join(", ")}`).toEqual([]);
-
-    const missingInAdapter = DATA_ADAPTER_MEMBERS.filter(
-      (name) => typeof (QuarkReadOnlyAdapter.prototype as unknown as Record<string, unknown>)[name] !== "function"
-    );
-    expect(missingInAdapter, `QuarkReadOnlyAdapter 缺少实现：${missingInAdapter.join(", ")}`).toEqual([]);
+  test("自检：从期望清单删掉一个成员，比对必须 fail 并打出方法名", () => {
+    const mutated = OFFICIAL_DATA_ADAPTER_MEMBERS.filter((name) => name !== "trashLocal");
+    // 清单删了 trashLocal，实现里还在 → 双向比对的 extra 必须报出来（测试因此 fail）
+    const { extra } = compareAdapterMembers(mutated);
+    expect(extra).toEqual(["trashLocal"]);
+    expect(extra.join(", ")).toContain("trashLocal");
   });
 
-  test("返回类型写清：同步 4 个为 string，其余为 Promise<T>", async () => {
-    const block = dataAdapterBlock(await readDts());
-    for (const name of DATA_ADAPTER_MEMBERS) {
-      const signature = memberSignature(block, name);
-      expect(signature, `DataAdapter 缺少 ${name} 的声明`).not.toBe("");
-      if (SYNC_MEMBERS.has(name)) {
-        expect(signature, `${name} 必须是同步 string`).toMatch(/\)\s*:\s*string;$/);
-      } else {
-        expect(signature, `${name} 必须返回 Promise`).toMatch(/\)\s*:\s*Promise</);
-      }
+  test("自检：清单里塞一个 adapter 没实现的成员，必须报 missing", () => {
+    const { missing } = compareAdapterMembers([...OFFICIAL_DATA_ADAPTER_MEMBERS, "getFilePath"]);
+    expect(missing).toEqual(["getFilePath"]);
+    expect(missing.join(", ")).toContain("getFilePath");
+  });
+
+  test("4 个同步成员运行期返回 string（不是 Promise），其余返回 Promise", () => {
+    const adapter = new QuarkReadOnlyAdapter({
+      index: { entries: [] },
+      cache: {
+        has: () => false,
+        get: () => null,
+        getResourceUrl: () => "",
+        put: () => ({ cached: true }),
+        enqueuePrefetch: () => undefined,
+      },
+      client: { downloadFile: async () => new ArrayBuffer(0) },
+      baseAdapter: {} as never,
+      allowPrefetch: () => false,
+    });
+    for (const name of ["getName", "getBasePath", "getFullPath", "getResourcePath"]) {
+      const value = (adapter as unknown as Record<string, (path: string) => unknown>)[name]("notes/a.md");
+      expect(typeof value, `${name} 必须同步返回 string`).toBe("string");
     }
+    const readPromise = (adapter as unknown as { read: (path: string) => unknown }).read("notes/a.md");
+    void (readPromise as Promise<unknown>).catch(() => undefined);
+    expect(readPromise).toBeInstanceOf(Promise);
+    const writePromise = (adapter as unknown as { write: (path: string, data: string) => unknown }).write(
+      "notes/a.md",
+      "x"
+    );
+    void (writePromise as Promise<unknown>).catch(() => undefined);
+    expect(writePromise).toBeInstanceOf(Promise);
   });
 });

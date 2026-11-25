@@ -110,15 +110,4 @@ describe("0.2.18 B1 file-open 附件预热", () => {
       expect(isQuarkAttachmentPath(path), path).toBe(false);
     }
   });
-
-  test("main.ts 接线：file-open 处理器把活动叶子路径交给附件 warmup", async () => {
-    const source = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
-    const found = {
-      fileOpen: source.includes('.on("file-open"'),
-      openAttachment: /void this\.openQuarkAttachment\(/.test(source),
-      predicate: /isQuarkAttachmentPath\(/.test(source),
-      factory: source.includes("createAttachmentWarmup("),
-    };
-    expect(found).toEqual({ fileOpen: true, openAttachment: true, predicate: true, factory: true });
-  });
 });

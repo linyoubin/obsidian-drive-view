@@ -3,12 +3,14 @@ import * as obsidianRuntime from "obsidian";
 import type { DataAdapter } from "obsidian";
 import { GoogleDriveDataAdapter } from "./adapter/GoogleDriveDataAdapter";
 import {
+  QuarkFileOpenBinding,
   QuarkReadOnlyAdapter,
   createAttachmentWarmup,
   createReadonlyRollback,
   isQuarkAttachmentPath,
+  reloadLeafView,
 } from "./adapter/QuarkReadOnlyAdapter";
-import type { ReadonlyRollbackLeaf } from "./adapter/QuarkReadOnlyAdapter";
+import type { ReadonlyRollbackLeaf, RefreshableLeafLike } from "./adapter/QuarkReadOnlyAdapter";
 import { VaultMounter } from "./adapter/VaultMounter";
 import type { VaultMountable } from "./adapter/VaultMounter";
 import { CookieStore } from "./auth/CookieStore";
@@ -179,7 +181,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkStatI = { downloads: 0, bytes: 0 };
   private quarkStatBg = { downloads: 0, bytes: 0 };
   private quarkStatBulk = { downloads: 0, bytes: 0 };
-  private quarkFileOpenRef: { ref?: unknown } | null = null;
+  /** 0.2.20 N9：file-open 绑定（退出只读/卸载必须 stop，否则本地附件仍走 quarkAdapter）。 */
+  private quarkFileOpenBinding: QuarkFileOpenBinding | null = null;
   /** 0.2.18 B1：附件「点开才下」的预热入口（file-open → readBinary → 重绘，节流 ≥1s）。 */
   private quarkAttachmentWarmup: ((path: string) => Promise<boolean>) | null = null;
   /** 0.2.18 B2：诊断日志路径随 `app.vault.configDir` 变化（默认 `.obsidian/plugins/drive-view/…`）。 */
@@ -297,6 +300,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public async onunload(): Promise<void> {
     this.stopPollingTimer();
     hideQuarkSyncNotice();
+    // 0.2.20 N9：插件卸载时解绑 file-open
+    this.quarkFileOpenBinding?.stop();
+    this.quarkFileOpenBinding = null;
     // 0.2.9：预取循环随插件卸载停止
     this.quarkCache?.stopPrefetchLoop();
     this.quarkCancelBulkPrefetch();
@@ -601,7 +607,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     // 0.2.18 B1：附件「点开才下」——file-open 打开 jpeg/png/pdf/mp3/mp4 等附件后主动下载并重绘
     this.quarkAttachmentWarmup = createAttachmentWarmup({
       readBinary: (path) => this.quarkAdapter.readBinary(path),
-      // 只重绘当前活动叶子（打开附件的就是它）；节流在 warmup 内（≥1s）
+      // 0.2.20 B1：按视图类型重载 —— Markdown 用 previewMode.rerender，图片/PDF/媒体用 setViewState
+      activeLeaf: () => this.activeLeaf(),
+      // 兜底：拿不到叶子时仍尝试重绘当前活动预览
       redraw: () => this.refreshActivePreview(),
       onError: (path, error) => {
         console.warn(`[Quark] attachment warmup failed: ${path}`, error);
@@ -1035,16 +1043,24 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkRerenderTimer = window.setTimeout(tick, 300);
   }
 
-  /** 只重绘当前活动叶子（0.2.12：不再遍历 workspace.iterateAllLeaves）。 */
-  private refreshActivePreview(): void {
+  /** 0.2.20 B1：当前活动叶子（附件下载完成后按视图类型重载）。 */
+  private activeLeaf(): RefreshableLeafLike | null {
     try {
       const workspace = this.app.workspace as unknown as {
-        activeLeaf?: { view?: { previewMode?: { rerender?: (force?: boolean) => void } | null } | null } | null;
+        activeLeaf?: RefreshableLeafLike | null;
       };
-      workspace.activeLeaf?.view?.previewMode?.rerender?.(true);
+      return workspace.activeLeaf ?? null;
     } catch {
-      /* 重绘失败不影响阅读 */
+      return null;
     }
+  }
+
+  /**
+   * 只重绘当前活动叶子（0.2.12：不再遍历 workspace.iterateAllLeaves）。
+   * 0.2.20 B1：Markdown → previewMode.rerender(true)；图片/PDF/媒体 → setViewState 强制重载。
+   */
+  private refreshActivePreview(): void {
+    reloadLeafView(this.activeLeaf());
   }
 
   /** 预取完成后的轻量重绘：优先 `previewMode.rerender(true)`，拿不到时回退 `setViewState(getViewState())`。同一文件 1s 内最多 1 次。 */
@@ -1064,18 +1080,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         };
         const path = leaf?.view?.file?.path ?? "";
         if (!this.quarkPreviewThrottle(path)) return;
-        try {
-          const previewMode = leaf.view?.previewMode;
-          if (previewMode && typeof previewMode.rerender === "function") {
-            previewMode.rerender(true);
-            return;
-          }
-          if (typeof leaf.getViewState === "function" && typeof leaf.setViewState === "function") {
-            void leaf.setViewState(leaf.getViewState());
-          }
-        } catch {
-          /* 重绘失败不影响预取 */
-        }
+        // 0.2.20 B1：与附件重绘同一套分派（Markdown rerender / 其它视图 setViewState）
+        reloadLeafView(leaf);
       });
     } catch {
       /* workspace 不可用：忽略 */
@@ -1200,16 +1206,22 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     // 0.2.13：全库 md 正文预取（内容搜索用；同步完成后启动，可取消）
     this.startBulkPrefetch();
     // 0.2.11：切换/关闭笔记 → 丢弃未开始的预取任务，避免跨笔记累积
+    // 0.2.20 N9：注册/解绑走 QuarkFileOpenBinding，退出只读时必须 stop()
     const quarkWorkspace = this.app.workspace as unknown as {
       on(name: string, callback: () => void): { ref?: unknown };
       offref(ref: { ref?: unknown }): void;
     };
-    if (this.quarkFileOpenRef) quarkWorkspace.offref(this.quarkFileOpenRef);
-    this.quarkFileOpenRef = quarkWorkspace.on("file-open", () => {
-      // 0.2.16：点击让路——bulk 暂停 3 秒（活动笔记读完可提前恢复）
-      this.quarkClient?.downloadGate.pauseBulk(3000);
-      void this.onQuarkFileOpen();
+    this.quarkFileOpenBinding = new QuarkFileOpenBinding({
+      onFileOpen: (callback) => quarkWorkspace.on("file-open", callback),
+      offFileOpen: (ref) => quarkWorkspace.offref(ref),
+      isActive: () => this.mounter.isMounted() && this.quarkMounted,
+      onOpen: () => {
+        // 0.2.16：点击让路——bulk 暂停 3 秒（活动笔记读完可提前恢复）
+        this.quarkClient?.downloadGate.pauseBulk(3000);
+        void this.onQuarkFileOpen();
+      },
     });
+    this.quarkFileOpenBinding.start();
     // 0.2.11：会话下载统计，每 30 秒一条日志
     if (this.quarkStatsTimerId === null) {
       this.quarkStatsTimerId = window.setInterval(() => {
@@ -1231,6 +1243,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   /** 卸载（QuarkHost 的「退出只读模式」）：还原原生 adapter 并释放内存缓存。 */
   public async quarkExitReadOnly(): Promise<void> {
+    // 0.2.20 N9：先解绑 file-open，退出后打开本地附件不再走 quarkAdapter 联网
+    this.quarkFileOpenBinding?.stop();
+    this.quarkFileOpenBinding = null;
     if (this.quarkMounted) {
       await this.mounter.unmount(this.createQuarkMountFacade());
       this.quarkMounted = false;

@@ -17,6 +17,7 @@
 import { CookieStore, collectSetCookieValues } from "../auth/CookieStore";
 import { DEFAULT_AUTH_COOLDOWN_MS, DEFAULT_DOWNLOAD_CONCURRENCY, DownloadGate } from "./downloadGate";
 import type { GateSignal } from "./downloadGate";
+import { firstBytesSha8 } from "../utils/diagLog";
 import type { DiagEntry } from "../utils/diagLog";
 import { InflightRequests } from "./inflight";
 
@@ -259,6 +260,11 @@ export interface TokenBucketOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/** 0.2.20 N3：单次下载的控制位（外层超时置 aborted，底层据此停止后续跳/重试）。 */
+interface DownloadControl {
+  aborted: boolean;
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -424,6 +430,8 @@ export class QuarkClient {
   private reqCounter = 0;
   /** 0.2.5：同一 fid 的进行中下载（去重表，完成即清理）。 */
   private readonly inflight = new InflightRequests();
+  /** 0.2.20 N3：超时后仍在跑的「僵尸」请求（同 fid 新请求必须等它结束）。 */
+  private readonly fidZombies = new Map<string, Promise<unknown>>();
 
   private riskStreak = 0;
   private breakerOpenUntil = 0;
@@ -675,51 +683,107 @@ export class QuarkClient {
     const signal = options.signal ?? null;
     const path = options.path || fid;
     const priority = options.priority ?? "background";
+    // 0.2.20 N3：控制位（外层超时时置 aborted → 僵尸请求不再发后续跳/不再重试）
+    const control: DownloadControl = { aborted: false };
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
     // 0.2.19 SF4：硬超时放在闸门任务内部 —— 超时后闸门槽位与 inflight 表项都会释放
-    const shared = this.inflight.run(fid, () =>
-      this.downloadGate.run(
-        () => this.withDownloadTimeout(this.downloadWithRetry(fid, signal, path)),
-        { path, priority }
-      )
-    );
+    // 0.2.20 N3：僵尸等待单独计时；闸门任务只包一层超时，保证超时时槽位立即释放
+    const shared = this.inflight.run(fid, async () => {
+      await this.waitForFidZombie(fid, control);
+      if (control.aborted) {
+        throw new QuarkDownloadTimeoutError(`下载超时（>${this.downloadTimeoutMs}ms）`, false);
+      }
+      return await this.downloadGate.run(() => {
+        const underlying = this.downloadWithRetry(fid, signal, path, control);
+        // 闸门任务在超时时会提前 reject，但底层请求继续；登记为僵尸，供同 fid 串行等待
+        this.trackFidZombie(fid, underlying);
+        return this.withDownloadTimeout(control, () => underlying);
+      }, { path, priority });
+    });
     if (!signal) return shared;
     return this.raceCallerCancel(shared, signal);
   }
 
   /**
-   * 0.2.19 SF4：单次下载硬超时。
-   *
-   * 之前只有「transport 自己抛超时」才会进入超时分支；transport 永不 resolve 时
-   * `downloadFile` 永远挂着、inflight 表项也永不释放。这里用 `Promise.race` 兜底，
-   * 超时抛 `QuarkDownloadTimeoutError(retried=false)`，由 inflight 的 finally 清理表项。
+   * 0.2.20 N3：等同一个 fid 的上一个「僵尸」请求结束（避免真实并发 2×）。
+   * 等待本身受同一个超时约束：等不到就放弃（置 aborted），不另发请求。
    */
-  private withDownloadTimeout<T>(task: Promise<T>): Promise<T> {
+  private async waitForFidZombie(fid: string, control: DownloadControl): Promise<void> {
+    const zombie = this.fidZombies.get(fid);
+    if (!zombie) return;
+    const settled = zombie.then(
+      () => undefined,
+      () => undefined
+    );
     const timeoutMs = this.downloadTimeoutMs;
-    if (!(timeoutMs > 0)) return task;
+    if (!(timeoutMs > 0)) {
+      await settled;
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        settled,
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            control.aborted = true;
+            reject(new QuarkDownloadTimeoutError(`下载超时（>${timeoutMs}ms）：等待上一次同 fid 请求结束`, false));
+          }, timeoutMs);
+          const maybeUnref = timer as unknown as { unref?: () => void };
+          if (typeof maybeUnref.unref === "function") maybeUnref.unref();
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  private trackFidZombie(fid: string, underlying: Promise<unknown>): void {
+    const tracked = underlying.then(
+      () => undefined,
+      () => undefined
+    );
+    this.fidZombies.set(fid, tracked);
+    void tracked.then(() => {
+      if (this.fidZombies.get(fid) === tracked) this.fidZombies.delete(fid);
+    });
+  }
+
+  /**
+   * 0.2.19 SF4 / 0.2.20 N3：单次下载硬超时（可配，默认 20s）。
+   *
+   * 超时后：调用方立即拿到 `QuarkDownloadTimeoutError`；同时把 `control.aborted` 置位，
+   * 让仍在跑的底层请求**不再发后续跳、不再退避重试**（否则请求数会在超时后继续增长）。
+   */
+  private withDownloadTimeout<T>(control: DownloadControl, run: () => Promise<T>): Promise<T> {
+    const timeoutMs = this.downloadTimeoutMs;
+    if (!(timeoutMs > 0)) return run();
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        control.aborted = true;
         reject(new QuarkDownloadTimeoutError(`下载超时（>${timeoutMs}ms）`, false));
       }, timeoutMs);
       const maybeUnref = timer as unknown as { unref?: () => void };
       if (typeof maybeUnref.unref === "function") maybeUnref.unref();
-      task.then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        },
-        (error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(error);
-        }
-      );
+      Promise.resolve()
+        .then(run)
+        .then(
+          (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(value);
+          },
+          (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+          }
+        );
     });
   }
 
@@ -761,19 +825,27 @@ export class QuarkClient {
   private async downloadWithRetry(
     fid: string,
     signal: GateSignal | null = null,
-    path: string = fid
+    path: string = fid,
+    control: DownloadControl = { aborted: false }
   ): Promise<ArrayBuffer> {
     try {
-      return await this.downloadOnce(fid, path);
+      return await this.downloadOnce(fid, path, control);
     } catch (error) {
       if (!isDownloadTimeoutError(error)) throw error;
+      // 0.2.20 N3：外层已超时 → 不再重试（否则请求数在超时后继续增长）
+      if (control.aborted) {
+        throw new QuarkDownloadTimeoutError(`下载超时（>${this.downloadTimeoutMs}ms）`, false);
+      }
       // 用户已取消：不重试（取消 = 丢弃结果 + 停止后续，不假装能中断已发出的 TCP）
       if (signal && signal.aborted) throw new QuarkDownloadCanceledError();
       // 超时：退避 1 秒后重试 1 次
       await this.sleep(QUARK_DOWNLOAD_RETRY_BACKOFF_MS);
+      if (control.aborted) {
+        throw new QuarkDownloadTimeoutError(`下载超时（>${this.downloadTimeoutMs}ms）`, false);
+      }
       if (signal && signal.aborted) throw new QuarkDownloadCanceledError();
       try {
-        return await this.downloadOnce(fid, path);
+        return await this.downloadOnce(fid, path, control);
       } catch (second) {
         if (second instanceof QuarkAuthError || second instanceof QuarkFileTooLargeError) throw second;
         if (second instanceof QuarkDownloadCanceledError) throw second;
@@ -794,7 +866,11 @@ export class QuarkClient {
    * 0.2.10：两跳都写 `stage=download` 诊断（hop=1/2、status、code、urlLen、contentType、bytes、firstBytes），
    * 只记元信息，**绝不记录正文**。
    */
-  private async downloadOnce(fid: string, path: string = fid): Promise<ArrayBuffer> {
+  private async downloadOnce(
+    fid: string,
+    path: string = fid,
+    control: DownloadControl = { aborted: false }
+  ): Promise<ArrayBuffer> {
     let resolved: { url: string; status: number; code: number };
     try {
       resolved = await this.resolveDownloadUrlDetailed(fid);
@@ -808,6 +884,11 @@ export class QuarkClient {
       { hop: 1, status: resolved.status, code: resolved.code, urlLen: resolved.url.length },
       ""
     );
+
+    // 0.2.20 N3：第一跳与第二跳之间检查 aborted —— 超时后不再发起大文件传输
+    if (control.aborted) {
+      throw new QuarkDownloadTimeoutError(`下载超时（>${this.downloadTimeoutMs}ms）`, false);
+    }
 
     let response: QuarkHttpResponse;
     try {
@@ -826,6 +907,8 @@ export class QuarkClient {
         : typeof response.text === "string" && response.text
           ? (new TextEncoder().encode(response.text).buffer as ArrayBuffer)
           : new ArrayBuffer(0);
+    // 0.2.20 N7：响应体只记长度与不可逆 sha8，不记任何原始字节
+    const sha8 = await firstBytesSha8(buffer);
     this.logDownload(
       path,
       fid,
@@ -834,7 +917,7 @@ export class QuarkClient {
         status: response.status,
         contentType: headerValue(response.headers, "content-type"),
         bytes: buffer.byteLength,
-        firstBytes: hexPreview(buffer),
+        ...(sha8 ? { sha8 } : {}),
       },
       buffer.byteLength === 0 ? "empty-body" : ""
     );
@@ -1047,18 +1130,6 @@ function headerValue(
     return String(value);
   }
   return "";
-}
-
-/** 前 8 字节 hex（诊断用，判断是不是 HTML 错误页/空内容）。 */
-function hexPreview(buffer: ArrayBuffer, count = 8): string {
-  try {
-    const bytes = new Uint8Array(buffer, 0, Math.min(count, buffer.byteLength));
-    return Array.from(bytes)
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-  } catch {
-    return "";
-  }
 }
 
 function errorText(error: unknown): string {

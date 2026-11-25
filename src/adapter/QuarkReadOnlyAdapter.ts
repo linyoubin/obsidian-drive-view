@@ -34,6 +34,7 @@ import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils
 import { attachmentCandidates, extractAttachmentRefs, isMarkdownPath } from "../utils/noteRefs";
 import { MdContentStore } from "../store/MdContentStore";
 import type { MdContentRecord, MdContentStore as MdStoreType } from "../store/MdContentStore";
+import { firstBytesSha8 } from "../utils/diagLog";
 import { ReadOnlyError } from "./readonlyError";
 
 /** 本 adapter 的固定名字（`getName()` 返回值）。 */
@@ -437,12 +438,13 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       const bytes = buffer.byteLength;
       const text = arrayBufferToString(buffer);
       const chars = text.length;
-      // 0.2.18 SF2：解码埋点只记字节/字符数与前 8 字节 hex，**绝不**记录正文片段
+      // 0.2.20 N7：解码埋点只记长度与不可逆指纹（sha8），不记任何原文/原始字节
       if (chars > 0) {
+        const sha8 = await firstBytesSha8(buffer);
         this.reportInfo("decode", clean, fid, {
           bytes,
           chars,
-          firstBytes: firstBytesHex(buffer),
+          ...(sha8 ? { sha8 } : {}),
         });
       } else {
         this.reportDiagnostic({
@@ -793,12 +795,18 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.reportDiag(stage, path, fid, error);
   }
 
-  /** 下载优先级（0.2.16）：只给「当前活动笔记」interactive；其它 md → bulk；附件 → background。 */
+  /**
+   * 下载优先级（0.2.20 N1）：附件（点开才下）永远 background → 取消按钮能掐掉；
+   * 当前活动笔记正文 interactive；其它 md → bulk。
+   *
+   * 改前「活动路径 === 附件路径」会把刚点开的图片判成 interactive，
+   * 于是默认跳过 interactive 的取消逻辑对它无效。
+   */
   private downloadPriority(path: string): "interactive" | "background" | "bulk" {
+    if (!isMarkdownPath(path)) return "background";
     const active = this.activeNotePath ? String(this.activeNotePath() ?? "") : "";
     if (active && path === active) return "interactive";
-    if (isMarkdownPath(path)) return "bulk";
-    return "background";
+    return "bulk";
   }
 
   /**
@@ -921,17 +929,6 @@ export function errorText(error: unknown): string {
   return text.replace(/\s+/g, " ").slice(0, 120);
 }
 
-/** 0.2.18 SF2：字节前 N 位转 hex（解码埋点用；只暴露字节值，不暴露正文）。 */
-export function firstBytesHex(buffer: ArrayBuffer, count = 8): string {
-  const bytes = new Uint8Array(buffer);
-  const size = Math.min(Math.max(0, count), bytes.length);
-  let hex = "";
-  for (let index = 0; index < size; index += 1) {
-    hex += bytes[index].toString(16).padStart(2, "0");
-  }
-  return hex;
-}
-
 // ------------------------------------------------------------------ 0.2.18 B1：附件「点开才下」
 
 /** 附件打开预热的节流窗口：同一 path 1 秒内最多下一次（与重绘共用）。 */
@@ -978,11 +975,105 @@ export function isQuarkAttachmentPath(path: string): boolean {
 /** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */
 export interface AttachmentWarmupHost {
   readBinary(path: string): Promise<unknown>;
-  redraw(path: string): void;
+  /** 兼容旧回调：没有 `activeLeaf` 时用它重绘。 */
+  redraw?: (path: string) => void;
+  /** 0.2.20 B1：下载完成后要重载的叶子（图片/PDF/媒体没有 previewMode，必须 setViewState）。 */
+  activeLeaf?: () => RefreshableLeafLike | null | undefined;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
   /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
   onError?: (path: string, error: unknown) => void;
+}
+
+// ------------------------------------------------------------------ 0.2.20 B1/N9：叶子重载与 file-open 绑定
+
+/** 需要「强制重载」的叶子最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
+export interface RefreshableLeafLike {
+  view?: {
+    file?: { path?: string } | null;
+    getViewData?: () => string;
+    previewMode?: { rerender?: (force?: boolean) => void } | null;
+  } | null;
+  getViewState?: () => unknown;
+  setViewState?: (state: unknown) => Promise<void>;
+}
+
+/**
+ * 0.2.20 B1：按视图类型重载内容。
+ *
+ * - Markdown（有 `getViewData`）且有 `previewMode.rerender` → `rerender(true)`；
+ * - 其它视图（图片 / PDF / 媒体）→ `setViewState(getViewState())` 强制重载；
+ * - 两者都没有 → `none`（不抛）。
+ */
+export function reloadLeafView(leaf: RefreshableLeafLike | null | undefined): "rerender" | "reload" | "none" {
+  try {
+    const view = leaf?.view;
+    const previewMode = view?.previewMode;
+    const isMarkdown = Boolean(view) && typeof view?.getViewData === "function";
+    if (isMarkdown && previewMode && typeof previewMode.rerender === "function") {
+      previewMode.rerender(true);
+      return "rerender";
+    }
+    if (typeof leaf?.getViewState === "function" && typeof leaf?.setViewState === "function") {
+      void Promise.resolve(leaf.setViewState(leaf.getViewState())).catch(() => undefined);
+      return "reload";
+    }
+    return "none";
+  } catch {
+    return "none";
+  }
+}
+
+/** file-open 事件引用（Obsidian `EventRef` 结构上满足）。 */
+export interface QuarkEventRef {
+  ref?: unknown;
+}
+
+/** 0.2.20 N9：file-open 绑定的最小宿主（workspace + 挂载态 + 打开动作）。 */
+export interface QuarkFileOpenHost {
+  onFileOpen(callback: () => void): QuarkEventRef;
+  offFileOpen(ref: QuarkEventRef): void;
+  /** 只有挂载态才处理（退出只读后即使事件残留也不联网）。 */
+  isActive(): boolean;
+  onOpen(): void;
+}
+
+/**
+ * 0.2.20 N9：`file-open` 的注册/解绑生命周期。
+ *
+ * `start()` 注册（重复调用先解绑再注册，不会重复）；`stop()` 解绑。
+ * 退出只读 / 插件卸载都必须 `stop()`，否则本地附件仍会走 quarkAdapter 联网。
+ */
+export class QuarkFileOpenBinding {
+  private ref: QuarkEventRef | null = null;
+
+  constructor(private readonly host: QuarkFileOpenHost) {}
+
+  get bound(): boolean {
+    return this.ref !== null;
+  }
+
+  start(): void {
+    this.stop();
+    this.ref = this.host.onFileOpen(() => {
+      if (!this.host.isActive()) return;
+      try {
+        this.host.onOpen();
+      } catch {
+        /* 打开事件失败不影响其它视图 */
+      }
+    });
+  }
+
+  stop(): void {
+    if (!this.ref) return;
+    try {
+      this.host.offFileOpen(this.ref);
+    } catch {
+      /* 事件已失效 */
+    }
+    this.ref = null;
+  }
 }
 
 /**
@@ -1013,10 +1104,16 @@ export function createAttachmentWarmup(
       host.onError?.(clean, error);
       return false;
     }
-    try {
-      host.redraw(clean);
-    } catch {
-      /* 重绘失败不影响已完成的下载 */
+    // 0.2.20 B1：下载完成后按视图类型重载（Markdown → rerender；图片/PDF/媒体 → setViewState）
+    const leaf = host.activeLeaf ? host.activeLeaf() : null;
+    if (leaf) {
+      reloadLeafView(leaf);
+    } else if (host.redraw) {
+      try {
+        host.redraw(clean);
+      } catch {
+        /* 重绘失败不影响已完成的下载 */
+      }
     }
     return true;
   };

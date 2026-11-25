@@ -131,6 +131,31 @@ function utf8Length(text: string): number {
 }
 
 /**
+ * 0.2.20 N7：内容指纹 —— 前 `count` 字节的 SHA-256 前 8 位 hex（不可逆）。
+ *
+ * 诊断日志需要「这次读到的内容是否和上次一样」这类线索，但**不能**写原文或原始字节
+ * （前 8 字节 hex 足以还原开头几个字）。没有 WebCrypto 时返回 `""`（宁可不写）。
+ */
+export async function firstBytesSha8(buffer: ArrayBuffer | Uint8Array, count = 8): Promise<string> {
+  try {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const slice = bytes.subarray(0, Math.min(Math.max(0, count), bytes.length));
+    const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
+    if (!subtle || typeof subtle.digest !== "function") return "";
+    // 复制成独立 ArrayBuffer：DOM lib 的 digest 只接受 ArrayBufferView<ArrayBuffer>
+    const copy = new Uint8Array(slice.length);
+    copy.set(slice);
+    const digest = await subtle.digest("SHA-256", copy.buffer);
+    return Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 8);
+  } catch {
+    return "";
+  }
+}
+
+/**
  * 环形截断（A6）：超过 `maxBytes` 时只保留尾部，且从整行边界开始，避免半行。
  * 用 UTF-8 字节数而不是字符数，保证写进文件的体积真的不超上限。
  */
