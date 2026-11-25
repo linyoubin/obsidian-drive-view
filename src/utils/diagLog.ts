@@ -12,7 +12,16 @@
  */
 
 /** 允许出现在日志里的阶段名（`download` = client 下载失败）。 */
-export type DiagStage = "read" | "readBinary" | "getResourcePath" | "download" | "list" | "sort" | "index" | "write";
+export type DiagStage =
+  | "read"
+  | "readBinary"
+  | "getResourcePath"
+  | "download"
+  | "list"
+  | "sort"
+  | "index"
+  | "write"
+  | "decode";
 
 /** 日志文件（库内路径，走 Obsidian adapter 写）。 */
 export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";
@@ -24,7 +33,19 @@ export const DIAG_MSG_MAX = 200;
 export const DIAG_TAIL_LINES = 200;
 
 /** 失败原因分类（0.2.4 A7）。 */
-export type DiagCause = "timeout" | "size" | "auth" | "http" | "canceled" | "readonly" | "unknown";
+export type DiagCause =
+  | "timeout"
+  | "size"
+  | "auth"
+  | "http"
+  | "canceled"
+  | "readonly"
+  | "utf8"
+  | "empty"
+  | "unknown";
+
+/** 结构化附加字段（0.2.10 埋点）：按插入顺序写在 `fid` 之后、`msg` 之前。 */
+export type DiagFields = Record<string, string | number | boolean>;
 
 export interface DiagEntry {
   stage: DiagStage;
@@ -39,6 +60,8 @@ export interface DiagEntry {
   cause?: DiagCause;
   /** 是否重试过（超时重试 1 次后仍失败为 true）。 */
   retried?: boolean;
+  /** 0.2.10：结构化字段（hop/status/code/urlLen/contentType/bytes/firstBytes/chars/hit/size/sample…）。 */
+  fields?: DiagFields;
 }
 
 /**
@@ -52,15 +75,30 @@ export function redactDiagMessage(message: string): string {
   );
 }
 
-/** 一行日志：`[ISO] level=error stage=<...> path=<路径> fid=<fid> msg=<前200字符>`。 */
+/** 一行日志：`[ISO] level=error stage=<...> path=<路径> fid=<fid> <fields> cause=… msg=<前200字符>`。 */
 export function formatDiagLine(entry: DiagEntry, now: Date = new Date()): string {
   const level = entry.level ?? "error";
   const path = entry.path && entry.path !== "" ? entry.path : "/";
   const fid = entry.fid && entry.fid !== "" ? entry.fid : "-";
   const msg = redactDiagMessage(entry.message).replace(/\s+/g, " ").trim().slice(0, DIAG_MSG_MAX);
+  const fields = formatDiagFields(entry.fields);
   const cause = entry.cause ? ` cause=${entry.cause}` : "";
   const retried = entry.retried === true ? " retried=true" : "";
-  return `[${now.toISOString()}] level=${level} stage=${entry.stage} path=${path} fid=${fid}${cause}${retried} msg=${msg}`;
+  return `[${now.toISOString()}] level=${level} stage=${entry.stage} path=${path} fid=${fid}${fields}${cause}${retried} msg=${msg}`;
+}
+
+/** 结构化字段渲染：` hop=1 status=200`；值里的空白压成空格、截断 120 字符（sample 已在上游处理）。 */
+export function formatDiagFields(fields?: DiagFields): string {
+  if (!fields) return "";
+  let rendered = "";
+  for (const [key, value] of Object.entries(fields)) {
+    const text = redactDiagMessage(`${key}=${String(value ?? "")}`)
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+    rendered += ` ${text}`;
+  }
+  return rendered;
 }
 
 function utf8Length(text: string): number {

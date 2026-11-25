@@ -472,6 +472,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       downloadConcurrency: this.settings.quarkDownloadConcurrency,
       // 401：清队列 + 暂停 60s，同一失效期只回调一次 → 这里只弹一次提醒
       onAuthExpired: () => this.onQuarkAuthExpired(),
+      // 0.2.10：下载两跳埋点（hop/status/code/urlLen/contentType/bytes/firstBytes）
+      diag: (entry) => this.quarkDiag?.log(entry),
     });
     this.quarkCache = new ContentCache({ maxBytes: DEFAULT_CONTENT_CACHE_BYTES });
     this.quarkIndex = new IndexStore({

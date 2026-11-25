@@ -17,6 +17,7 @@
 import { CookieStore, collectSetCookieValues } from "../auth/CookieStore";
 import { DEFAULT_AUTH_COOLDOWN_MS, DEFAULT_DOWNLOAD_CONCURRENCY, DownloadGate } from "./downloadGate";
 import type { GateSignal } from "./downloadGate";
+import type { DiagEntry } from "../utils/diagLog";
 import { InflightRequests } from "./inflight";
 
 /** 桌面 Chrome UA（与已跑通探针一致；手机端 UA 策略见 v3 §9.4 Q6，暂沿用）。 */
@@ -243,6 +244,8 @@ export interface QuarkClientOptions {
   authCooldownMs?: number;
   /** 登录失效时回调（同一失效期只回调一次；main.ts 据此只弹一次 Notice）。 */
   onAuthExpired?: () => void;
+  /** 0.2.10：下载两跳埋点出口（main 注入 DiagLogger.log）。 */
+  diag?: (entry: DiagEntry) => void;
 }
 
 export interface TokenBucketOptions {
@@ -389,6 +392,8 @@ export class QuarkClient {
   readonly downloadGate: DownloadGate;
   private readonly authCooldownMs: number;
   private readonly onAuthExpired?: () => void;
+  /** 0.2.10：下载两跳埋点（main 注入 DiagLogger.log）。 */
+  private readonly diag?: (entry: DiagEntry) => void;
   /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
   private authNotified = false;
   /** 0.2.5：同一 fid 的进行中下载（去重表，完成即清理）。 */
@@ -413,6 +418,7 @@ export class QuarkClient {
     this.userAgent = options.userAgent ?? QUARK_DEFAULT_UA;
     this.authCooldownMs = Math.max(1, options.authCooldownMs ?? DEFAULT_AUTH_COOLDOWN_MS);
     this.onAuthExpired = options.onAuthExpired;
+    this.diag = options.diag;
     this.downloadGate =
       options.gate ??
       new DownloadGate({
@@ -578,6 +584,14 @@ export class QuarkClient {
 
   /** 取某个 fid 的签名下载 URL（`/file/download` 第一跳）。 */
   async resolveDownloadUrl(fid: string): Promise<string> {
+    const result = await this.resolveDownloadUrlDetailed(fid);
+    return result.url;
+  }
+
+  /** 0.2.10：第一跳带 status/code/urlLen 的诊断版本（公开方法行为不变）。 */
+  private async resolveDownloadUrlDetailed(
+    fid: string
+  ): Promise<{ url: string; status: number; code: number }> {
     const url = buildDriveUrl(QUARK_DOWNLOAD_PATH);
     const response = await this.requestRaw(url, {
       method: "POST",
@@ -601,7 +615,7 @@ export class QuarkClient {
         ? String((first as Record<string, unknown>).download_url)
         : "";
     if (!downloadUrl) throw new QuarkApiError("file/download 未返回 download_url", { code, status: response.status });
-    return downloadUrl;
+    return { url: downloadUrl, status: response.status, code };
   }
 
   /**
@@ -617,11 +631,15 @@ export class QuarkClient {
    * 连续点同一个文件 10 次只会发 1 次请求；取消只放弃**调用方自己**的等待，
    * 共享的那次下载继续（其它调用方照常拿到结果并写缓存）。
    */
-  async downloadFile(fid: string, options: { signal?: GateSignal | null } = {}): Promise<ArrayBuffer> {
+  async downloadFile(
+    fid: string,
+    options: { signal?: GateSignal | null; path?: string } = {}
+  ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
+    const path = options.path || fid;
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
     const shared = this.inflight.run(fid, () =>
-      this.downloadGate.run(() => this.downloadWithRetry(fid))
+      this.downloadGate.run(() => this.downloadWithRetry(fid, signal, path))
     );
     if (!signal) return shared;
     return this.raceCallerCancel(shared, signal);
@@ -652,9 +670,13 @@ export class QuarkClient {
     });
   }
 
-  private async downloadWithRetry(fid: string, signal: GateSignal | null = null): Promise<ArrayBuffer> {
+  private async downloadWithRetry(
+    fid: string,
+    signal: GateSignal | null = null,
+    path: string = fid
+  ): Promise<ArrayBuffer> {
     try {
-      return await this.downloadOnce(fid);
+      return await this.downloadOnce(fid, path);
     } catch (error) {
       if (!isDownloadTimeoutError(error)) throw error;
       // 用户已取消：不重试（取消 = 丢弃结果 + 停止后续，不假装能中断已发出的 TCP）
@@ -663,7 +685,7 @@ export class QuarkClient {
       await this.sleep(QUARK_DOWNLOAD_RETRY_BACKOFF_MS);
       if (signal && signal.aborted) throw new QuarkDownloadCanceledError();
       try {
-        return await this.downloadOnce(fid);
+        return await this.downloadOnce(fid, path);
       } catch (second) {
         if (second instanceof QuarkAuthError || second instanceof QuarkFileTooLargeError) throw second;
         if (second instanceof QuarkDownloadCanceledError) throw second;
@@ -678,29 +700,71 @@ export class QuarkClient {
     }
   }
 
-  /** 单次下载（两跳）；失败统一映射为可诊断的错误类型。 */
-  private async downloadOnce(fid: string): Promise<ArrayBuffer> {
-    let downloadUrl: string;
+  /**
+   * 单次下载（两跳）；失败统一映射为可诊断的错误类型。
+   *
+   * 0.2.10：两跳都写 `stage=download` 诊断（hop=1/2、status、code、urlLen、contentType、bytes、firstBytes），
+   * 只记元信息，**绝不记录正文**。
+   */
+  private async downloadOnce(fid: string, path: string = fid): Promise<ArrayBuffer> {
+    let resolved: { url: string; status: number; code: number };
     try {
-      downloadUrl = await this.resolveDownloadUrl(fid);
+      resolved = await this.resolveDownloadUrlDetailed(fid);
     } catch (error) {
+      this.logDownload(path, fid, { hop: 1, status: statusOf(error), code: codeOf(error), urlLen: 0 }, errorText(error));
       throw this.mapDownloadError(error);
     }
+    this.logDownload(
+      path,
+      fid,
+      { hop: 1, status: resolved.status, code: resolved.code, urlLen: resolved.url.length },
+      ""
+    );
+
     let response: QuarkHttpResponse;
     try {
-      response = await this.requestRaw(downloadUrl, {
+      response = await this.requestRaw(resolved.url, {
         headers: { Accept: "*/*" },
         checkAuth: false,
       });
     } catch (error) {
+      this.logDownload(path, fid, { hop: 2, status: statusOf(error) }, errorText(error));
       throw this.mapDownloadError(error);
     }
-    if (response.arrayBuffer && response.arrayBuffer.byteLength > 0) return response.arrayBuffer;
-    if (typeof response.text === "string" && response.text) {
-      const bytes = new TextEncoder().encode(response.text);
-      return bytes.buffer as ArrayBuffer;
+
+    const buffer =
+      response.arrayBuffer && response.arrayBuffer.byteLength > 0
+        ? response.arrayBuffer
+        : typeof response.text === "string" && response.text
+          ? (new TextEncoder().encode(response.text).buffer as ArrayBuffer)
+          : new ArrayBuffer(0);
+    this.logDownload(
+      path,
+      fid,
+      {
+        hop: 2,
+        status: response.status,
+        contentType: headerValue(response.headers, "content-type"),
+        bytes: buffer.byteLength,
+        firstBytes: hexPreview(buffer),
+      },
+      buffer.byteLength === 0 ? "empty-body" : ""
+    );
+    return buffer;
+  }
+
+  /** 下载埋点（0.2.10）：失败只影响日志，不影响下载结果。 */
+  private logDownload(
+    path: string,
+    fid: string,
+    fields: Record<string, string | number | boolean>,
+    message: string
+  ): void {
+    try {
+      this.diag?.({ level: "info", stage: "download", path, fid, message, fields });
+    } catch {
+      /* 日志失败不影响下载 */
     }
-    return new ArrayBuffer(0);
   }
 
   /** 下载错误归一：23018 → 文件过大；401 → 熔断；其它原样。 */
@@ -849,6 +913,49 @@ export class QuarkClient {
   }
 }
 
+/** 取响应头（大小写不敏感，数组取第一个）。 */
+function headerValue(
+  headers: QuarkHttpResponse["headers"],
+  name: string
+): string {
+  if (!headers || typeof headers !== "object") return "";
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() !== lower) continue;
+    const value = (headers as Record<string, unknown>)[key];
+    if (Array.isArray(value)) return value.length > 0 ? String(value[0]) : "";
+    if (value === undefined || value === null) return "";
+    return String(value);
+  }
+  return "";
+}
+
+/** 前 8 字节 hex（诊断用，判断是不是 HTML 错误页/空内容）。 */
+function hexPreview(buffer: ArrayBuffer, count = 8): string {
+  try {
+    const bytes = new Uint8Array(buffer, 0, Math.min(count, buffer.byteLength));
+    return Array.from(bytes)
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    return "";
+  }
+}
+
+function errorText(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error ?? "");
+  return text.replace(/\s+/g, " ").slice(0, 120);
+}
+
+function statusOf(error: unknown): number {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? status : 0;
+}
+
+function codeOf(error: unknown): number {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "number" ? code : -1;
+}
 /** 供调用方核对「响应是否带 set-cookie」（诊断用，不含 cookie 值）。 */
 export function countSetCookieHeaders(headers: QuarkHttpResponse["headers"]): number {
   return collectSetCookieValues(headers as Record<string, unknown> | null | undefined).length;

@@ -265,7 +265,7 @@ describe("QuarkClient：超时重试 / 23018 / 401 熔断（A3/A5/A6）", () => 
 describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
   function makeAdapter(downloadImpl: (fid: string, options?: { signal?: { aborted: boolean } | null }) => Promise<ArrayBuffer>) {
     const puts: string[] = [];
-    const logs: Array<{ cause?: string; started: number }> = [];
+    const logs: Array<{ cause?: string; level?: string; started: number }> = [];
     const index = {
       entries: [{ path: "notes/a.md", type: "file" as const, fid: "fid-a", parentFid: "0", size: 2048, mtime: 1 }],
     };
@@ -283,7 +283,7 @@ describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
       cache,
       client: { downloadFile: downloadImpl },
       baseAdapter: {} as never,
-      diag: (entry) => logs.push({ cause: entry.cause, started }),
+      diag: (entry) => logs.push({ cause: entry.cause, level: entry.level, started }),
       downloadUi: {
         begin: () => {
           started += 1;
@@ -306,8 +306,11 @@ describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
     await expect(adapter.read("/notes/a.md")).rejects.toBeInstanceOf(QuarkDownloadCanceledError);
     expect(calls).toBe(1);
     expect(puts.length).toBe(0);
-    expect(logs.length).toBe(1);
-    expect(logs[0].cause).toBe("canceled");
+    const errorLogs = logs.filter((log) => log.level !== "info");
+    expect(errorLogs.length).toBe(1);
+    expect(errorLogs[0].cause).toBe("canceled");
+    // 0.2.10：入口埋点也在（hit/size + decode），正文不出现
+    expect(logs.some((log) => log.level === "info")).toBe(true);
   });
 
   test("同一错误对象只记一条日志（download 与 read 不重复记）", async () => {
@@ -315,8 +318,9 @@ describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
       throw new Error("Request failed. 请求超时");
     });
     await expect(adapter.read("/notes/a.md")).rejects.toThrow();
-    expect(logs.length).toBe(1);
-    expect(logs[0].cause).toBe("timeout");
+    const errorLogs = logs.filter((log) => log.level !== "info");
+    expect(errorLogs.length).toBe(1);
+    expect(errorLogs[0].cause).toBe("timeout");
   });
 
   test("diagCauseOf：各错误类型映射到 cause", () => {
@@ -326,5 +330,85 @@ describe("QuarkReadOnlyAdapter：取消下载（A4′）", () => {
     expect(diagCauseOf(new QuarkDownloadTimeoutError("t", true))).toBe("timeout");
     expect(diagCauseOf(new DownloadGateError("auth-expired", "x"))).toBe("auth");
     expect(diagCauseOf(new Error("other"))).toBe("unknown");
+  });
+});
+
+// ------------------------------------------------------------------ 0.2.10 埋点：read → download → decode
+
+describe("0.2.10 埋点：read / decode / download 两跳", () => {
+  function diagAdapter(text: string, opts: { signalAbort?: boolean } = {}) {
+    const entries: Array<{ stage: string; fields?: Record<string, unknown>; message?: string; level?: string }> = [];
+    const adapter = new QuarkReadOnlyAdapter({
+      index: {
+        entries: [{ path: "notes/a.md", type: "file" as const, fid: "fa", parentFid: "0", size: text.length, mtime: 1 }],
+      },
+      cache: {
+        has: () => false,
+        get: () => null,
+        getResourceUrl: () => "",
+        put: () => ({ cached: true }),
+        enqueuePrefetch: () => undefined,
+      },
+      client: {
+        downloadFile: async () => new TextEncoder().encode(text).buffer as ArrayBuffer,
+      },
+      baseAdapter: {} as never,
+      diag: (entry: any) => entries.push(entry),
+    });
+    return { adapter, entries };
+  }
+
+  test("read 入口记 hit/size；decode 记 bytes/chars/sample（60 字符、去换行）", async () => {
+    const longText = "标题\n" + "字".repeat(100);
+    const { adapter, entries } = diagAdapter(longText);
+    const text = await adapter.read("/notes/a.md");
+    expect(text).toBe(longText);
+    const readEntry = entries.find((entry) => entry.stage === "read")!;
+    expect(readEntry.fields).toMatchObject({ hit: false, size: longText.length });
+    const decode = entries.find((entry) => entry.stage === "decode")!;
+    expect(decode.fields!.bytes).toBe(new TextEncoder().encode(longText).length);
+    expect(decode.fields!.chars).toBe(longText.length);
+    const sample = String(decode.fields!.sample);
+    expect(sample.length).toBeLessThanOrEqual(60);
+    expect(sample).not.toContain("\n");
+  });
+
+  test("空内容：decode 记 cause=empty、不带 sample（正文绝不落日志）", async () => {
+    const { adapter, entries } = diagAdapter("");
+    await adapter.read("/notes/a.md");
+    const decode = entries.find((entry) => entry.stage === "decode")!;
+    expect(decode.fields).toMatchObject({ bytes: 0, chars: 0 });
+    expect(decode.fields!.sample).toBeUndefined();
+    expect(decode.message).toBe("empty-body");
+  });
+
+  test("download 两跳：hop=1 带 status/code/urlLen；hop=2 带 contentType/bytes/firstBytes", async () => {
+    const entries: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
+    const calls: string[] = [];
+    const transport: QuarkTransport = async (request) => {
+      calls.push(request.url);
+      if (request.url.includes("/file/download")) {
+        return { status: 200, headers: {}, text: JSON.stringify({ code: 0, data: [{ download_url: "https://cdn.example/f1" }] }) };
+      }
+      return {
+        status: 200,
+        headers: { "Content-Type": "text/markdown" },
+        arrayBuffer: new TextEncoder().encode("# hi").buffer as ArrayBuffer,
+      };
+    };
+    const client = new QuarkClient({
+      transport,
+      limiter: fastBucket(),
+      sleep: fastSleep,
+      diag: (entry: any) => entries.push(entry),
+    });
+    const bytes = await client.downloadFile("fid-1", { path: "notes/a.md" });
+    expect(new TextDecoder().decode(bytes)).toBe("# hi");
+    const hop1 = entries.find((entry) => entry.fields?.hop === 1)!;
+    expect(hop1.fields).toMatchObject({ status: 200, code: 0 });
+    expect(Number(hop1.fields!.urlLen)).toBeGreaterThan(0);
+    const hop2 = entries.find((entry) => entry.fields?.hop === 2)!;
+    expect(hop2.fields).toMatchObject({ status: 200, contentType: "text/markdown", bytes: 4 });
+    expect(String(hop2.fields!.firstBytes)).toBe("23206869"); // "# hi" 的前 4 字节
   });
 });

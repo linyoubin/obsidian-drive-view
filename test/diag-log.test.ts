@@ -166,3 +166,36 @@ describe("diagLog：追加写入（不崩、不覆盖、串行）", () => {
     expect(errors.length).toBe(1);
   });
 });
+
+// ------------------------------------------------------------------ 结构化字段（0.2.10 埋点）
+
+describe("diagLog：结构化字段（0.2.10）", () => {
+  test("fields 按插入顺序写在 fid 后、msg 前，并做脱敏与截断", () => {
+    const line = formatDiagLine(
+      {
+        level: "info",
+        stage: "download",
+        path: "/技术/a.md",
+        fid: "f1",
+        message: "",
+        fields: { hop: 1, status: 200, code: 0, urlLen: 321, cookie: "should-redact=value" },
+      },
+      fixedNow
+    );
+    expect(line).toContain("stage=download path=/技术/a.md fid=f1 hop=1 status=200 code=0 urlLen=321");
+    expect(line).toContain("cookie=");
+    expect(line).not.toContain("should-redact");
+    expect(line.endsWith("msg=")).toBe(true);
+  });
+
+  test("sample 字段去换行并截断 60 字符（调用方截断，字段渲染再兜一层）", () => {
+    const sample = "第一行\n第二行" + "x".repeat(80);
+    const line = formatDiagLine(
+      { level: "info", stage: "decode", path: "/a.md", fid: "f", message: "", fields: { bytes: 10, chars: 90, sample: sample.slice(0, 60).replace(/\s+/g, " ") } },
+      fixedNow
+    );
+    expect(line).not.toContain("\n");
+    const field = line.split(" sample=")[1];
+    expect(field.length).toBeLessThanOrEqual(60 + " msg=".length + 1);
+  });
+});
