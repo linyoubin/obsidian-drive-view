@@ -175,9 +175,9 @@ describe("0.2.19 B3 VaultMounter.unmount 还原 fileMap", () => {
     expect(Object.keys(harness.fileMap).length).toBe(before.length);
     expect(harness.fileMap["cloud/a.md"]).toBeUndefined();
     expect(harness.fileMap["notes"].children).toEqual([]);
-    // 0.2.21 N5：unmount 不再全库 stat，文件节点按 0 兜底（mtime/size 由 Obsidian 监听后续补）
+    // 0.2.22 M2：missing 文件逐个 stat → 恢复真实 size（不再全 0）
     expect(harness.fileMap["local.md"].stat).toBeDefined();
-    expect(harness.fileMap["local.md"].stat?.size).toBe(0);
+    expect(harness.fileMap["local.md"].stat?.size).toBe(11);
     // 挂载时停监听，卸载后必须重启本地监听
     expect(harness.stats.starts).toBeGreaterThanOrEqual(1);
   });

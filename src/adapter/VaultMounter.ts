@@ -146,7 +146,8 @@ export class VaultMounter {
    *
    * - 只删「云端独有」（fileMap 有、本地没有）的节点，两边都有的**不动**（避免闪白）；
    * - 只补「本地缺失」（本地有、fileMap 没有）的节点；
-   * - 跳过 `configDir` / `.trash`（0.2.21 N5），且不做全库 `stat`（移动端不卡退出）。
+   * - 跳过 `configDir` / `.trash`（0.2.21 N5）；缺失文件逐个 stat（0.2.22 M2，集合很小），
+   *   已有节点不 stat（0.2.21 N5 的「不卡退出」保留）。
    */
   public async rebuildFileMapFromLocal(): Promise<void> {
     const internalVault = this.app.vault as InternalVault;
@@ -164,7 +165,7 @@ export class VaultMounter {
       internalVault.onChange?.(isFolderNode(item) ? "folder-removed" : "file-removed", path);
     }
 
-    // 2) 只补本地缺失（父目录先于子项）
+    // 2) 只补本地缺失（父目录先于子项）；0.2.22 M2：只对这批文件做 stat 取真实 size/mtime
     const missing = entries
       .filter((entry) => !internalVault.fileMap?.[entry.path])
       .sort((a, b) => {
@@ -172,10 +173,27 @@ export class VaultMounter {
         return a.path.split("/").length - b.path.split("/").length;
       });
     for (const entry of missing) {
-      this.applyLocalEntry(entry, internalVault);
+      const withStat = entry.type === "file" ? await this.enrichWithStat(entry) : entry;
+      this.applyLocalEntry(withStat, internalVault);
     }
 
     this.refreshFileExplorerViews();
+  }
+
+  /**
+   * 0.2.22 M2：只给「本地缺失、需要新建」的文件取 stat（集合很小），
+   * 已有节点不重复 stat；取不到就保持 0 兜底（不阻塞还原）。
+   */
+  private async enrichWithStat(entry: VaultTreeEntry): Promise<VaultTreeEntry> {
+    const adapter = this.originalAdapter;
+    if (!adapter) return entry;
+    try {
+      const stat = await adapter.stat(entry.path);
+      if (!stat) return entry;
+      return { ...entry, ctime: stat.ctime, mtime: stat.mtime, size: stat.size };
+    } catch {
+      return entry;
+    }
   }
 
   /** 0.2.21 N5：配置目录与回收站不参与本地树还原。 */

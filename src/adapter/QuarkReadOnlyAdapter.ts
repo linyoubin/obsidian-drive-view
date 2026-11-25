@@ -824,7 +824,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
    * 改前「活动路径 === 附件路径」会把刚点开的图片判成 interactive，
    * 于是默认跳过 interactive 的取消逻辑对它无效。
    */
-  private downloadPriority(path: string): "interactive" | "background" | "bulk" {    if (!isMarkdownPath(path)) return "background";
+  private downloadPriority(path: string): "interactive" | "background" | "bulk" {
+    if (!isMarkdownPath(path)) return "background";
     const active = this.activeNotePath ? String(this.activeNotePath() ?? "") : "";
     if (active && path === active) return "interactive";
     return "bulk";
@@ -1000,6 +1001,8 @@ export interface AttachmentWarmupHost {
   redraw?: (path: string) => void;
   /** 0.2.20 B1：下载完成后要重载的叶子（图片/PDF/媒体没有 previewMode，必须 setViewState）。 */
   activeLeaf?: () => RefreshableLeafLike | null | undefined;
+  /** 0.2.22 M5：当前仍打开的叶子集合（判断发起下载的叶子是否已被关闭）。 */
+  openLeaves?: () => RefreshableLeafLike[];
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
   /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
@@ -1128,6 +1131,8 @@ export function createAttachmentWarmup(
     if (previous !== undefined && at - previous < window) return false;
     // 先占位：同一节流窗口内并发 file-open 也只发一次下载
     lastAt.set(clean, at);
+    // 0.2.22 M5：记住发起下载的叶子（用户切走后仍能在它上面重载）
+    const originLeaf = host.activeLeaf ? host.activeLeaf() : null;
     try {
       await host.readBinary(clean);
     } catch (error) {
@@ -1135,15 +1140,28 @@ export function createAttachmentWarmup(
       return false;
     }
     // 0.2.20 B1：下载完成后按视图类型重载（Markdown → rerender；图片/PDF/媒体 → setViewState）
-    // 0.2.21 S4：叶子已切走（path 不匹配）时不重载，只记日志
-    const leaf = host.activeLeaf ? host.activeLeaf() : null;
+    // 0.2.21 S4：叶子已切到别的文件时不重载（path-mismatch）
+    // 0.2.22 M5：优先重载**发起时**的叶子；它已关闭才跳过（leaf-closed）
+    const leaf = originLeaf ?? (host.activeLeaf ? host.activeLeaf() : null);
     if (leaf) {
-      const outcome = reloadLeafView(leaf, clean);
-      if (outcome === "skip") {
+      const open = host.openLeaves ? host.openLeaves() : null;
+      const stillOpen = open
+        ? open.includes(leaf)
+        : !host.activeLeaf || host.activeLeaf() === leaf;
+      if (!stillOpen) {
         try {
-          host.log?.({ path: clean, state: "skip", reason: "path-mismatch" });
+          host.log?.({ path: clean, state: "skip", reason: "leaf-closed" });
         } catch {
           /* 日志失败不影响已完成的下载 */
+        }
+      } else {
+        const outcome = reloadLeafView(leaf, clean);
+        if (outcome === "skip") {
+          try {
+            host.log?.({ path: clean, state: "skip", reason: "path-mismatch" });
+          } catch {
+            /* 日志失败不影响已完成的下载 */
+          }
         }
       }
     } else if (host.redraw) {

@@ -610,6 +610,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       readBinary: (path) => this.quarkAdapter.readBinaryForUser(path),
       // 0.2.20 B1：按视图类型重载 —— Markdown 用 previewMode.rerender，图片/PDF/媒体用 setViewState
       activeLeaf: () => this.activeLeaf(),
+      // 0.2.22 M5：发起下载的叶子是否仍打开（切走后仍能重载；已关闭则跳过）
+      openLeaves: () => this.openQuarkLeaves(),
       // 兜底：拿不到叶子时仍尝试重绘当前活动预览
       redraw: () => this.refreshActivePreview(),
       // 0.2.21 S4：叶子已切走时不重载，只记日志 state=skip reason=path-mismatch
@@ -1077,6 +1079,23 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
    */
   private refreshActivePreview(): void {
     reloadLeafView(this.activeLeaf());
+  }
+
+  /** 0.2.22 M5：当前仍打开的全部叶子（判断附件发起叶子是否已被关闭）。 */
+  private openQuarkLeaves(): RefreshableLeafLike[] {
+    const leaves: RefreshableLeafLike[] = [];
+    try {
+      const workspace = this.app.workspace as unknown as {
+        iterateAllLeaves?: (callback: (leaf: unknown) => void) => void;
+      };
+      if (typeof workspace.iterateAllLeaves !== "function") return leaves;
+      workspace.iterateAllLeaves((leaf) => {
+        if (leaf) leaves.push(leaf as RefreshableLeafLike);
+      });
+    } catch {
+      /* workspace 不可用：当作没有打开的叶子 */
+    }
+    return leaves;
   }
 
   /** 预取完成后的轻量重绘：优先 `previewMode.rerender(true)`，拿不到时回退 `setViewState(getViewState())`。同一文件 1s 内最多 1 次。 */

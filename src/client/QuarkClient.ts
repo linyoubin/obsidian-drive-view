@@ -711,7 +711,7 @@ export class QuarkClient {
     options: {
       signal?: GateSignal | null;
       path?: string;
-      priority?: "interactive" | "background" | "bulk";
+      priority?: "interactive" | "background" | "background-user" | "bulk";
     } = {}
   ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;

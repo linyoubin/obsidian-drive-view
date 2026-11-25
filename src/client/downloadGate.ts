@@ -231,17 +231,24 @@ export class DownloadGate {
 
   /**
    * 401 熔断：进入 `auth-expired` 状态（冷却 `cooldownMs`，默认 60s），
-   * 清空 interactive + background + bulk **三个队列**并让排队任务立即以 `auth-expired` 拒绝。
-   * 已开始的任务不受影响（会自己失败）。
+   * 清空 interactive + background + background-user + bulk **四个队列**并让排队任务立即以
+   * `auth-expired` 拒绝。已开始的任务不受影响（会自己失败）。
    *
-   * 0.2.18 B4：bulk 队列此前漏清 —— 只能靠「另一个任务跑完 → finally 里的 pump」顺带拒绝，
-   * 没有其它任务在跑时 bulk 任务会一直挂着。这里显式清三个队列并在末尾 `pump()` 兜底。
+   * 0.2.18 B4：bulk 队列此前漏清 —— 只能靠「另一个任务跑完 → finally 里的 pump」顺带拒绝。
+   * 0.2.22 M1：`backgroundUserQueue` 同样漏清 —— 401 后用户点开的附件会一直 pending。
+   * 现在按队列实际清空四个，并在末尾 `pump()` 兜底。
    */
   failAuth(cooldownMs: number = DEFAULT_AUTH_COOLDOWN_MS): void {
     this.authExpiredUntil = this.now() + Math.max(1, cooldownMs);
-    const rejected = [...this.interactiveQueue, ...this.backgroundQueue, ...this.bulkQueue];
+    const rejected = [
+      ...this.interactiveQueue,
+      ...this.backgroundQueue,
+      ...this.backgroundUserQueue,
+      ...this.bulkQueue,
+    ];
     this.interactiveQueue = [];
     this.backgroundQueue = [];
+    this.backgroundUserQueue = [];
     this.bulkQueue = [];
     const error = new DownloadGateError(
       "auth-expired",
@@ -303,22 +310,19 @@ export class DownloadGate {
         return; // interactive 等待项存在：bg/bulk 不启动新任务
       }
 
-      // 0.2.16：给 interactive 强制留 1 个槽位
-      const lowCap = Math.max(1, this.concurrencyValue - 1);
-      if (this.backgroundActive + this.backgroundUserActive + this.bulkActive >= lowCap) return;
-
-      // 0.2.21 S3：用户点开的附件优先，并可占用为它保留的那个 bg 槽位；
-      // 预取（background）最多占 backgroundLimit-1，避免把用户点击堵在队列里。
-      if (
-        this.backgroundUserQueue.length > 0 &&
-        this.backgroundUserActive < 1 &&
-        this.backgroundActive + this.backgroundUserActive < this.backgroundLimitValue
-      ) {
+      // 0.2.22 M4：用户点开的附件允许用满 `concurrency`（只有 1 并发硬上限，
+      // 且预取最多 backgroundLimit-1，滥用风险已被限制），不受 lowCap 影响
+      if (this.backgroundUserQueue.length > 0 && this.backgroundUserActive < 1) {
         const pending = this.backgroundUserQueue.shift() as QueuedTask;
         if (!this.start(pending)) continue;
         continue;
       }
 
+      // 0.2.16：给 interactive 强制留 1 个槽位
+      const lowCap = Math.max(1, this.concurrencyValue - 1);
+      if (this.backgroundActive + this.backgroundUserActive + this.bulkActive >= lowCap) return;
+
+      // 0.2.21 S3：预取（background）最多占 backgroundLimit-1，为 bg-user 保留 1 个槽位
       if (this.backgroundQueue.length > 0) {
         const prefetchCap = Math.max(1, this.backgroundLimitValue - 1);
         if (
@@ -329,7 +333,9 @@ export class DownloadGate {
           if (!this.start(pending)) continue;
           continue;
         }
-        return; // 预取额度用完：bulk 让路
+        // 0.2.22 M3：预取满额时，只有「有 bg-user 在等」才让路；
+        // 否则继续往下给 bulk 分配空闲槽位（不再把空槽一起丢掉）
+        if (this.backgroundUserQueue.length > 0) return;
       }
 
       if (this.now() < this.bulkPausedUntil) return; // 点击让路：暂停 bulk 3 秒
