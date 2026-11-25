@@ -1,4 +1,4 @@
-import type { App, DataAdapter, MarkdownView, Stat, TFile, TFolder } from "obsidian";
+import type { App, DataAdapter, MarkdownView, TFile, TFolder } from "obsidian";
 import { getParentPath, isConfigOrInternalPath } from "../utils/pathUtils";
 import type { ObsidianVaultRawEvent } from "./GoogleDriveDataAdapter";
 
@@ -142,35 +142,55 @@ export class VaultMounter {
   }
 
   /**
-   * 0.2.19 B3：清掉 `Vault.fileMap` 里所有非根节点，再按**本地磁盘**重建。
-   * 这样云端合成节点（含目录）不会残留，本地文件也重新回到 fileMap。
+   * 0.2.19 B3 / 0.2.21 N4-N5：把 `Vault.fileMap` 对齐到**本地磁盘**，增量执行。
+   *
+   * - 只删「云端独有」（fileMap 有、本地没有）的节点，两边都有的**不动**（避免闪白）；
+   * - 只补「本地缺失」（本地有、fileMap 没有）的节点；
+   * - 跳过 `configDir` / `.trash`（0.2.21 N5），且不做全库 `stat`（移动端不卡退出）。
    */
   public async rebuildFileMapFromLocal(): Promise<void> {
     const internalVault = this.app.vault as InternalVault;
     if (!internalVault.fileMap) return;
 
-    const existing = Object.keys(internalVault.fileMap)
-      .filter((path) => path !== "/")
+    const entries = await this.collectLocalEntries();
+    const localPaths = new Set(entries.map((entry) => entry.path));
+
+    // 1) 只删云端独有（子路径先删，父目录后删）
+    const stale = Object.keys(internalVault.fileMap)
+      .filter((path) => path !== "/" && !localPaths.has(path))
       .sort((a, b) => b.length - a.length);
-    for (const path of existing) {
+    for (const path of stale) {
       const item = internalVault.fileMap[path];
       internalVault.onChange?.(isFolderNode(item) ? "folder-removed" : "file-removed", path);
     }
 
-    const entries = await this.collectLocalEntries();
-    const sorted = [...entries].sort((a, b) => {
-      if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-      return a.path.split("/").length - b.path.split("/").length;
-    });
-    for (const entry of sorted) {
-      // 配置目录也属于本地树（挂载时曾被 reconcile 移除），这里不过滤 config 路径
+    // 2) 只补本地缺失（父目录先于子项）
+    const missing = entries
+      .filter((entry) => !internalVault.fileMap?.[entry.path])
+      .sort((a, b) => {
+        if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+        return a.path.split("/").length - b.path.split("/").length;
+      });
+    for (const entry of missing) {
       this.applyLocalEntry(entry, internalVault);
     }
 
     this.refreshFileExplorerViews();
   }
 
-  /** 递归列出本地磁盘条目（非递归 `list` 逐层展开，带 visited 防环）。 */
+  /** 0.2.21 N5：配置目录与回收站不参与本地树还原。 */
+  private isSkippedLocalPath(path: string): boolean {
+    const configDir = String(this.app.vault.configDir ?? "");
+    if (configDir && (path === configDir || path.startsWith(`${configDir}/`))) return true;
+    return path === ".trash" || path.startsWith(".trash/");
+  }
+
+  /**
+   * 递归列出本地磁盘条目（非递归 `list` 逐层展开，带 visited 防环）。
+   *
+   * 0.2.21 N5：跳过 configDir / `.trash`；**不调用 `adapter.stat`**（移动端全库 stat 会卡退出，
+   * 这里放弃 mtime 精确恢复，退出后再由 Obsidian 自己的监听补上）。
+   */
   private async collectLocalEntries(): Promise<VaultTreeEntry[]> {
     const adapter = this.originalAdapter;
     if (!adapter) return [];
@@ -188,25 +208,13 @@ export class VaultMounter {
         continue; // 目录读不到：跳过该层，不让还原失败
       }
       for (const path of listed.folders ?? []) {
-        if (!path || visited.has(path)) continue;
+        if (!path || visited.has(path) || this.isSkippedLocalPath(path)) continue;
         entries.push({ path, type: "folder" });
         queue.push(path);
       }
       for (const path of listed.files ?? []) {
-        if (!path) continue;
-        let stat: Stat | null = null;
-        try {
-          stat = await adapter.stat(path);
-        } catch {
-          stat = null;
-        }
-        entries.push({
-          path,
-          type: "file",
-          ctime: stat?.ctime,
-          mtime: stat?.mtime,
-          size: stat?.size,
-        });
+        if (!path || this.isSkippedLocalPath(path)) continue;
+        entries.push({ path, type: "file" });
       }
     }
     return entries;

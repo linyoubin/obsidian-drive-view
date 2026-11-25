@@ -74,7 +74,7 @@ export interface QuarkDownloadClient {
   downloadFile(fid: string, options?: {
       signal?: { aborted: boolean } | null;
       path?: string;
-      priority?: "interactive" | "background" | "bulk";
+      priority?: "interactive" | "background" | "background-user" | "bulk";
     }): Promise<ArrayBuffer>;
 }
 
@@ -113,7 +113,7 @@ export interface QuarkDownloadUi {
     fid: string;
     sizeBytes: number;
     /** 0.2.19 SF3：取消作用域用（interactive 的下载点取消时不取消）。 */
-    priority?: "interactive" | "background" | "bulk";
+    priority?: "interactive" | "background" | "background-user" | "bulk";
     scope?: string;
   }): QuarkDownloadToken;
   end(token: QuarkDownloadToken | null, outcome: QuarkDownloadEndOutcome): void;
@@ -170,7 +170,11 @@ export interface QuarkReadOnlyAdapterOptions {
   /** 0.2.12：每篇笔记的预取上限（默认 20；0 = 关闭）。 */
   prefetchPerNote?: () => number;
   /** 0.2.11：每次网络下载成功后回调字节数（会话统计用）。 */
-  onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk", path?: string) => void;
+  onDownloaded?: (
+    bytes: number,
+    priority: "interactive" | "background" | "background-user" | "bulk",
+    path?: string
+  ) => void;
   /** 0.2.13：md 正文磁盘缓存（只存 .md；附件永不进 IDB）。 */
   mdStore?: MdStoreType | null;
   /** 0.2.15：当前活动笔记路径（defer 汇总日志用）。 */
@@ -271,7 +275,11 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly onReadonlyWrite?: (info: { operation: string; path: string }) => void;
   private readonly allowPrefetch?: () => boolean;
   private readonly prefetchPerNote?: () => number;
-  private readonly onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk", path?: string) => void;
+  private readonly onDownloaded?: (
+    bytes: number,
+    priority: "interactive" | "background" | "background-user" | "bulk",
+    path?: string
+  ) => void;
   private readonly mdStore?: MdStoreType | null;
   private readonly currentNotePath?: () => string;
   private readonly activeNotePath?: () => string;
@@ -495,6 +503,20 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     }
   }
 
+  /**
+   * 0.2.21 S3：用户点开的附件读取 —— 走 `background-user`（预取让路、取消按钮可取消）。
+   * 预取循环仍用 `readBinary`（普通 background），两者互不影响。
+   */
+  async readBinaryForUser(normalizedPath: string): Promise<ArrayBuffer> {
+    if (this.shouldForward(normalizedPath)) return this.baseAdapter.readBinary(normalizedPath);
+    try {
+      return await this.loadBinary(normalizedPath, "background-user");
+    } catch (error) {
+      this.reportDiagOnce(error, "readBinary", normalizedPath, this.fidOf(normalizedPath));
+      throw error;
+    }
+  }
+
   // ---------------------------------------------------------------- 写 12（只读 no-op，0.2.8）
 
   /**
@@ -615,7 +637,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
    */
   private async loadBinary(
     normalizedPath: string,
-    priorityOverride?: "interactive" | "background" | "bulk"
+    priorityOverride?: "interactive" | "background" | "background-user" | "bulk"
   ): Promise<ArrayBuffer> {
     const clean = normalizeVaultPath(normalizedPath);
     if (!clean) throw new QuarkEntryNotFoundError(clean);
@@ -802,8 +824,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
    * 改前「活动路径 === 附件路径」会把刚点开的图片判成 interactive，
    * 于是默认跳过 interactive 的取消逻辑对它无效。
    */
-  private downloadPriority(path: string): "interactive" | "background" | "bulk" {
-    if (!isMarkdownPath(path)) return "background";
+  private downloadPriority(path: string): "interactive" | "background" | "bulk" {    if (!isMarkdownPath(path)) return "background";
     const active = this.activeNotePath ? String(this.activeNotePath() ?? "") : "";
     if (active && path === active) return "interactive";
     return "bulk";
@@ -983,6 +1004,8 @@ export interface AttachmentWarmupHost {
   now?: () => number;
   /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
   onError?: (path: string, error: unknown) => void;
+  /** 0.2.21 S4：结构化日志（如 `state=skip reason=path-mismatch`）。 */
+  log?: (entry: { path: string; state: string; reason?: string }) => void;
 }
 
 // ------------------------------------------------------------------ 0.2.20 B1/N9：叶子重载与 file-open 绑定
@@ -999,15 +1022,22 @@ export interface RefreshableLeafLike {
 }
 
 /**
- * 0.2.20 B1：按视图类型重载内容。
+ * 0.2.20 B1 / 0.2.21 S4：按视图类型重载内容。
  *
  * - Markdown（有 `getViewData`）且有 `previewMode.rerender` → `rerender(true)`；
  * - 其它视图（图片 / PDF / 媒体）→ `setViewState(getViewState())` 强制重载；
+ * - 传了 `expectedPath` 且叶子已切到别的文件 → `skip`（不重载，避免刷错页）；
  * - 两者都没有 → `none`（不抛）。
  */
-export function reloadLeafView(leaf: RefreshableLeafLike | null | undefined): "rerender" | "reload" | "none" {
+export function reloadLeafView(
+  leaf: RefreshableLeafLike | null | undefined,
+  expectedPath?: string
+): "rerender" | "reload" | "skip" | "none" {
   try {
     const view = leaf?.view;
+    if (expectedPath !== undefined && view?.file?.path !== expectedPath) {
+      return "skip";
+    }
     const previewMode = view?.previewMode;
     const isMarkdown = Boolean(view) && typeof view?.getViewData === "function";
     if (isMarkdown && previewMode && typeof previewMode.rerender === "function") {
@@ -1105,9 +1135,17 @@ export function createAttachmentWarmup(
       return false;
     }
     // 0.2.20 B1：下载完成后按视图类型重载（Markdown → rerender；图片/PDF/媒体 → setViewState）
+    // 0.2.21 S4：叶子已切走（path 不匹配）时不重载，只记日志
     const leaf = host.activeLeaf ? host.activeLeaf() : null;
     if (leaf) {
-      reloadLeafView(leaf);
+      const outcome = reloadLeafView(leaf, clean);
+      if (outcome === "skip") {
+        try {
+          host.log?.({ path: clean, state: "skip", reason: "path-mismatch" });
+        } catch {
+          /* 日志失败不影响已完成的下载 */
+        }
+      }
     } else if (host.redraw) {
       try {
         host.redraw(clean);

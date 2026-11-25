@@ -46,8 +46,9 @@ export interface DownloadBeginInfo {
   /**
    * 0.2.19 SF3：下载优先级。`interactive` = 用户正在打开的正文，
    * 点「取消」时**不得**被取消（只让 bulk/background 让路）。
+   * 0.2.21 S3：`background-user` = 用户点开的附件（优先于预取，但可被取消）。
    */
-  priority?: "interactive" | "background" | "bulk";
+  priority?: "interactive" | "background" | "background-user" | "bulk";
   /** 0.2.19 SF3：发起方标识（按笔记/按调用方），`cancelScope` 只取消同一 scope。 */
   scope?: string;
 }

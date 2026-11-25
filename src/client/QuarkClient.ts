@@ -47,6 +47,12 @@ export const QUARK_RISK_STREAK_THRESHOLD = 5;
 export const QUARK_BREAKER_MS = 10 * 60 * 1000;
 /** 0.2.19 SF4：单次下载的硬超时（默认 20s；超时抛 `QuarkDownloadTimeoutError`）。 */
 export const QUARK_DOWNLOAD_TIMEOUT_MS = 20_000;
+/** 0.2.21 S1：僵尸请求记录的存活上限（超过即强制清理，避免永久毒化 fid）。 */
+export const QUARK_ZOMBIE_TTL_MS = 60_000;
+/** 0.2.21 S1：僵尸记录条数上限（按 fid 记，超出淘汰最旧）。 */
+export const QUARK_ZOMBIE_MAX = 32;
+/** 0.2.21 S2：等待僵尸的上限（实际取 min(zombieTtlMs, 3s)，不复用整段下载超时）。 */
+export const QUARK_ZOMBIE_WAIT_MAX_MS = 3_000;
 
 export interface QuarkHttpRequest {
   url: string;
@@ -251,6 +257,12 @@ export interface QuarkClientOptions {
   diag?: (entry: DiagEntry) => void;
   /** 0.2.19 SF4：单次下载硬超时（毫秒，默认 20s；0 = 关闭）。 */
   downloadTimeoutMs?: number;
+  /** 0.2.21 S1：僵尸记录 TTL（毫秒，默认 60s）。 */
+  zombieTtlMs?: number;
+  /** 0.2.21 S2：等待僵尸的上限（毫秒，默认 3s；实际取 min(zombieTtlMs, 该值)）。 */
+  zombieWaitMs?: number;
+  /** 0.2.21 S1：僵尸记录条数上限，默认 32。 */
+  zombieMax?: number;
 }
 
 export interface TokenBucketOptions {
@@ -263,6 +275,20 @@ export interface TokenBucketOptions {
 /** 0.2.20 N3：单次下载的控制位（外层超时置 aborted，底层据此停止后续跳/重试）。 */
 interface DownloadControl {
   aborted: boolean;
+}
+
+/**
+ * 0.2.21 S1/S2：僵尸记录。
+ *
+ * 下载超时后底层请求仍在跑 → 按 fid 登记；TTL 到期强制清理（不永久毒化 fid），
+ * 成功后把 buffer 留给等待者复用（不白等），失败则下次重下。
+ */
+interface FidZombie {
+  startedAt: number;
+  settled: boolean;
+  value?: ArrayBuffer;
+  error?: unknown;
+  promise: Promise<ArrayBuffer>;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -424,14 +450,19 @@ export class QuarkClient {
   private readonly diag?: (entry: DiagEntry) => void;
   /** 0.2.19 SF4：单次下载硬超时（毫秒；0 = 关闭）。 */
   private readonly downloadTimeoutMs: number;
+  /** 0.2.21 S1：僵尸记录 TTL / 条数上限。 */
+  private readonly zombieTtlMs: number;
+  private readonly zombieMax: number;
+  /** 0.2.21 S2：等待僵尸的上限（实际取 min(zombieTtlMs, 该值)）。 */
+  private readonly zombieWaitMs: number;
   /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
   private authNotified = false;
   /** 0.2.17：请求序号（cookie 合并单调保护用）。 */
   private reqCounter = 0;
   /** 0.2.5：同一 fid 的进行中下载（去重表，完成即清理）。 */
   private readonly inflight = new InflightRequests();
-  /** 0.2.20 N3：超时后仍在跑的「僵尸」请求（同 fid 新请求必须等它结束）。 */
-  private readonly fidZombies = new Map<string, Promise<unknown>>();
+  /** 0.2.20 N3 / 0.2.21 S1-S2：超时后仍在跑的「僵尸」请求（有 TTL/条数上限，成功结果可复用）。 */
+  private readonly fidZombies = new Map<string, FidZombie>();
 
   private riskStreak = 0;
   private breakerOpenUntil = 0;
@@ -454,6 +485,9 @@ export class QuarkClient {
     this.onAuthExpired = options.onAuthExpired;
     this.diag = options.diag;
     this.downloadTimeoutMs = Math.max(0, options.downloadTimeoutMs ?? QUARK_DOWNLOAD_TIMEOUT_MS);
+    this.zombieTtlMs = Math.max(0, options.zombieTtlMs ?? QUARK_ZOMBIE_TTL_MS);
+    this.zombieWaitMs = Math.max(0, options.zombieWaitMs ?? QUARK_ZOMBIE_WAIT_MAX_MS);
+    this.zombieMax = Math.max(1, options.zombieMax ?? QUARK_ZOMBIE_MAX);
     this.downloadGate =
       options.gate ??
       new DownloadGate({
@@ -687,17 +721,16 @@ export class QuarkClient {
     const control: DownloadControl = { aborted: false };
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
     // 0.2.19 SF4：硬超时放在闸门任务内部 —— 超时后闸门槽位与 inflight 表项都会释放
-    // 0.2.20 N3：僵尸等待单独计时；闸门任务只包一层超时，保证超时时槽位立即释放
+    // 0.2.21 S1/S2：先看有没有可复用的僵尸结果（TTL 内成功结果直接复用，否则最多等 min(ttl,3s)）
     const shared = this.inflight.run(fid, async () => {
-      await this.waitForFidZombie(fid, control);
-      if (control.aborted) {
-        throw new QuarkDownloadTimeoutError(`下载超时（>${this.downloadTimeoutMs}ms）`, false);
-      }
+      const reused = await this.reuseFidZombie(fid);
+      if (reused) return reused;
       return await this.downloadGate.run(() => {
         const underlying = this.downloadWithRetry(fid, signal, path, control);
-        // 闸门任务在超时时会提前 reject，但底层请求继续；登记为僵尸，供同 fid 串行等待
-        this.trackFidZombie(fid, underlying);
-        return this.withDownloadTimeout(control, () => underlying);
+        // 超时后底层继续跑：登记为僵尸（有 TTL/条数上限），供同 fid 复用或串行等待
+        return this.withDownloadTimeout(control, () => underlying, () =>
+          this.rememberZombie(fid, underlying)
+        );
       }, { path, priority });
     });
     if (!signal) return shared;
@@ -705,30 +738,38 @@ export class QuarkClient {
   }
 
   /**
-   * 0.2.20 N3：等同一个 fid 的上一个「僵尸」请求结束（避免真实并发 2×）。
-   * 等待本身受同一个超时约束：等不到就放弃（置 aborted），不另发请求。
+   * 0.2.21 S2：复用/等待同一个 fid 的僵尸。
+   *
+   * - TTL 到期 → 强制清理，返回 null（调用方重新发请求，避免永久毒化）；
+   * - 僵尸已成功 → 直接复用它的 buffer（不再发请求）；
+   * - 僵尸失败 → 清理，返回 null；
+   * - 僵尸仍在跑 → 最多等 `min(zombieTtlMs, zombieWaitMs)`；等不到就清理并自行发起。
    */
-  private async waitForFidZombie(fid: string, control: DownloadControl): Promise<void> {
-    const zombie = this.fidZombies.get(fid);
-    if (!zombie) return;
-    const settled = zombie.then(
-      () => undefined,
-      () => undefined
-    );
-    const timeoutMs = this.downloadTimeoutMs;
-    if (!(timeoutMs > 0)) {
-      await settled;
-      return;
+  private async reuseFidZombie(fid: string): Promise<ArrayBuffer | null> {
+    const record = this.fidZombies.get(fid);
+    if (!record) return null;
+    if (this.zombieTtlMs > 0 && this.now() - record.startedAt > this.zombieTtlMs) {
+      this.fidZombies.delete(fid);
+      return null;
+    }
+    if (record.settled) {
+      this.fidZombies.delete(fid);
+      return record.error || !record.value ? null : record.value;
+    }
+    const waitMs = Math.max(0, Math.min(this.zombieTtlMs > 0 ? this.zombieTtlMs : this.zombieWaitMs, this.zombieWaitMs));
+    if (waitMs <= 0) {
+      this.fidZombies.delete(fid);
+      return null;
     }
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       await Promise.race([
-        settled,
-        new Promise<void>((_resolve, reject) => {
-          timer = setTimeout(() => {
-            control.aborted = true;
-            reject(new QuarkDownloadTimeoutError(`下载超时（>${timeoutMs}ms）：等待上一次同 fid 请求结束`, false));
-          }, timeoutMs);
+        record.promise.then(
+          () => undefined,
+          () => undefined
+        ),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, waitMs);
           const maybeUnref = timer as unknown as { unref?: () => void };
           if (typeof maybeUnref.unref === "function") maybeUnref.unref();
         }),
@@ -736,17 +777,46 @@ export class QuarkClient {
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
+    if (record.settled && !record.error && record.value) {
+      this.fidZombies.delete(fid);
+      return record.value;
+    }
+    // 超期/失败：清掉记录，调用方自行发起
+    this.fidZombies.delete(fid);
+    return null;
   }
 
-  private trackFidZombie(fid: string, underlying: Promise<unknown>): void {
-    const tracked = underlying.then(
-      () => undefined,
-      () => undefined
+  /** 0.2.21 S1：登记一个超时后仍在跑的请求（带 TTL 与条数上限）。 */
+  private rememberZombie(fid: string, underlying: Promise<ArrayBuffer>): void {
+    const record: FidZombie = { startedAt: this.now(), settled: false, promise: underlying };
+    this.fidZombies.set(fid, record);
+    this.trimZombies();
+    void underlying.then(
+      (value) => {
+        record.settled = true;
+        record.value = value;
+      },
+      (error) => {
+        record.settled = true;
+        record.error = error;
+      }
     );
-    this.fidZombies.set(fid, tracked);
-    void tracked.then(() => {
-      if (this.fidZombies.get(fid) === tracked) this.fidZombies.delete(fid);
-    });
+  }
+
+  /** 0.2.21 S1：条数上限（32）：超出淘汰最旧的僵尸记录。 */
+  private trimZombies(): void {
+    while (this.fidZombies.size > this.zombieMax) {
+      let oldestFid: string | null = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [fid, record] of this.fidZombies) {
+        if (record.startedAt < oldestAt) {
+          oldestAt = record.startedAt;
+          oldestFid = fid;
+        }
+      }
+      if (!oldestFid) return;
+      this.fidZombies.delete(oldestFid);
+    }
   }
 
   /**
@@ -755,7 +825,11 @@ export class QuarkClient {
    * 超时后：调用方立即拿到 `QuarkDownloadTimeoutError`；同时把 `control.aborted` 置位，
    * 让仍在跑的底层请求**不再发后续跳、不再退避重试**（否则请求数会在超时后继续增长）。
    */
-  private withDownloadTimeout<T>(control: DownloadControl, run: () => Promise<T>): Promise<T> {
+  private withDownloadTimeout<T>(
+    control: DownloadControl,
+    run: () => Promise<T>,
+    onTimeout?: () => void
+  ): Promise<T> {
     const timeoutMs = this.downloadTimeoutMs;
     if (!(timeoutMs > 0)) return run();
     return new Promise<T>((resolve, reject) => {
@@ -764,6 +838,11 @@ export class QuarkClient {
         if (settled) return;
         settled = true;
         control.aborted = true;
+        try {
+          onTimeout?.();
+        } catch {
+          /* 僵尸登记失败不影响超时语义 */
+        }
         reject(new QuarkDownloadTimeoutError(`下载超时（>${timeoutMs}ms）`, false));
       }, timeoutMs);
       const maybeUnref = timer as unknown as { unref?: () => void };
@@ -925,7 +1004,12 @@ export class QuarkClient {
   }
 
   /** 闸门事件埋点（0.2.11）：`stage=gate state=… prio=… waitMs=…`。 */
-  private logGate(event: { state: "queued" | "acquired" | "abandoned"; priority: "i" | "bg" | "bulk"; path: string; waitMs: number }): void {
+  private logGate(event: {
+    state: "queued" | "acquired" | "abandoned";
+    priority: "i" | "bg" | "bg-user" | "bulk";
+    path: string;
+    waitMs: number;
+  }): void {
     try {
       this.diag?.({
         level: "info",

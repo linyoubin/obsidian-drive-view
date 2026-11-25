@@ -208,10 +208,14 @@ export class MdContentStore {
 export interface IdbMdBackendOptions {
   /** 失效重连退避（毫秒），默认 `[300, 900, 2700]`（与 IndexStore 的口径一致）。 */
   reopenDelaysMs?: number[];
+  /** 0.2.21 N6：连续失败多少次后本会话停用 IDB，默认 3。 */
+  disableAfterFailures?: number;
 }
 
 /** 默认重连退避。 */
 export const MD_REOPEN_DELAYS_MS = [300, 900, 2700];
+/** 0.2.21 N6：连续失败 N 次 → 本会话内直接跳过 IDB（避免每篇笔记都等重连退避）。 */
+export const MD_IDB_DISABLE_AFTER_FAILURES = 3;
 
 function errorName(error: unknown): string {
   if (error && typeof error === "object" && typeof (error as { name?: unknown }).name === "string") {
@@ -292,7 +296,10 @@ export function createIdbMdBackend(dbName: string, options: IdbMdBackendOptions 
     return dbPromise;
   };
 
-  const tx = async <T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> => {
+  const txWithReopen = async <T>(
+    mode: IDBTransactionMode,
+    run: (store: IDBObjectStore) => IDBRequest<T>
+  ): Promise<T> => {
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= reopenDelays.length; attempt += 1) {
       const database = await db();
@@ -317,6 +324,28 @@ export function createIdbMdBackend(dbName: string, options: IdbMdBackendOptions 
       }
     }
     throw lastError ?? new Error("IDB transaction failed");
+  };
+
+  // 0.2.21 N6：session 级降级闩 —— 连续失败 N 次后不再尝试连接 IDB
+  const disableAfter = Math.max(1, options.disableAfterFailures ?? MD_IDB_DISABLE_AFTER_FAILURES);
+  let consecutiveFailures = 0;
+  let disabled = false;
+  const disabledError = (): Error => {
+    const error = new Error("md IDB 已停用（本会话连续失败，跳过磁盘缓存）");
+    error.name = "MdIdbDisabledError";
+    return error;
+  };
+  const tx = async <T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> => {
+    if (disabled) throw disabledError();
+    try {
+      const value = await txWithReopen(mode, run);
+      consecutiveFailures = 0;
+      return value;
+    } catch (error) {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= disableAfter) disabled = true;
+      throw error;
+    }
   };
   return {
     get: (path) => tx<MdContentRecord | null>("readonly", (store) => store.get(path) as IDBRequest<MdContentRecord | null>),

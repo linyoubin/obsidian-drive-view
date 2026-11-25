@@ -158,8 +158,8 @@ describe("DownloadGate：并发上限与排队（A2）", () => {
     await Promise.all(tasks);
     expect(observedPeak).toBeLessThanOrEqual(4);
     expect(gate.peak).toBeLessThanOrEqual(4);
-    // 0.2.11：未标优先级 → background 通道（上限 2）
-    expect(gate.peak).toBe(2);
+    // 0.2.21 S3：bg 通道给「用户点开的附件」留 1 个槽位 → 预取（background）峰值 = 1
+    expect(gate.peak).toBe(1);
   });
 
   test("任务异常不泄漏并发槽：失败后下一个仍能跑", async () => {
@@ -475,12 +475,12 @@ describe("DownloadGate：双优先级（0.2.11）", () => {
       await new Promise((resolve) => setTimeout(resolve, 2));
     };
     const background = Array.from({ length: 5 }, (_, i) => gate.run(task(`bg${i}`), { priority: "background" }));
-    // 先启动 2 个 bg；再插 1 个 i
+    // 0.2.21 S3：预取并发上限 = backgroundLimit-1 = 1；再插 1 个 i
     await new Promise((resolve) => setTimeout(resolve, 1));
     const interactive = gate.run(task("i0"), { priority: "interactive" });
     await Promise.all([...background, interactive]);
-    // 前两个是 bg（已在跑），第三个必须是 i，不能是 bg2
-    expect(order.slice(0, 3)).toEqual(["bg0", "bg1", "i0"]);
+    // 预取只占 1 个槽位，第二个启动的必须是 i（interactive 不被预取堵住）
+    expect(order.slice(0, 2)).toEqual(["bg0", "i0"]);
     expect(order).toHaveLength(6);
   });
 

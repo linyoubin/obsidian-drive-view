@@ -45,13 +45,15 @@ const OFFICIAL_DATA_ADAPTER_MEMBERS = [
 
 /**
  * 不属于 DataAdapter 契约的 prototype 成员：
- *   - 夸克扩展：`readForBulk`（bulk 预取） / `prefetchNote`（按笔记预取）
+ *   - 夸克扩展：`readForBulk`（bulk 预取） / `prefetchNote`（按笔记预取） /
+ *     `readBinaryForUser`（0.2.21 S3：用户点开的附件走 background-user）
  *   - 私有辅助方法（TS private 在运行期也在 prototype 上）
  */
 const NON_CONTRACT_MEMBERS = new Set([
   "constructor",
   "readForBulk",
   "prefetchNote",
+  "readBinaryForUser",
   "rejectWrite",
   "shouldForward",
   "findEntry",

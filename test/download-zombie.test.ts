@@ -114,7 +114,7 @@ describe("0.2.20 N3 超时后不再发后续请求", () => {
     const firstOutcome = await first;
     expect(firstOutcome).toBeInstanceOf(QuarkDownloadTimeoutError);
 
-    // 超时后用户重试同一个 fid：必须排队等前一个僵尸结束，而不是立刻再发一份
+    // 超时后用户重试同一个 fid：0.2.21 S2 起复用僵尸成功的结果，而不是再发一份
     const second = client.downloadFile("fid-same").then(
       (buffer) => ({ ok: true as const, body: new TextDecoder().decode(buffer) }),
       (error) => ({ ok: false as const, error })
@@ -130,8 +130,9 @@ describe("0.2.20 N3 超时后不再发后续请求", () => {
     ]);
     expect(secondOutcome.ok).not.toBe("watchdog");
     expect(secondOutcome.ok).toBe(true);
-    if (secondOutcome.ok === true) expect(secondOutcome.body).toBe("second-body");
+    // 僵尸的 buffer 被复用（不再发第二份请求）
+    if (secondOutcome.ok === true) expect(secondOutcome.body).toBe("first-body");
     expect(maxCdnActive).toBe(1);
-    expect(hop2Count).toBe(2);
+    expect(hop2Count).toBe(1);
   });
 });

@@ -15,8 +15,8 @@
  * 事件（0.2.11，供 `stage=gate` 日志）：queued / acquired / abandoned，带 prio 与 waitMs。
  */
 
-export type GatePriority = "interactive" | "background" | "bulk" | "high" | "normal";
-export type GatePriorityClass = "i" | "bg" | "bulk";
+export type GatePriority = "interactive" | "background" | "background-user" | "bulk" | "high" | "normal";
+export type GatePriorityClass = "i" | "bg" | "bg-user" | "bulk";
 export type GateState = "queued" | "acquired" | "abandoned";
 
 /** 可取消信号（结构与 `AbortSignal` 兼容，便于注入）。 */
@@ -93,9 +93,10 @@ export const DEFAULT_BULK_LIMIT = 2;
 /** 401 后的默认冷却：60 秒。 */
 export const DEFAULT_AUTH_COOLDOWN_MS = 60_000;
 
-/** 优先级归一：`high`/`interactive` → i；`normal`/`background` → bg（默认 background）。 */
+/** 优先级归一：`high`/`interactive` → i；`background-user` → bg-user；其余 → bg。 */
 export function normalizeGatePriority(priority: GatePriority | undefined): GatePriorityClass {
   if (priority === "interactive" || priority === "high") return "i";
+  if (priority === "background-user") return "bg-user";
   if (priority === "bulk") return "bulk";
   return "bg";
 }
@@ -105,8 +106,11 @@ export class DownloadGate {
   private readonly onEvent?: (event: GateEvent) => void;
   private interactiveQueue: QueuedTask[] = [];
   private backgroundQueue: QueuedTask[] = [];
+  /** 0.2.21 S3：用户点开的附件（最高 bg 优先级，预取不得堵住它）。 */
+  private backgroundUserQueue: QueuedTask[] = [];
   private interactiveActive = 0;
   private backgroundActive = 0;
+  private backgroundUserActive = 0;
   private bulkQueue: QueuedTask[] = [];
   private bulkActive = 0;
   private peakActive = 0;
@@ -140,9 +144,9 @@ export class DownloadGate {
     return this.backgroundLimitValue;
   }
 
-  /** 正在执行的任务数（两个通道合计）。 */
+  /** 正在执行的任务数（全部通道合计）。 */
   get active(): number {
-    return this.interactiveActive + this.backgroundActive + this.bulkActive;
+    return this.interactiveActive + this.backgroundActive + this.backgroundUserActive + this.bulkActive;
   }
 
   get interactiveActiveCount(): number {
@@ -153,14 +157,24 @@ export class DownloadGate {
     return this.backgroundActive;
   }
 
+  /** 0.2.21 S3：用户点开的附件正在下载数。 */
+  get backgroundUserActiveCount(): number {
+    return this.backgroundUserActive;
+  }
+
   /** 正在执行的 bulk 任务数（0.2.18：failAuth 后必须归零）。 */
   get bulkActiveCount(): number {
     return this.bulkActive;
   }
 
-  /** 排队中的任务数（两个通道合计）。 */
+  /** 排队中的任务数（全部通道合计）。 */
   get pending(): number {
-    return this.interactiveQueue.length + this.backgroundQueue.length + this.bulkQueue.length;
+    return (
+      this.interactiveQueue.length +
+      this.backgroundQueue.length +
+      this.backgroundUserQueue.length +
+      this.bulkQueue.length
+    );
   }
 
   /** 历史并发峰值（单测断言「never 超过配置值」用）。 */
@@ -260,6 +274,7 @@ export class DownloadGate {
   private enqueue(pending: QueuedTask): void {
     if (pending.priority === "i") this.interactiveQueue.push(pending);
     else if (pending.priority === "bulk") this.bulkQueue.push(pending);
+    else if (pending.priority === "bg-user") this.backgroundUserQueue.push(pending);
     else this.backgroundQueue.push(pending);
   }
 
@@ -290,15 +305,31 @@ export class DownloadGate {
 
       // 0.2.16：给 interactive 强制留 1 个槽位
       const lowCap = Math.max(1, this.concurrencyValue - 1);
-      if (this.backgroundActive + this.bulkActive >= lowCap) return;
+      if (this.backgroundActive + this.backgroundUserActive + this.bulkActive >= lowCap) return;
+
+      // 0.2.21 S3：用户点开的附件优先，并可占用为它保留的那个 bg 槽位；
+      // 预取（background）最多占 backgroundLimit-1，避免把用户点击堵在队列里。
+      if (
+        this.backgroundUserQueue.length > 0 &&
+        this.backgroundUserActive < 1 &&
+        this.backgroundActive + this.backgroundUserActive < this.backgroundLimitValue
+      ) {
+        const pending = this.backgroundUserQueue.shift() as QueuedTask;
+        if (!this.start(pending)) continue;
+        continue;
+      }
 
       if (this.backgroundQueue.length > 0) {
-        if (this.backgroundActive < this.backgroundLimitValue) {
+        const prefetchCap = Math.max(1, this.backgroundLimitValue - 1);
+        if (
+          this.backgroundActive < prefetchCap &&
+          this.backgroundActive + this.backgroundUserActive < this.backgroundLimitValue
+        ) {
           const pending = this.backgroundQueue.shift() as QueuedTask;
           if (!this.start(pending)) continue;
           continue;
         }
-        return; // background 在等：bulk 让路
+        return; // 预取额度用完：bulk 让路
       }
 
       if (this.now() < this.bulkPausedUntil) return; // 点击让路：暂停 bulk 3 秒
@@ -341,6 +372,7 @@ export class DownloadGate {
     }
     if (pending.priority === "i") this.interactiveActive += 1;
     else if (pending.priority === "bulk") this.bulkActive += 1;
+    else if (pending.priority === "bg-user") this.backgroundUserActive += 1;
     else this.backgroundActive += 1;
     this.startedCount += 1;
     if (this.active > this.peakActive) this.peakActive = this.active;
@@ -354,6 +386,7 @@ export class DownloadGate {
       .finally(() => {
         if (pending.priority === "i") this.interactiveActive -= 1;
         else if (pending.priority === "bulk") this.bulkActive -= 1;
+        else if (pending.priority === "bg-user") this.backgroundUserActive -= 1;
         else this.backgroundActive -= 1;
         this.pump();
       });

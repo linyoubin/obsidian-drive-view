@@ -606,11 +606,27 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
     // 0.2.18 B1：附件「点开才下」——file-open 打开 jpeg/png/pdf/mp3/mp4 等附件后主动下载并重绘
     this.quarkAttachmentWarmup = createAttachmentWarmup({
-      readBinary: (path) => this.quarkAdapter.readBinary(path),
+      // 0.2.21 S3：用户点开的附件走 background-user（预取让路，取消按钮可取消）
+      readBinary: (path) => this.quarkAdapter.readBinaryForUser(path),
       // 0.2.20 B1：按视图类型重载 —— Markdown 用 previewMode.rerender，图片/PDF/媒体用 setViewState
       activeLeaf: () => this.activeLeaf(),
       // 兜底：拿不到叶子时仍尝试重绘当前活动预览
       redraw: () => this.refreshActivePreview(),
+      // 0.2.21 S4：叶子已切走时不重载，只记日志 state=skip reason=path-mismatch
+      log: (entry) => {
+        try {
+          this.quarkDiag?.log({
+            level: "info",
+            stage: "prefetch",
+            path: entry.path || "/",
+            fid: "-",
+            message: "",
+            fields: { state: entry.state, ...(entry.reason ? { reason: entry.reason } : {}) },
+          });
+        } catch {
+          /* 日志失败不影响阅读 */
+        }
+      },
       onError: (path, error) => {
         console.warn(`[Quark] attachment warmup failed: ${path}`, error);
       },
