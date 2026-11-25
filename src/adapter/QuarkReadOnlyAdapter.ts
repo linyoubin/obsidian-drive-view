@@ -33,7 +33,7 @@ import { DownloadGateError } from "../client/downloadGate";
 import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
 import { attachmentCandidates, extractAttachmentRefs, isMarkdownPath } from "../utils/noteRefs";
 import { MdContentStore } from "../store/MdContentStore";
-import type { MdContentStore as MdStoreType } from "../store/MdContentStore";
+import type { MdContentRecord, MdContentStore as MdStoreType } from "../store/MdContentStore";
 import { ReadOnlyError } from "./readonlyError";
 
 /** 本 adapter 的固定名字（`getName()` 返回值）。 */
@@ -86,7 +86,11 @@ export type QuarkDiagCause =
   | "canceled"
   | "utf8"
   | "empty"
-  | "unknown";
+  | "unknown"
+  /** 0.2.19 B5：md 磁盘缓存（IDB）读写失败，只记日志、不影响正文读取。 */
+  | "cache-get"
+  | "cache-put"
+  | "cache-delete";
 
 /** 一次下载的取消令牌（与 `DownloadToken` 结构兼容）。 */
 export interface QuarkDownloadToken {
@@ -103,7 +107,14 @@ export type QuarkDownloadEndOutcome = "done" | "failed" | "canceled";
  * 只能丢弃结果、停止重试、不写缓存。
  */
 export interface QuarkDownloadUi {
-  begin(info: { path: string; fid: string; sizeBytes: number }): QuarkDownloadToken;
+  begin(info: {
+    path: string;
+    fid: string;
+    sizeBytes: number;
+    /** 0.2.19 SF3：取消作用域用（interactive 的下载点取消时不取消）。 */
+    priority?: "interactive" | "background" | "bulk";
+    scope?: string;
+  }): QuarkDownloadToken;
   end(token: QuarkDownloadToken | null, outcome: QuarkDownloadEndOutcome): void;
 }
 
@@ -611,37 +622,81 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (cached) return cached;
 
     // 0.2.13：内存 LRU → IDB mdContent（只对 md）→ 网络
+    // 0.2.19 B5：磁盘缓存是加速层，**任何** IDB 异常都不得导致正文读取失败
     if (this.mdStore && isMarkdownPath(clean)) {
       const indexed = this.findEntry(clean);
-      const record = await this.mdStore.get(clean);
+      let record: MdContentRecord | null = null;
+      try {
+        record = await this.mdStore.get(clean);
+      } catch (error) {
+        record = null;
+        this.reportDiagnostic({
+          stage: "cache",
+          path: clean,
+          fid: indexed ? indexed.fid : this.fidOf(clean),
+          level: "warn",
+          cause: "cache-get",
+          message: errorText(error),
+          fields: { state: "get-error" },
+        });
+      }
       if (record && indexed && MdContentStore.isValid(record, indexed)) {
         const buffer = record.bytes.buffer.slice(record.bytes.byteOffset, record.bytes.byteOffset + record.bytes.byteLength) as ArrayBuffer;
         this.cache.put(clean, buffer, { fid: indexed.fid, mtime: indexed.mtime });
         this.reportInfo("cache", clean, indexed.fid, { state: "hit-md", bytes: buffer.byteLength });
         return buffer;
       }
-      if (record && indexed) await this.mdStore.delete(clean);
+      if (record && indexed) {
+        try {
+          await this.mdStore.delete(clean);
+        } catch (error) {
+          this.reportDiagnostic({
+            stage: "cache",
+            path: clean,
+            fid: indexed.fid,
+            level: "warn",
+            cause: "cache-delete",
+            message: errorText(error),
+            fields: { state: "delete-error" },
+          });
+        }
+      }
     }
 
     const entry = this.findEntry(clean);
     if (!entry) throw new QuarkEntryNotFoundError(clean);
     if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
 
-    const token = this.downloadUi?.begin({ path: clean, fid: entry.fid, sizeBytes: entry.size }) ?? null;
+    const priority = priorityOverride ?? this.downloadPriority(clean);
+    const token =
+      this.downloadUi?.begin({ path: clean, fid: entry.fid, sizeBytes: entry.size, priority }) ?? null;
     try {
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       const buffer = await this.client.downloadFile(entry.fid, {
         signal: token,
         path: clean,
-        priority: priorityOverride ?? this.downloadPriority(clean),
+        priority,
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
       // 0.2.13：md 正文同时落 IDB（附件永不进 IDB）
+      // 0.2.19 B5：put 失败只记 cause=cache-put，正文照常返回
       if (this.mdStore && isMarkdownPath(clean)) {
-        await this.mdStore.put(clean, buffer, { fid: entry.fid, size: entry.size, mtime: entry.mtime });
+        try {
+          await this.mdStore.put(clean, buffer, { fid: entry.fid, size: entry.size, mtime: entry.mtime });
+        } catch (error) {
+          this.reportDiagnostic({
+            stage: "cache",
+            path: clean,
+            fid: entry.fid,
+            level: "warn",
+            cause: "cache-put",
+            message: errorText(error),
+            fields: { state: "put-error", bytes: buffer.byteLength },
+          });
+        }
       }
-      this.onDownloaded?.(buffer.byteLength, priorityOverride ?? this.downloadPriority(clean), clean);
+      this.onDownloaded?.(buffer.byteLength, priority, clean);
       this.downloadUi?.end(token, "done");
       return buffer;
     } catch (error) {

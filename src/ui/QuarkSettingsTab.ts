@@ -7,6 +7,7 @@
 
 import * as obsidianRuntime from "obsidian";
 import type { App, Plugin } from "obsidian";
+import { diagLogPath } from "../utils/diagLog";
 
 /** 登录态：未登录 / 已登录 / 已过期（有 cookie 但缺 `__pus` 判据）。 */
 export type QuarkLoginState = "none" | "active" | "expired";
@@ -598,9 +599,11 @@ export class QuarkSettingsTab extends settingTabBase() {
     });
 
     // 0.2.3 A7：出错时把最近 200 行诊断日志复制走（日志不含 cookie 与正文）
+    // 0.2.19：日志路径随 configDir（不再写死 .obsidian）
+    const diagPath = diagLogPath(this.app.vault.configDir);
     new Setting(container)
       .setName("诊断")
-      .setDesc("打开失败等异常会记到 .obsidian/plugins/drive-view/quark-debug.log（不含 cookie 与正文）")
+      .setDesc(`打开失败等异常会记到 ${diagPath}（不含 cookie 与正文）`)
       .addButton((button: any) =>
         button.setButtonText("导出诊断").onClick(async () => {
           await this.host.quarkExportDiagnostics();

@@ -44,6 +44,8 @@ export const QUARK_DEFAULT_RATE = 3;
 export const QUARK_RISK_STREAK_THRESHOLD = 5;
 /** 熔断时长：10 分钟。 */
 export const QUARK_BREAKER_MS = 10 * 60 * 1000;
+/** 0.2.19 SF4：单次下载的硬超时（默认 20s；超时抛 `QuarkDownloadTimeoutError`）。 */
+export const QUARK_DOWNLOAD_TIMEOUT_MS = 20_000;
 
 export interface QuarkHttpRequest {
   url: string;
@@ -246,6 +248,8 @@ export interface QuarkClientOptions {
   onAuthExpired?: () => void;
   /** 0.2.10：下载两跳埋点出口（main 注入 DiagLogger.log）。 */
   diag?: (entry: DiagEntry) => void;
+  /** 0.2.19 SF4：单次下载硬超时（毫秒，默认 20s；0 = 关闭）。 */
+  downloadTimeoutMs?: number;
 }
 
 export interface TokenBucketOptions {
@@ -273,6 +277,8 @@ export class TokenBucket {
   private tokens: number;
   private lastRefillAt: number;
   private waitedMs = 0;
+  /** 0.2.19 SF1：acquire 串行链（并发调用按到达顺序排队，不会读到同一个 now）。 */
+  private chain: Promise<void> = Promise.resolve();
 
   constructor(options: TokenBucketOptions = {}) {
     this.rate = Math.max(0.001, options.ratePerSecond ?? QUARK_DEFAULT_RATE);
@@ -288,22 +294,38 @@ export class TokenBucket {
     return this.waitedMs;
   }
 
-  /** 取一个令牌；返回本次实际等待的毫秒数（0 = 未受限）。 */
+  /**
+   * 取一个令牌；返回本次实际等待的毫秒数（0 = 未受限）。
+   *
+   * 0.2.19 SF1：并发安全 —— 用 `chain` 串行化「读令牌 → 计算等待 → 扣令牌」，
+   * 每次 acquire 原子地占用下一个槽位。改前 10 个并发都算出同一个 waitMs，
+   * sleep 结束后集体放行（3 req/s 的桶实测 ≈30 req/s）。
+   */
   async acquire(): Promise<number> {
-    this.refill();
-    if (this.tokens >= 1) {
-      this.tokens -= 1;
-      return 0;
+    let release!: () => void;
+    const previous = this.chain;
+    this.chain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      this.refill();
+      if (this.tokens >= 1) {
+        this.tokens -= 1;
+        return 0;
+      }
+      // 缺口按速率换算成等待时长；等待后按等待时长补令牌（不依赖注入时钟是否前进）
+      const deficit = 1 - this.tokens;
+      const waitMs = Math.max(1, Math.ceil((deficit / this.rate) * 1000));
+      await this.sleep(waitMs);
+      this.waitedMs += waitMs;
+      this.tokens = Math.min(this.capacity, this.tokens + (waitMs / 1000) * this.rate);
+      this.tokens = Math.max(0, this.tokens - 1);
+      this.lastRefillAt = this.now();
+      return waitMs;
+    } finally {
+      release();
     }
-    // 缺口按速率换算成等待时长；等待后按等待时长补令牌（不依赖注入时钟是否前进）
-    const deficit = 1 - this.tokens;
-    const waitMs = Math.max(1, Math.ceil((deficit / this.rate) * 1000));
-    await this.sleep(waitMs);
-    this.waitedMs += waitMs;
-    this.tokens = Math.min(this.capacity, this.tokens + (waitMs / 1000) * this.rate);
-    this.tokens = Math.max(0, this.tokens - 1);
-    this.lastRefillAt = this.now();
-    return waitMs;
   }
 
   private refill(): void {
@@ -394,6 +416,8 @@ export class QuarkClient {
   private readonly onAuthExpired?: () => void;
   /** 0.2.10：下载两跳埋点（main 注入 DiagLogger.log）。 */
   private readonly diag?: (entry: DiagEntry) => void;
+  /** 0.2.19 SF4：单次下载硬超时（毫秒；0 = 关闭）。 */
+  private readonly downloadTimeoutMs: number;
   /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
   private authNotified = false;
   /** 0.2.17：请求序号（cookie 合并单调保护用）。 */
@@ -421,6 +445,7 @@ export class QuarkClient {
     this.authCooldownMs = Math.max(1, options.authCooldownMs ?? DEFAULT_AUTH_COOLDOWN_MS);
     this.onAuthExpired = options.onAuthExpired;
     this.diag = options.diag;
+    this.downloadTimeoutMs = Math.max(0, options.downloadTimeoutMs ?? QUARK_DOWNLOAD_TIMEOUT_MS);
     this.downloadGate =
       options.gate ??
       new DownloadGate({
@@ -651,11 +676,61 @@ export class QuarkClient {
     const path = options.path || fid;
     const priority = options.priority ?? "background";
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
+    // 0.2.19 SF4：硬超时放在闸门任务内部 —— 超时后闸门槽位与 inflight 表项都会释放
     const shared = this.inflight.run(fid, () =>
-      this.downloadGate.run(() => this.downloadWithRetry(fid, signal, path), { path, priority })
+      this.downloadGate.run(
+        () => this.withDownloadTimeout(this.downloadWithRetry(fid, signal, path)),
+        { path, priority }
+      )
     );
     if (!signal) return shared;
     return this.raceCallerCancel(shared, signal);
+  }
+
+  /**
+   * 0.2.19 SF4：单次下载硬超时。
+   *
+   * 之前只有「transport 自己抛超时」才会进入超时分支；transport 永不 resolve 时
+   * `downloadFile` 永远挂着、inflight 表项也永不释放。这里用 `Promise.race` 兜底，
+   * 超时抛 `QuarkDownloadTimeoutError(retried=false)`，由 inflight 的 finally 清理表项。
+   */
+  private withDownloadTimeout<T>(task: Promise<T>): Promise<T> {
+    const timeoutMs = this.downloadTimeoutMs;
+    if (!(timeoutMs > 0)) return task;
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new QuarkDownloadTimeoutError(`下载超时（>${timeoutMs}ms）`, false));
+      }, timeoutMs);
+      const maybeUnref = timer as unknown as { unref?: () => void };
+      if (typeof maybeUnref.unref === "function") maybeUnref.unref();
+      task.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  /** 0.2.19 SF4：进行中的下载数（超时/失败后必须归零；观测与单测用）。 */
+  get inflightCount(): number {
+    return this.inflight.size;
+  }
+
+  /** 进行中的下载 key（fid 列表）。 */
+  inflightKeys(): string[] {
+    return this.inflight.keys();
   }
 
   /**

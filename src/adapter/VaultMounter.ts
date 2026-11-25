@@ -1,6 +1,26 @@
-import { App, DataAdapter, MarkdownView, TFile, TFolder } from "obsidian";
+import type { App, DataAdapter, MarkdownView, Stat, TFile, TFolder } from "obsidian";
 import { getParentPath, isConfigOrInternalPath } from "../utils/pathUtils";
-import { ObsidianVaultRawEvent } from "./GoogleDriveDataAdapter";
+import type { ObsidianVaultRawEvent } from "./GoogleDriveDataAdapter";
+
+/**
+ * 运行期不 import `obsidian` 的值（`TFile/TFolder/MarkdownView` 改成结构判定）：
+ * 这样 VaultMounter 能在单测里直接 import，不需要整进程 mock Obsidian。
+ */
+function isFolderNode(node: unknown): boolean {
+  return Boolean(node) && Array.isArray((node as { children?: unknown }).children);
+}
+
+interface MarkdownViewLike {
+  file?: { path?: string } | null;
+  getViewData(): string;
+  setViewData(data: string, clear: boolean): void;
+}
+
+function isMarkdownViewLike(view: unknown): view is MarkdownViewLike {
+  if (!view || typeof view !== "object") return false;
+  const candidate = view as { getViewData?: unknown; setViewData?: unknown };
+  return typeof candidate.getViewData === "function" && typeof candidate.setViewData === "function";
+}
 
 /**
  * VaultMounter 实际只依赖这三样能力，因此入口参数不再绑定 Google Drive 的具体类（T-10 放宽）：
@@ -67,14 +87,7 @@ export class VaultMounter {
     }
 
     // Stop local filesystem watcher on the stub folder while virtual adapter is active
-    const anyOriginal = this.originalAdapter as DataAdapter & {
-      stopWatch?: () => Promise<void> | void;
-    };
-    try {
-      await anyOriginal.stopWatch?.();
-    } catch {
-      // Ignore if stopWatch is not supported on this platform
-    }
+    await this.stopLocalWatch();
 
     this.app.vault.adapter = mountable.createProxiedAdapter();
     this.mounted = true;
@@ -84,6 +97,9 @@ export class VaultMounter {
 
   /**
    * Flushes pending writes and restores the original native `DataAdapter`.
+   *
+   * 0.2.19 B3：只换回 adapter 不够 —— 云端合成节点会留在 `Vault.fileMap`、
+   * 本地文件也回不来。顺序：停监听 → 恢复 base adapter → 按本地磁盘重建 fileMap → 重启本地监听。
    */
   public async unmount(mountable?: VaultMountable): Promise<void> {
     if (!this.mounted || !this.originalAdapter) return;
@@ -94,8 +110,123 @@ export class VaultMounter {
       console.warn("[VaultMounter] Error flushing pending uploads on unmount:", err);
     }
 
+    await this.stopLocalWatch();
     this.app.vault.adapter = this.originalAdapter;
     this.mounted = false;
+    await this.rebuildFileMapFromLocal();
+    this.startLocalWatch();
+  }
+
+  /** 停掉本地文件监听（mount/unmount 都调用；不支持此能力的平台静默忽略）。 */
+  private async stopLocalWatch(): Promise<void> {
+    const original = this.originalAdapter as (DataAdapter & { stopWatch?: () => Promise<void> | void }) | null;
+    if (!original) return;
+    try {
+      await original.stopWatch?.();
+    } catch {
+      // Ignore if stopWatch is not supported on this platform
+    }
+  }
+
+  /** 重启本地文件监听（unmount 还原后必须重新盯本地磁盘）。 */
+  private startLocalWatch(): void {
+    const original = this.originalAdapter as (DataAdapter & {
+      startWatch?: () => Promise<void> | void;
+    }) | null;
+    if (!original) return;
+    try {
+      void original.startWatch?.();
+    } catch {
+      // Ignore if startWatch is not supported on this platform
+    }
+  }
+
+  /**
+   * 0.2.19 B3：清掉 `Vault.fileMap` 里所有非根节点，再按**本地磁盘**重建。
+   * 这样云端合成节点（含目录）不会残留，本地文件也重新回到 fileMap。
+   */
+  public async rebuildFileMapFromLocal(): Promise<void> {
+    const internalVault = this.app.vault as InternalVault;
+    if (!internalVault.fileMap) return;
+
+    const existing = Object.keys(internalVault.fileMap)
+      .filter((path) => path !== "/")
+      .sort((a, b) => b.length - a.length);
+    for (const path of existing) {
+      const item = internalVault.fileMap[path];
+      internalVault.onChange?.(isFolderNode(item) ? "folder-removed" : "file-removed", path);
+    }
+
+    const entries = await this.collectLocalEntries();
+    const sorted = [...entries].sort((a, b) => {
+      if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+      return a.path.split("/").length - b.path.split("/").length;
+    });
+    for (const entry of sorted) {
+      // 配置目录也属于本地树（挂载时曾被 reconcile 移除），这里不过滤 config 路径
+      this.applyLocalEntry(entry, internalVault);
+    }
+
+    this.refreshFileExplorerViews();
+  }
+
+  /** 递归列出本地磁盘条目（非递归 `list` 逐层展开，带 visited 防环）。 */
+  private async collectLocalEntries(): Promise<VaultTreeEntry[]> {
+    const adapter = this.originalAdapter;
+    if (!adapter) return [];
+    const entries: VaultTreeEntry[] = [];
+    const queue: string[] = [""];
+    const visited = new Set<string>();
+    while (queue.length > 0) {
+      const dir = queue.shift() as string;
+      if (visited.has(dir)) continue;
+      visited.add(dir);
+      let listed: { files?: string[]; folders?: string[] };
+      try {
+        listed = await adapter.list(dir);
+      } catch {
+        continue; // 目录读不到：跳过该层，不让还原失败
+      }
+      for (const path of listed.folders ?? []) {
+        if (!path || visited.has(path)) continue;
+        entries.push({ path, type: "folder" });
+        queue.push(path);
+      }
+      for (const path of listed.files ?? []) {
+        if (!path) continue;
+        let stat: Stat | null = null;
+        try {
+          stat = await adapter.stat(path);
+        } catch {
+          stat = null;
+        }
+        entries.push({
+          path,
+          type: "file",
+          ctime: stat?.ctime,
+          mtime: stat?.mtime,
+          size: stat?.size,
+        });
+      }
+    }
+    return entries;
+  }
+
+  /** 把一个本地条目写回 fileMap（不过滤配置目录，与 `applyVaultRawEvent` 的过滤策略不同）。 */
+  private applyLocalEntry(entry: VaultTreeEntry, internalVault: InternalVault): void {
+    if (entry.type === "folder") {
+      this.ensureParentFoldersInVault(entry.path, internalVault);
+      if (!this.app.vault.getAbstractFileByPath(entry.path)) {
+        internalVault.onChange?.("folder-created", entry.path);
+      }
+      return;
+    }
+    this.ensureParentFoldersInVault(entry.path, internalVault);
+    const stat = { ctime: entry.ctime ?? 0, mtime: entry.mtime ?? 0, size: entry.size ?? 0 };
+    internalVault.onChange?.("raw", entry.path, entry.path, stat);
+    if (!this.app.vault.getAbstractFileByPath(entry.path)) {
+      internalVault.onChange?.("file-created", entry.path, entry.path, stat);
+    }
   }
 
   /**
@@ -205,7 +336,7 @@ export class VaultMounter {
       for (const path of existingPaths) {
         if (!virtualPaths.has(path) || isConfigOrInternalPath(path, configDir)) {
           const item = internalVault.fileMap[path];
-          const isFolder = item instanceof TFolder;
+          const isFolder = isFolderNode(item);
           internalVault.onChange?.(isFolder ? "folder-removed" : "file-removed", path);
         }
       }
@@ -251,7 +382,7 @@ export class VaultMounter {
 
       for (const leaf of leaves) {
         const view = leaf.view;
-        if (view instanceof MarkdownView && view.file?.path === normalizedPath) {
+        if (isMarkdownViewLike(view) && (view as { file?: { path?: string } | null }).file?.path === normalizedPath) {
           const anyView = view as MarkdownView & {
             data?: string;
             lastSavedData?: string;

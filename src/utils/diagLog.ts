@@ -63,7 +63,11 @@ export type DiagCause =
   | "readonly"
   | "utf8"
   | "empty"
-  | "unknown";
+  | "unknown"
+  /** 0.2.19 B5：md 磁盘缓存（IDB）读写失败。 */
+  | "cache-get"
+  | "cache-put"
+  | "cache-delete";
 
 /** 结构化附加字段（0.2.10 埋点）：按插入顺序写在 `fid` 之后、`msg` 之前。 */
 export type DiagFields = Record<string, string | number | boolean>;

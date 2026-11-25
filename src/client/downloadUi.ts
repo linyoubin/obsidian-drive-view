@@ -43,6 +43,13 @@ export interface DownloadBeginInfo {
   fid: string;
   /** 文件大小（未知为 0）。 */
   sizeBytes: number;
+  /**
+   * 0.2.19 SF3：下载优先级。`interactive` = 用户正在打开的正文，
+   * 点「取消」时**不得**被取消（只让 bulk/background 让路）。
+   */
+  priority?: "interactive" | "background" | "bulk";
+  /** 0.2.19 SF3：发起方标识（按笔记/按调用方），`cancelScope` 只取消同一 scope。 */
+  scope?: string;
 }
 
 /** 字节数 → `12.3 MB` / `640 KB` / `900 B`。 */
@@ -162,13 +169,46 @@ export class DownloadNoticeBook {
     this.hide();
   }
 
-  /** 取消当前所有下载（同一时刻最多 2 个并发）：标记 `aborted`，提示换成「已取消下载」。 */
-  cancelAll(): void {
-    for (const token of this.active.keys()) token.aborted = true;
+  /**
+   * 取消下载（0.2.19 SF3：取消有作用域）。
+   *
+   * - 默认**不取消** `priority=interactive` 的下载（用户正在看的正文）；
+   * - 传 `scope` 时只取消该发起方的下载；
+   * - 返回实际标记取消的数量。
+   */
+  cancelAll(options: { scope?: string; includeInteractive?: boolean } = {}): number {
+    const includeInteractive = options.includeInteractive === true;
+    const scope = options.scope;
+    let canceled = 0;
+    for (const [token, info] of this.active) {
+      if (scope !== undefined && info.scope !== scope) continue;
+      if (!includeInteractive && info.priority === "interactive") continue;
+      token.aborted = true;
+      canceled += 1;
+    }
+    if (canceled > 0) {
+      this.noticeText = "已取消下载";
+      if (this.notice && typeof this.notice.setMessage === "function") {
+        this.notice.setMessage(this.noticeText);
+      }
+    }
+    return canceled;
+  }
+
+  /** 0.2.19 SF3：只取消某个发起方自己的下载（interactive 仍受保护）。 */
+  cancelScope(scope: string): number {
+    return this.cancelAll({ scope });
+  }
+
+  /** 0.2.19 SF3：只取消一个令牌（调用方自己放弃自己的等待）。 */
+  cancelToken(token: DownloadToken | null): boolean {
+    if (!token || token.aborted) return false;
+    token.aborted = true;
     this.noticeText = "已取消下载";
     if (this.notice && typeof this.notice.setMessage === "function") {
       this.notice.setMessage(this.noticeText);
     }
+    return true;
   }
 
   /** 插件卸载/重置时隐藏并清空。 */

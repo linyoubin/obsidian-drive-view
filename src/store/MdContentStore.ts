@@ -205,9 +205,37 @@ export class MdContentStore {
 }
 
 /** 运行期 IndexedDB 后端（桌面/移动 WebView 通用）。 */
-export function createIdbMdBackend(dbName: string): MdContentBackend {
+export interface IdbMdBackendOptions {
+  /** 失效重连退避（毫秒），默认 `[300, 900, 2700]`（与 IndexStore 的口径一致）。 */
+  reopenDelaysMs?: number[];
+}
+
+/** 默认重连退避。 */
+export const MD_REOPEN_DELAYS_MS = [300, 900, 2700];
+
+function errorName(error: unknown): string {
+  if (error && typeof error === "object" && typeof (error as { name?: unknown }).name === "string") {
+    return (error as { name: string }).name;
+  }
+  return "";
+}
+
+/** iOS 挂起 / 另一个标签页升级后，旧 IDB 句柄会抛这两个错误名（与 IndexStore 同口径）。 */
+export function isMdInvalidStateError(error: unknown): boolean {
+  const name = errorName(error);
+  return name === "InvalidStateError" || name === "TransactionInactiveError";
+}
+
+function idbSleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+export function createIdbMdBackend(dbName: string, options: IdbMdBackendOptions = {}): MdContentBackend {
   const idb = (globalThis as unknown as { indexedDB?: IDBFactory }).indexedDB;
   if (!idb) return new MemoryMdContentBackend();
+  const reopenDelays = (options.reopenDelaysMs ?? MD_REOPEN_DELAYS_MS).map((ms) =>
+    Number.isFinite(ms) ? Math.max(0, ms) : 0
+  );
   const openDb = (): Promise<IDBDatabase> =>
     new Promise((resolve, reject) => {
       const request = idb.open(dbName, 1);
@@ -219,18 +247,76 @@ export function createIdbMdBackend(dbName: string): MdContentBackend {
       request.onerror = () => reject(request.error);
     });
   let dbPromise: Promise<IDBDatabase> | null = null;
+
+  /** 0.2.19 B5：丢弃失效句柄（关闭旧 DB），下一次操作重新 open。 */
+  const resetDb = (): void => {
+    const pending = dbPromise;
+    dbPromise = null;
+    if (!pending) return;
+    void pending
+      .then((database) => {
+        try {
+          database.close();
+        } catch {
+          /* 已关闭 */
+        }
+      })
+      .catch(() => undefined);
+  };
+
+  const openOnce = (): Promise<IDBDatabase> =>
+    openDb()
+      .then((database) => {
+        try {
+          // 另一个标签页升级版本：关掉自己的句柄，让下次操作重开
+          database.onversionchange = () => {
+            try {
+              database.close();
+            } catch {
+              /* 已关闭 */
+            }
+            resetDb();
+          };
+        } catch {
+          /* 某些 WebView 的 db 对象是只读代理 */
+        }
+        return database;
+      })
+      .catch((error) => {
+        dbPromise = null;
+        throw error;
+      });
+
   const db = (): Promise<IDBDatabase> => {
-    if (!dbPromise) dbPromise = openDb();
+    if (!dbPromise) dbPromise = openOnce();
     return dbPromise;
   };
+
   const tx = async <T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> => {
-    const database = await db();
-    return await new Promise<T>((resolve, reject) => {
-      const transaction = database.transaction("mdContent", mode);
-      const request = run(transaction.objectStore("mdContent"));
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= reopenDelays.length; attempt += 1) {
+      const database = await db();
+      try {
+        return await new Promise<T>((resolve, reject) => {
+          const transaction = database.transaction("mdContent", mode);
+          // 0.2.19 B5：补 onabort/onerror，事务中断时拒绝而不是让 Promise 永远挂着
+          transaction.onabort = () =>
+            reject(transaction.error ?? new Error("IDB transaction aborted"));
+          transaction.onerror = () =>
+            reject(transaction.error ?? new Error("IDB transaction error"));
+          const request = run(transaction.objectStore("mdContent"));
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      } catch (error) {
+        lastError = error;
+        if (!isMdInvalidStateError(error) || attempt >= reopenDelays.length) throw error;
+        resetDb();
+        const delay = reopenDelays[attempt];
+        if (delay > 0) await idbSleep(delay);
+      }
+    }
+    throw lastError ?? new Error("IDB transaction failed");
   };
   return {
     get: (path) => tx<MdContentRecord | null>("readonly", (store) => store.get(path) as IDBRequest<MdContentRecord | null>),

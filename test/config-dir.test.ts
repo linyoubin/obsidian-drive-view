@@ -185,4 +185,13 @@ describe("0.2.18 B2 configDir 贯通", () => {
       diagOption: true,
     });
   });
+
+  test("设置页诊断文案随 configDir（不再写死 .obsidian/plugins/drive-view）", async () => {
+    const source = await Bun.file(new URL("../src/ui/QuarkSettingsTab.ts", import.meta.url)).text();
+    const found = {
+      hardcoded: source.includes(".obsidian/plugins/drive-view/quark-debug.log"),
+      usesHelper: source.includes("diagLogPath("),
+    };
+    expect(found).toEqual({ hardcoded: false, usesHelper: true });
+  });
 });
