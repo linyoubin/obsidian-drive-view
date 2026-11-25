@@ -397,11 +397,11 @@ describe("QuarkClient：Cookie 自管 / 401 判定 / 退避与熔断", () => {
     expect(store.getHeader()).toContain("__puus=renewed");
   });
 
-  test("HTTP 401 → QuarkAuthError（不重试）", async () => {
+  test("HTTP 401 → QuarkAuthError（0.2.17：重读 cookie 后重试 1 次）", async () => {
     const { transport, calls } = makeTransport(() => jsonResponse(401, { code: 31001, message: "guest" }));
     const client = new QuarkClient({ transport, limiter: idleLimiter() });
     await expect(client.listDir("0", { all: false })).rejects.toBeInstanceOf(QuarkAuthError);
-    expect(calls.length).toBe(1);
+    expect(calls.length).toBe(2);
   });
 
   test("HTTP 200 但 code=31001 → QuarkAuthError", async () => {

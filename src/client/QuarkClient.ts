@@ -396,6 +396,8 @@ export class QuarkClient {
   private readonly diag?: (entry: DiagEntry) => void;
   /** 同一失效期内只回调一次（main.ts 只弹一次 Notice）。 */
   private authNotified = false;
+  /** 0.2.17：请求序号（cookie 合并单调保护用）。 */
+  private reqCounter = 0;
   /** 0.2.5：同一 fid 的进行中下载（去重表，完成即清理）。 */
   private readonly inflight = new InflightRequests();
 
@@ -449,6 +451,11 @@ export class QuarkClient {
   resetAuth(): void {
     this.authNotified = false;
     this.downloadGate.resetAuth();
+    try {
+      this.diag?.({ level: "info", stage: "auth", path: "/", fid: "-", message: "state=circuit-closed" });
+    } catch {
+      /* 日志失败忽略 */
+    }
   }
 
   /** 观测快照：请求数、风控连击、熔断状态、当前 Cookie 名。 */
@@ -813,6 +820,11 @@ export class QuarkClient {
     if (this.authNotified) return;
     this.authNotified = true;
     try {
+      this.diag?.({ level: "warn", stage: "auth", path: "/", fid: "-", message: "state=circuit-open" });
+    } catch {
+      /* 日志失败忽略 */
+    }
+    try {
       this.onAuthExpired?.();
     } catch {
       /* 回调失败不影响请求处理 */
@@ -892,8 +904,9 @@ export class QuarkClient {
   }
 
   /** 唯一出网口：限速 → 注入 Cookie → 发请求 → 合并 set-cookie（并尽力持久化）。 */
-  private async send(request: QuarkHttpRequest): Promise<QuarkHttpResponse> {
+  private async send(request: QuarkHttpRequest, retriedAuth = false): Promise<QuarkHttpResponse> {
     await this.limiter.acquire();
+    const reqSeq = ++this.reqCounter;
 
     const headers: Record<string, string> = {
       "User-Agent": this.userAgent,
@@ -921,7 +934,7 @@ export class QuarkClient {
       body: request.body,
     });
 
-    const applied = this.cookieStore.applySetCookie(response ? response.headers : null);
+    const applied = this.cookieStore.applySetCookie(response ? response.headers : null, reqSeq);
     this.lastSetCookieNames = applied.names;
     if (applied.names.length > 0) {
       // 响应里有 set-cookie 就回写；持久化失败不影响本次请求
@@ -930,6 +943,15 @@ export class QuarkClient {
       } catch {
         /* CookieStore.save 自己吞异常，这里兜一层防御 */
       }
+    }
+    // 0.2.17：401 → 先从 secretStorage 重读 cookie，再重试 1 次；仍 401 才熔断
+    if (response && response.status === 401 && !retriedAuth) {
+      try {
+        await this.cookieStore.load();
+      } catch {
+        /* 读失败按原样重试 */
+      }
+      return this.send(request, true);
     }
     return response;
   }

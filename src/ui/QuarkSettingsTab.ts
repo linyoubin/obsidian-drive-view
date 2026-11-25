@@ -263,7 +263,7 @@ export function describeRibbonTooltip(snapshot: QuarkUiSnapshot): string {
     }
     return "同步夸克 · 已登录";
   }
-  if (snapshot.loginState === "expired") return "同步夸克 · 已登录（过期）";
+  if (snapshot.loginState === "expired") return "同步夸克 · 已登录（过期）· 需重新扫码";
   return "同步夸克 · 未登录";
 }
 

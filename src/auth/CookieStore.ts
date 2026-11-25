@@ -63,6 +63,8 @@ export interface CookieStoreOptions {
   pairs?: string[] | string;
   /** 持久化失败回调（静默降级为纯内存，不抛给调用方）。 */
   onPersistError?: (error: unknown) => void;
+  /** 0.2.17：cookie merge 日志（seq + name + 8 位 hash，绝不记录明文）。 */
+  onCookieMerge?: (event: { seq: number; name: string; hash: string }) => void;
 }
 
 function isStringArray(value: unknown): value is string[] {
@@ -310,6 +312,10 @@ export class CookieStore {
   private readonly storageKey: string;
   private readonly secretId: string;
   private readonly onPersistError?: (error: unknown) => void;
+  private readonly onCookieMerge?: (event: { seq: number; name: string; hash: string }) => void;
+  /** 0.2.17：cookie 合并单调序号（防乱序覆盖）。 */
+  private mergeSeq = 0;
+  private readonly seqByName = new Map<string, number>();
   /** 0.2.15：secretStorage 失败一次后本会话永久降级（不重试、不重复打日志）。 */
   private secretDisabled = false;
 
@@ -320,6 +326,7 @@ export class CookieStore {
     this.storageKey = options.storageKey ?? DEFAULT_COOKIE_STORAGE_KEY;
     this.secretId = sanitizeSecretId(options.secretId ?? QUARK_SECRET_ID);
     this.onPersistError = options.onPersistError;
+    this.onCookieMerge = options.onCookieMerge;
     if (options.pairs !== undefined) this.setPairs(options.pairs);
   }
 
@@ -395,11 +402,27 @@ export class CookieStore {
    */
   applySetCookie(
     headers: HeaderBag | Record<string, unknown> | null | undefined,
+    reqSeq?: number,
     now: number = Date.now()
   ): { names: string[]; header: string; total: number; removed: string[] } {
-    const raws = collectSetCookieValues(headers);
+    this.mergeSeq += 1;
+    const seq = typeof reqSeq === "number" && Number.isFinite(reqSeq) ? reqSeq : this.mergeSeq;
+    // 0.2.17：__puus 只接受「发起序号不小于已合并序号」的值（晚到的旧响应丢弃）
+    const raws = collectSetCookieValues(headers).filter((raw) => {
+      const match = /^\s*([^=;\s]+)=/.exec(raw);
+      const name = match ? match[1] : "";
+      if (name !== "__puus") return true;
+      return seq >= (this.seqByName.get("__puus") ?? -1);
+    });
     const result = mergeSetCookies(this.pairs, raws, now);
     this.pairs = result.pairs;
+    for (const name of result.applied) {
+      this.seqByName.set(name, Math.max(seq, this.seqByName.get(name) ?? -1));
+      if (name === "__puus") {
+        const pair = this.pairs.find((item) => item.startsWith("__puus=")) ?? "";
+        this.onCookieMerge?.({ seq, name, hash: hash8(pair.slice("__puus=".length)) });
+      }
+    }
     return { names: result.applied, header: this.getHeader(), total: this.pairs.length, removed: result.removed };
   }
 
@@ -482,4 +505,11 @@ export function migrateLegacyCookieData(
   const removed = typeof source[key] === "string" && source[key] !== "";
   if (removed) delete source[key];
   return { data: source, removed };
+}
+/** 8 位非明文 hash（0.2.17 日志用；不记录 cookie 值）。 */
+export function hash8(value: string): string {
+  let hash = 5381;
+  const text = String(value ?? "");
+  for (let i = 0; i < text.length; i += 1) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }

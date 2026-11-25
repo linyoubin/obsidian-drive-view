@@ -50,6 +50,7 @@ import type { DownloadNoticeLike } from "./client/downloadUi";
 import { createPathThrottle, normalizeVaultPath } from "./utils/pathUtils";
 import { formatBuiltAt } from "./ui/QuarkSettingsTab";
 import { decideAfterLogin } from "./auth/loginDecision";
+import { AuthNoticeGate, QUARK_AUTH_FAILED_TEXT, QUARK_AUTH_READ_BLOCKED_TEXT } from "./ui/authNotice";
 import { planBulkMarkdown, runBulkPrefetch } from "./prefetch/bulkPrefetch";
 import { MdContentStore, createIdbMdBackend } from "./store/MdContentStore";
 import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
@@ -174,6 +175,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkStatBg = { downloads: 0, bytes: 0 };
   private quarkStatBulk = { downloads: 0, bytes: 0 };
   private quarkFileOpenRef: { ref?: unknown } | null = null;
+  private readonly quarkAuthGate = new AuthNoticeGate();
+  private quarkAuthNotice: Notice | null = null;
   /** 0.2.13：md 磁盘缓存与统计。 */
   private quarkMdStore: MdContentStore | null = null;
   private quarkMdStats = { count: 0, bytes: 0 };
@@ -795,6 +798,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           this.lastPersistedQuarkCookie = this.quarkCookieStore.getHeader();
           // 重新扫码成功：解除 401 熔断与「已过期」状态
           this.quarkAuthExpired = false;
+          this.quarkAuthGate.reset();
+          if (this.quarkAuthNotice) {
+            try { (this.quarkAuthNotice as unknown as { hide?: () => void }).hide?.(); } catch { /* ignore */ }
+            this.quarkAuthNotice = null;
+          }
           this.quarkClient.resetAuth();
           this.refreshQuarkUi();
           new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），继续…`, 4000);
@@ -946,6 +954,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
     const path = workspace.activeLeaf?.view?.file?.path ?? "";
     this.quarkLastNotePath = path;
+    // 0.2.17：熔断期间点开笔记 → 额外提示一次（同一失效期只一次）
+    if (this.quarkAuthExpired && this.quarkAuthGate.shouldShow()) {
+      new Notice(QUARK_AUTH_READ_BLOCKED_TEXT, 8000);
+    }
     this.quarkLastNotePrefetch = 0;
     if (!path || !/\.(md|markdown)$/i.test(path) || !this.quarkAdapter) {
       this.refreshQuarkUi();
@@ -1325,10 +1337,18 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
   /** 401 熔断回调（同一失效期客户端只回调一次）：只弹一次提醒并刷新 tooltip。 */
   private onQuarkAuthExpired(): void {
-    if (!this.quarkAuthExpired) {
-      new Notice("夸克：登录已失效，请重新扫码（点左侧「同步夸克」图标）", 10000);
-    }
     this.quarkAuthExpired = true;
+    if (this.quarkAuthGate.shouldShow()) {
+      // 0.2.17：常驻提示（不自动消失），带「重新扫码」按钮
+      const notice = new Notice(QUARK_AUTH_FAILED_TEXT, 0);
+      try {
+        const noticeEl = (notice as unknown as { noticeEl?: { createEl?: (tag: string, opts?: { text?: string }) => HTMLElement } }).noticeEl;
+        const button = noticeEl?.createEl?.("button", { text: "重新扫码" });
+        if (!button) throw new Error("no noticeEl");
+        button.addEventListener("click", () => { void this.quarkOpenQrModal(); });
+      } catch { /* 按钮失败不影响提示 */ }
+      this.quarkAuthNotice = notice;
+    }
     this.refreshQuarkUi();
   }
 

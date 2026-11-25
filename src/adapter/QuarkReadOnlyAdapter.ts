@@ -289,6 +289,16 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
 
   // ---------------------------------------------------------------- 同步 2
 
+  /** 0.2.17：FileSystemAdapter 兼容方法（Obsidian 内部偶有调用；缺了会 `undefined.then`）。 */
+  getBasePath(): string {
+    return "";
+  }
+
+  /** 0.2.17：同上——库内绝对路径在虚拟库里不存在，返回空串。 */
+  getFullPath(normalizedPath: string): string {
+    return normalizeVaultPath(normalizedPath) ? `/${normalizeVaultPath(normalizedPath)}` : "/";
+  }
+
   getName(): string {
     return QUARK_ADAPTER_NAME;
   }

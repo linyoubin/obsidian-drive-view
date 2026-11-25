@@ -430,7 +430,7 @@ describe("库根状态与 ribbon tooltip（T-10 A5/A6）", () => {
     expect(new Set([none, loggedIn, syncing, synced]).size).toBe(4);
     // 登录已过期：不误报「未登录」，提示要重新扫码
     expect(settingsTab.describeRibbonTooltip(snapshot({ loginState: "expired" }))).toBe(
-      "同步夸克 · 已登录（过期）"
+      "同步夸克 · 已登录（过期）· 需重新扫码"
     );
   });
 
@@ -562,7 +562,7 @@ describe("ribbon 固定图标与五态后缀文字（0.2.5 A6′）", () => {
       "同步夸克 · 已登录",
       "同步夸克 · 同步中 29% · /技术",
       "同步夸克 · 已同步（索引 2026-11-20 15:40 · 128 条）",
-      "同步夸克 · 已登录（过期）",
+      "同步夸克 · 已登录（过期）· 需重新扫码",
     ]);
     expect(new Set(texts).size).toBe(5);
     for (const text of texts) expect(text.startsWith("同步夸克 · ")).toBe(true);
@@ -641,5 +641,12 @@ describe("设置页唯一注册入口（0.2.6）", () => {
     expect(quark).toContain("Google Drive 旧功能仍可在命令面板使用");
     expect(quark).toContain("sync-now / flush-uploads / rebuild-cache");
     expect(quark).toContain("其专属设置页已不再注册");
+  });
+});
+
+describe("0.2.17 熔断 UI 文案", () => {
+  test("登录过期 tooltip 含「需重新扫码」", () => {
+    const snapshot = { ...settingsTab.EMPTY_QUARK_SNAPSHOT, loginState: "expired" as const };
+    expect(settingsTab.describeRibbonTooltip(snapshot)).toContain("需重新扫码");
   });
 });
