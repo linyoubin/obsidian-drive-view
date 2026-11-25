@@ -34,6 +34,13 @@ export interface ContentCacheOptions {
   now?: () => number;
   /** 逐出回调（诊断/状态栏用）。 */
   onEvict?: (path: string, bytes: number) => void;
+  /**
+   * blob URL 延迟释放的毫秒数（0.2.9，默认 60s）：
+   * 已渲染的 `<img>` 可能还引用旧 URL，立刻 revoke 会变破图。
+   */
+  revokeDelayMs?: number;
+  /** 延迟执行的调度器（单测注入），默认 setTimeout。 */
+  schedule?: (callback: () => void, ms: number) => void;
 }
 
 /** 一条缓存条目的公开信息（不含内容本身）。 */
@@ -125,6 +132,12 @@ export class ContentCache {
   private readonly revokeUrl: (url: string) => void;
   private readonly now: () => number;
   private readonly onEvict?: (path: string, bytes: number) => void;
+  private readonly revokeDelayMs: number;
+  private readonly schedule: (callback: () => void, ms: number) => void;
+  private prefetchActive = false;
+  private prefetchLoader: ContentLoader | null = null;
+  private prefetchOnLoaded: ((path: string) => void) | null = null;
+  private prefetchWaiter: (() => void) | null = null;
 
   private readonly entries = new Map<string, CacheEntry>();
   private totalBytes = 0;
@@ -138,6 +151,12 @@ export class ContentCache {
     this.revokeUrl = options.revokeObjectUrl ?? defaultRevokeObjectUrl;
     this.now = options.now ?? ((): number => Date.now());
     this.onEvict = options.onEvict;
+    this.revokeDelayMs = Math.max(0, options.revokeDelayMs ?? 60_000);
+    this.schedule =
+      options.schedule ?? ((callback, ms) => {
+        const timer = setTimeout(callback, ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      });
   }
 
   get maxBytes(): number {
@@ -205,12 +224,12 @@ export class ContentCache {
    * 写入内容。
    *
    * - 单条大于总上限 → 不缓存（返回 `cached:false`，避免进来就把别的全挤掉）；
-   * - 写入后超限则从最旧开始逐出，逐出的条目会 `revokeUrl`。
+   * - **0 字节也缓存**（0.2.9：空文件是合法内容），只是不生成 blob URL；
+   * - 写入后超限则从最旧开始逐出，逐出条目的 URL **延迟 60 秒** revoke（避免已渲染图片变破图）。
    */
   put(path: string, data: ArrayBuffer | Uint8Array, meta: ContentMeta = {}): PutResult {
     if (!path) return { cached: false, evicted: [] };
     const bytes = byteLengthOf(data as ArrayBuffer);
-    if (bytes <= 0) return { cached: false, evicted: [] };
     if (bytes > this.maxBytesValue) return { cached: false, evicted: [] };
 
     const evicted: string[] = [];
@@ -227,7 +246,8 @@ export class ContentCache {
     const entry: CacheEntry = {
       path,
       bytes,
-      url: this.createUrl(buffer),
+      // 0 字节不生成 blob URL（空 Blob 没有展示意义），但仍缓存内容
+      url: bytes > 0 ? this.createUrl(buffer) : "",
       fid: typeof meta.fid === "string" ? meta.fid : "",
       mtime: typeof meta.mtime === "number" ? meta.mtime : 0,
       loadedAt: this.now(),
@@ -292,8 +312,12 @@ export class ContentCache {
    * 执行预取队列：每批最多 `prefetchLimit`（5）个并发，批间串行。
    *
    * 加载失败不计入缓存、不重试（一期口径：手动/按需）。
+   * `onLoaded(path)` 在每个附件**真正写入缓存后**回调（0.2.9：main 用它触发一次轻量重绘）。
    */
-  async runPrefetch(loader: ContentLoader): Promise<PrefetchResult> {
+  async runPrefetch(
+    loader: ContentLoader,
+    onLoaded?: (path: string) => void
+  ): Promise<PrefetchResult> {
     const result: PrefetchResult = { loaded: 0, failed: 0, skipped: 0, bytes: 0 };
     if (typeof loader !== "function") return result;
 
@@ -301,15 +325,15 @@ export class ContentCache {
       const batch = this.queue.splice(0, this.prefetchLimitValue);
       const outcomes = await Promise.all(
         batch.map(async (item) => {
-          if (this.entries.has(item.path)) return { status: "skipped" as const, bytes: 0 };
+          if (this.entries.has(item.path)) return { status: "skipped" as const, bytes: 0, path: item.path };
           try {
             const data = await loader(item.path);
-            const bytes = byteLengthOf(data);
-            if (bytes <= 0) return { status: "skipped" as const, bytes: 0 };
+            // 0.2.9：0 字节也是合法内容，照常缓存（只是没有 blob URL）
             const put = this.put(item.path, data);
-            return put.cached ? { status: "loaded" as const, bytes } : { status: "skipped" as const, bytes: 0 };
+            if (!put.cached) return { status: "skipped" as const, bytes: 0, path: item.path };
+            return { status: "loaded" as const, bytes: byteLengthOf(data), path: item.path };
           } catch {
-            return { status: "failed" as const, bytes: 0 };
+            return { status: "failed" as const, bytes: 0, path: item.path };
           }
         })
       );
@@ -317,6 +341,13 @@ export class ContentCache {
         if (outcome.status === "loaded") {
           result.loaded += 1;
           result.bytes += outcome.bytes;
+          if (onLoaded) {
+            try {
+              onLoaded(outcome.path);
+            } catch {
+              /* 回调异常不影响预取 */
+            }
+          }
         } else if (outcome.status === "failed") {
           result.failed += 1;
         } else {
@@ -325,6 +356,58 @@ export class ContentCache {
       }
     }
     return result;
+  }
+
+  /**
+   * 启动预取循环（0.2.9，幂等）：队列非空就持续消化，队列空时短轮询等待。
+   * 由 main 在**挂载成功后**调用；`stopPrefetchLoop()` 在卸载/退出时停止。
+   */
+  startPrefetchLoop(loader: ContentLoader, options: { onLoaded?: (path: string) => void } = {}): void {
+    if (this.prefetchActive) return;
+    if (typeof loader !== "function") return;
+    this.prefetchActive = true;
+    this.prefetchLoader = loader;
+    this.prefetchOnLoaded = options.onLoaded ?? null;
+    void this.prefetchLoop();
+  }
+
+  /** 停止预取循环（幂等）。 */
+  stopPrefetchLoop(): void {
+    this.prefetchActive = false;
+    this.prefetchLoader = null;
+    this.prefetchOnLoaded = null;
+    const waiter = this.prefetchWaiter;
+    this.prefetchWaiter = null;
+    if (waiter) waiter();
+  }
+
+  /** 预取循环是否在跑（观测/单测用）。 */
+  get prefetchRunning(): boolean {
+    return this.prefetchActive;
+  }
+
+  private async prefetchLoop(): Promise<void> {
+    while (this.prefetchActive && this.prefetchLoader) {
+      if (this.queue.length === 0) {
+        await this.waitPrefetchTick();
+        continue;
+      }
+      try {
+        await this.runPrefetch(this.prefetchLoader, this.prefetchOnLoaded ?? undefined);
+      } catch {
+        /* 单轮失败继续下一轮 */
+      }
+    }
+  }
+
+  private waitPrefetchTick(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.prefetchWaiter = resolve;
+      this.schedule(() => {
+        if (this.prefetchWaiter === resolve) this.prefetchWaiter = null;
+        resolve();
+      }, 200);
+    });
   }
 
   /** 便捷方法：入队 + 立即执行。 */
@@ -345,7 +428,19 @@ export class ContentCache {
     if (!entry) return;
     this.entries.delete(path);
     this.totalBytes = Math.max(0, this.totalBytes - entry.bytes);
-    if (entry.url) this.revokeUrl(entry.url);
+    if (entry.url) {
+      // 0.2.9：延迟 revoke——已渲染的 <img> 可能还引用这个 blob URL，立刻释放会变破图
+      if (this.revokeDelayMs <= 0) {
+        this.revokeUrl(entry.url);
+      } else {
+        const url = entry.url;
+        try {
+          this.schedule(() => this.revokeUrl(url), this.revokeDelayMs);
+        } catch {
+          this.revokeUrl(url);
+        }
+      }
+    }
     evicted.push(path);
     if (this.onEvict) {
       try {

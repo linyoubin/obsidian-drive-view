@@ -16,6 +16,7 @@ import {
   createIdbBackend,
   diffEntries,
   indexDbNameForVault,
+  normalizeQuarkMtime,
   type IdbFactoryLike,
   type IndexEntry,
   type ScanProgress,
@@ -568,5 +569,17 @@ describe("IndexStore：扫描的原子替换（T-10 A9）", () => {
     expect(store.entryCount).toBe(1);
     expect(store.entries[0].path).toBe("new.md");
     expect(store.entries.some((item) => item.path === "old.md")).toBe(false);
+  });
+});
+// ------------------------------------------------------------------ mtime 单位归一（0.2.9）
+
+describe("IndexStore：mtime 单位归一（0.2.9）", () => {
+  test("秒级 updated_at 归一为毫秒；毫秒级原样；0/非法值 → 0", () => {
+    expect(normalizeQuarkMtime(1_700_000_000)).toBe(1_700_000_000_000); // 10 位秒
+    expect(normalizeQuarkMtime(1_700_000_000_123)).toBe(1_700_000_000_123); // 13 位毫秒
+    expect(normalizeQuarkMtime(0)).toBe(0);
+    expect(normalizeQuarkMtime(-1)).toBe(0);
+    expect(normalizeQuarkMtime("1700000000")).toBe(1_700_000_000_000);
+    expect(normalizeQuarkMtime(Number.NaN)).toBe(0);
   });
 });

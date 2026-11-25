@@ -286,13 +286,13 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
   test("stat：文件/目录/根/缺失四种", async () => {
     const { adapter, client } = makeAdapter();
     const file = await adapter.stat("folder/b.md");
-    expect(file).toEqual({ type: "file", ctime: 200, mtime: 200, size: 22 });
+    expect(file).toEqual({ type: "file", ctime: 200_000, mtime: 200_000, size: 22 });
     const folder = await adapter.stat("folder");
     expect(folder!.type).toBe("folder");
     expect(folder!.size).toBe(0);
     const root = await adapter.stat("");
     expect(root!.type).toBe("folder");
-    expect(root!.mtime).toBe(200); // 全库最新 updated_at
+    expect(root!.mtime).toBe(200_000); // 全库最新 updated_at（秒级已归一为毫秒，0.2.9）
     await expect(adapter.stat("nope.md")).resolves.toBeNull();
     expect(client.calls).toEqual([]);
   });

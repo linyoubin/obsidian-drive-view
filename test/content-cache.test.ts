@@ -29,7 +29,7 @@ interface Harness {
   evicted: Array<{ path: string; bytes: number }>;
 }
 
-function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetchMaxBytes?: number } = {}): Harness {
+function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetchMaxBytes?: number; revokeDelayMs?: number } = {}): Harness {
   const created: string[] = [];
   const revoked: string[] = [];
   const evicted: Array<{ path: string; bytes: number }> = [];
@@ -37,6 +37,7 @@ function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetc
     maxBytes: options.maxBytes ?? 100,
     prefetchLimit: options.prefetchLimit ?? DEFAULT_PREFETCH_LIMIT,
     prefetchMaxBytes: options.prefetchMaxBytes ?? DEFAULT_PREFETCH_MAX_BYTES,
+    revokeDelayMs: options.revokeDelayMs ?? 0,
     createObjectUrl: () => {
       const url = `blob:fake-${created.length + 1}`;
       created.push(url);
@@ -101,12 +102,16 @@ describe("ContentCache：读写与上限", () => {
     expect(cache.bytes).toBe(40);
   });
 
-  test("空内容/空路径不缓存", () => {
-    const { cache } = makeCache();
+  test("空路径不缓存；0 字节文件照常缓存（0.2.9，但不生成 blob URL）", () => {
+    const { cache, created } = makeCache();
     expect(cache.put("", buffer(10)).cached).toBe(false);
-    expect(cache.put("a.md", buffer(0)).cached).toBe(false);
-    expect(cache.size).toBe(0);
+    const empty = cache.put("empty.md", buffer(0));
+    expect(empty.cached).toBe(true);
+    expect(cache.size).toBe(1);
     expect(cache.bytes).toBe(0);
+    expect(cache.peek("empty.md")!.url).toBe("");
+    expect(cache.get("empty.md")!.byteLength).toBe(0);
+    expect(created.length).toBe(0);
   });
 });
 
@@ -277,5 +282,66 @@ describe("ContentCache：预取闸门与批大小", () => {
     });
     expect(called).toBe(0);
     expect(result.loaded).toBe(0);
+  });
+});
+
+// ------------------------------------------------------------------ 预取循环与延迟 revoke（0.2.9）
+
+describe("ContentCache：预取循环（0.2.9）", () => {
+  test("startPrefetchLoop 幂等启动并消化队列；stopPrefetchLoop 停止；每个附件成功后回调", async () => {
+    const { cache } = makeCache({ prefetchLimit: 2 });
+    const loaded: string[] = [];
+    cache.enqueuePrefetch([{ path: "img/a.png" }, { path: "img/b.png" }]);
+    const loader = async (path: string) => buffer(10);
+    cache.startPrefetchLoop(loader, { onLoaded: (path) => loaded.push(path) });
+    cache.startPrefetchLoop(loader); // 幂等：不应重复启动
+    expect(cache.prefetchRunning).toBe(true);
+    for (let i = 0; i < 400; i += 1) {
+      if (cache.has("img/a.png") && cache.has("img/b.png")) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(cache.has("img/a.png")).toBe(true);
+    expect(cache.has("img/b.png")).toBe(true);
+    expect(cache.pendingPrefetch).toBe(0);
+    expect(loaded.sort()).toEqual(["img/a.png", "img/b.png"]);
+    cache.stopPrefetchLoop();
+    expect(cache.prefetchRunning).toBe(false);
+  });
+
+  test("0 字节附件也会被预取缓存（不再因 bytes<=0 跳过）", async () => {
+    const { cache } = makeCache();
+    cache.enqueuePrefetch([{ path: "empty.md" }]);
+    const result = await cache.runPrefetch(async () => buffer(0));
+    expect(result.loaded).toBe(1);
+    expect(cache.has("empty.md")).toBe(true);
+    expect(cache.peek("empty.md")!.url).toBe("");
+  });
+});
+
+describe("ContentCache：blob URL 延迟 revoke（0.2.9）", () => {
+  test("逐出后 60s 才 revoke（期间不立刻释放，避免已渲染图片变破图）", () => {
+    const created: string[] = [];
+    const revoked: string[] = [];
+    const scheduled: Array<{ callback: () => void; ms: number }> = [];
+    const cache = new ContentCache({
+      maxBytes: 60,
+      createObjectUrl: () => {
+        const url = `blob:fake-${created.length + 1}`;
+        created.push(url);
+        return url;
+      },
+      revokeObjectUrl: (url: string) => revoked.push(url),
+      revokeDelayMs: 60_000,
+      schedule: (callback, ms) => scheduled.push({ callback, ms }),
+    });
+    cache.put("a.md", buffer(40));
+    const aUrl = cache.peek("a.md")!.url;
+    cache.put("b.md", buffer(40)); // 超限 → 逐出 a
+    expect(cache.has("a.md")).toBe(false);
+    expect(revoked).toEqual([]); // 还没释放
+    expect(scheduled.length).toBe(1);
+    expect(scheduled[0].ms).toBe(60_000);
+    scheduled[0].callback(); // 60s 后
+    expect(revoked).toEqual([aUrl]);
   });
 });

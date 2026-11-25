@@ -47,7 +47,7 @@ import type { QuarkFlowEvent, QuarkHost, QuarkUiSnapshot } from "./ui/QuarkSetti
 import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { DownloadNoticeBook } from "./client/downloadUi";
 import type { DownloadNoticeLike } from "./client/downloadUi";
-import { normalizeVaultPath } from "./utils/pathUtils";
+import { createPathThrottle, normalizeVaultPath } from "./utils/pathUtils";
 import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
 import type { DiagAdapterLike } from "./utils/diagLog";
 
@@ -155,6 +155,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkDownloadBook: DownloadNoticeBook | null = null;
   private quarkAuthExpired = false;
   private quarkRollback: ((info: { operation: string; path: string }) => void) | null = null;
+  private readonly quarkPreviewThrottle = createPathThrottle(1000);
   private lastSettingsRefreshAt = 0;
 
   private statusBarItemEl: HTMLElement | null = null;
@@ -258,6 +259,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public async onunload(): Promise<void> {
     this.stopPollingTimer();
     hideQuarkSyncNotice();
+    // 0.2.9：预取循环随插件卸载停止
+    this.quarkCache?.stopPrefetchLoop();
     await this.mounter.unmount(this.driveAdapter);
     // 夸克只读库：若是我们挂的，随插件卸载一起还原原生 adapter
     if (this.quarkMounted) {
@@ -660,6 +663,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       await this.mounter.unmount(this.createQuarkMountFacade());
       this.quarkMounted = false;
     }
+    // 0.2.9：改库根时停止预取（旧库的附件不该再下载）
+    this.quarkCache.stopPrefetchLoop();
     await this.quarkIndex.clearAll();
     this.quarkCache.clear();
     await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
@@ -799,6 +804,53 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     }
   }
 
+  /**
+   * 启动预取循环（0.2.9）：`getResourcePath` 未命中时 adapter 会入队，但之前没人消费，
+   * 图片/PDF 永远拿不到 blob URL。这里用 adapter.readBinary 作为 loader（下载即写缓存），
+   * 每成功预取一个附件就触发一次**节流**的轻量重绘，让 `<img>` 重新取 getResourcePath。
+   */
+  private startQuarkPrefetch(): void {
+    if (!this.quarkCache || !this.quarkAdapter) return;
+    this.quarkCache.startPrefetchLoop((path) => this.quarkAdapter.readBinary(path), {
+      onLoaded: () => this.refreshQuarkPreviews(),
+    });
+  }
+
+  /** 预取完成后的轻量重绘：优先 `previewMode.rerender(true)`，拿不到时回退 `setViewState(getViewState())`。同一文件 1s 内最多 1 次。 */
+  private refreshQuarkPreviews(): void {
+    const workspace = this.app.workspace as unknown as {
+      iterateAllLeaves(callback: (leaf: unknown) => void): void;
+    };
+    try {
+      workspace.iterateAllLeaves((raw) => {
+        const leaf = raw as {
+          view?: {
+            file?: { path?: string } | null;
+            previewMode?: { rerender?: (force?: boolean) => void } | null;
+          } | null;
+          getViewState?: () => unknown;
+          setViewState?: (state: unknown) => Promise<void>;
+        };
+        const path = leaf?.view?.file?.path ?? "";
+        if (!this.quarkPreviewThrottle(path)) return;
+        try {
+          const previewMode = leaf.view?.previewMode;
+          if (previewMode && typeof previewMode.rerender === "function") {
+            previewMode.rerender(true);
+            return;
+          }
+          if (typeof leaf.getViewState === "function" && typeof leaf.setViewState === "function") {
+            void leaf.setViewState(leaf.getViewState());
+          }
+        } catch {
+          /* 重绘失败不影响预取 */
+        }
+      });
+    } catch {
+      /* workspace 不可用：忽略 */
+    }
+  }
+
   /** 索引诊断（0.2.7）：同步完成后记录条目数 / 目录数 / 前 5 条路径，便于对照真机表现。 */
   private logQuarkIndexDiag(): void {
     try {
@@ -845,6 +897,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkMounted = true;
     this.refreshQuarkUi();
     new Notice(`夸克：只读库已挂载（${this.quarkIndex.entryCount} 条）`, 5000);
+    // 0.2.9：挂载成功后启动预取循环（getResourcePath 未命中入队的附件由这里消化）
+    this.startQuarkPrefetch();
   }
 
   /** 卸载（QuarkHost 的「退出只读模式」）：还原原生 adapter 并释放内存缓存。 */
@@ -856,6 +910,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     } else {
       new Notice("夸克：只读库当前未挂载");
     }
+    // 0.2.9：卸载时停止预取循环（不再往已卸载的库下载附件）
+    this.quarkCache.stopPrefetchLoop();
     this.quarkCache.clear();
     this.refreshQuarkUi();
   }

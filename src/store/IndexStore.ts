@@ -117,6 +117,19 @@ export function indexDbNameForVault(vaultName: string): string {
   return `obsidian-quark-index-${safe}`;
 }
 
+/** 小于该阈值的时间戳视为「秒」，归一化时 ×1000（0.2.9）。 */
+export const QUARK_SECONDS_MTIME_MAX = 1e12;
+
+/**
+ * 夸克 `updated_at` 单位归一（0.2.9）：`< 1e12` 视为秒 → ×1000，其余原样。
+ * 返回毫秒时间戳（Obsidian `Stat.mtime` 的口径）。
+ */
+export function normalizeQuarkMtime(value: unknown): number {
+  const numeric = typeof value === "number" && Number.isFinite(value) ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return numeric < QUARK_SECONDS_MTIME_MAX ? Math.round(numeric * 1000) : Math.round(numeric);
+}
+
 function cloneEntry(entry: IndexEntry): IndexEntry {
   return {
     path: entry.path,
@@ -124,7 +137,7 @@ function cloneEntry(entry: IndexEntry): IndexEntry {
     fid: String(entry.fid ?? ""),
     parentFid: String(entry.parentFid ?? ""),
     size: Number.isFinite(entry.size) ? Number(entry.size) : 0,
-    mtime: Number.isFinite(entry.mtime) ? Number(entry.mtime) : 0,
+    mtime: normalizeQuarkMtime(entry.mtime),
   };
 }
 

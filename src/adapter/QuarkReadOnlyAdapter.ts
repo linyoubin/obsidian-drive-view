@@ -21,6 +21,7 @@
 
 import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from "obsidian";
 
+import { normalizeQuarkMtime } from "../store/IndexStore";
 import type { IndexEntry } from "../store/IndexStore";
 import {
   QuarkAuthError,
@@ -282,12 +283,14 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       for (const entry of this.index.entries) {
         if (entry.mtime > mtime) mtime = entry.mtime;
       }
-      return { type: "folder", ctime: mtime, mtime, size: 0 };
+      return { type: "folder", ctime: mtime, mtime: normalizeQuarkMtime(mtime), size: 0 };
     }
     const entry = this.findEntry(clean);
     if (!entry) return null;
     // 索引里没有 ctime（夸克只给 updated_at），ctime 取 mtime 兜底
-    return { type: entry.type, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
+    // 0.2.9：mtime 统一成毫秒（秒级 updated_at 在 IndexStore 已归一，这里再兜一层）
+    const mtime = normalizeQuarkMtime(entry.mtime);
+    return { type: entry.type, ctime: mtime, mtime, size: entry.size };
   }
 
   /** 非递归：只返回直接子项（完整库内路径，与 Obsidian 约定一致）。 */

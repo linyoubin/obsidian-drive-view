@@ -2,6 +2,26 @@
  * Pure cross-platform path and binary utilities (works on Desktop Electron and Mobile iOS/Android Capacitor).
  */
 
+/**
+ * 按 path 的节流闸（0.2.9）：同一 path 在 `windowMs` 内只放行一次。
+ * 用于「预取完成 → 轻量重绘」：一次预取 20 张图只重绘每个文件 1 次（1s 窗口）。
+ */
+export function createPathThrottle(
+  windowMs = 1000,
+  now: () => number = () => Date.now()
+): (path: string) => boolean {
+  const lastAt = new Map<string, number>();
+  const window = Math.max(0, windowMs);
+  return (path: string): boolean => {
+    const key = String(path ?? "");
+    const at = now();
+    const previous = lastAt.get(key);
+    if (previous !== undefined && at - previous < window) return false;
+    lastAt.set(key, at);
+    return true;
+  };
+}
+
 export function normalizeVaultPath(rawPath: string): string {
   if (!rawPath) return "";
   let cleaned = rawPath.replace(/\\/g, "/").trim();
