@@ -15,6 +15,8 @@ export type QuarkLoginState = "none" | "active" | "expired";
 export interface QuarkUiSnapshot {
   loginState: QuarkLoginState;
   cookieNameCount: number;
+  /** 0.2.15：secretStorage 是否可用（false → 登录入口禁用）。 */
+  secretAvailable: boolean;
   rootPath: string;
   rootChosen: boolean;
   indexCount: number;
@@ -39,6 +41,9 @@ export interface QuarkUiSnapshot {
   prefetchPerNote: number;
   /** 0.2.13：全库 md 正文预取开关。 */
   prefetchAllMarkdown: boolean;
+  /** 0.2.13：md 磁盘正文缓存统计。 */
+  mdCount: number;
+  mdBytes: number;
   /** 0.2.13：bulk 进度（已下载/总数/字节/状态）。 */
   bulkDone: number;
   bulkTotal: number;
@@ -71,11 +76,13 @@ export interface QuarkHost {
   quarkSetPrefetchPerNote(value: number): Promise<void>;
   quarkSetPrefetchAllMarkdown(value: boolean): Promise<void>;
   quarkCancelBulkPrefetch(): void;
+  quarkClearMdCache(): Promise<void>;
 }
 
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   loginState: "none",
   cookieNameCount: 0,
+  secretAvailable: true,
   rootPath: "/",
   rootChosen: false,
   indexCount: 0,
@@ -99,6 +106,8 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   bulkTotal: 0,
   bulkBytes: 0,
   bulkState: "idle",
+  mdCount: 0,
+  mdBytes: 0,
   sessionDownloads: 0,
   sessionBytes: 0,
 };
@@ -454,6 +463,15 @@ export class QuarkSettingsTab extends settingTabBase() {
         })
       );
 
+    // 0.2.15：凭据存储只允许 secretStorage（Obsidian 1.11.4+）
+    new Setting(container)
+      .setName("凭据存储")
+      .setDesc(
+        snapshot.secretAvailable
+          ? "secretStorage（系统密钥链）"
+          : "需要 Obsidian 1.11.4 及以上（当前 secretStorage 不可用），扫码登录已禁用"
+      );
+
     new Setting(container)
       .setName("索引状态")
       .setDesc(describeIndexState(snapshot));
@@ -554,6 +572,18 @@ export class QuarkSettingsTab extends settingTabBase() {
       );
 
     new Setting(container)
+      .setName("正文缓存（磁盘 IndexedDB，仅 md）")
+      .setDesc(
+        `磁盘 ${(snapshot.mdBytes / (1024 * 1024)).toFixed(2)} MB / ${snapshot.mdCount} 篇 · 内存 ${(snapshot.cacheBytes / (1024 * 1024)).toFixed(2)} MB / ${(snapshot.cacheMaxBytes / (1024 * 1024)).toFixed(0)} MB`
+      )
+      .addButton((button: any) =>
+        button.setButtonText("清空磁盘正文").setWarning().onClick(async () => {
+          await this.host.quarkClearMdCache();
+          this.display();
+        })
+      );
+
+    new Setting(container)
       .setName("挂载状态")
       .setDesc(describeMountedState(snapshot.mounted))
       .addButton((button: any) =>
@@ -583,3 +613,5 @@ export class QuarkSettingsTab extends settingTabBase() {
     });
   }
 }
+
+/** 0.2.14：登录成功后的去向（有快照且库根一致 → 直接挂载，零网络）。 */

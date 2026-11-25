@@ -32,10 +32,15 @@ import {
 import { DownloadGateError } from "../client/downloadGate";
 import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
 import { attachmentCandidates, extractAttachmentRefs, isMarkdownPath } from "../utils/noteRefs";
+import { MdContentStore } from "../store/MdContentStore";
+import type { MdContentStore as MdStoreType } from "../store/MdContentStore";
 import { ReadOnlyError } from "./readonlyError";
 
 /** 本 adapter 的固定名字（`getName()` 返回值）。 */
 export const QUARK_ADAPTER_NAME = "quark-readonly";
+/** 0.2.15：图片「点了才下」——未命中返回 1×1 透明 PNG 占位，不触发下载。 */
+export const QUARK_PLACEHOLDER_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 /** 默认配置目录。 */
 export const DEFAULT_CONFIG_DIR = ".obsidian";
 /** 默认插件目录（配置目录内的子集，转发规则与配置目录相同）。 */
@@ -112,7 +117,8 @@ export type QuarkAdapterDiagStage =
   | "sort"
   | "decode"
   | "prefetch"
-  | "gate";
+  | "gate"
+  | "cache";
 
 /** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5 / 0.2.4 A7）。 */
 export type QuarkAdapterDiagSink = (entry: {
@@ -153,6 +159,10 @@ export interface QuarkReadOnlyAdapterOptions {
   prefetchPerNote?: () => number;
   /** 0.2.11：每次网络下载成功后回调字节数（会话统计用）。 */
   onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
+  /** 0.2.13：md 正文磁盘缓存（只存 .md；附件永不进 IDB）。 */
+  mdStore?: MdStoreType | null;
+  /** 0.2.15：当前活动笔记路径（defer 汇总日志用）。 */
+  currentNotePath?: () => string;
 }
 
 /** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
@@ -248,6 +258,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly allowPrefetch?: () => boolean;
   private readonly prefetchPerNote?: () => number;
   private readonly onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
+  private readonly mdStore?: MdStoreType | null;
+  private readonly currentNotePath?: () => string;
+  private deferCount = 0;
+  private deferLoggedAt = 0;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -265,6 +279,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.allowPrefetch = options.allowPrefetch;
     this.prefetchPerNote = options.prefetchPerNote;
     this.onDownloaded = options.onDownloaded;
+    this.mdStore = options.mdStore ?? null;
+    this.currentNotePath = options.currentNotePath;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -283,6 +299,18 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     try {
       const url = this.cache.getResourceUrl(clean);
       if (url) return url;
+      if (clean && !this.prefetchEnabled()) {
+        // 0.2.15：默认不下载、不入队；返回占位图（每次笔记一条汇总日志，限流 1s）
+        const now = Date.now();
+        this.deferCount += 1;
+        if (now - this.deferLoggedAt >= 1000) {
+          this.deferLoggedAt = now;
+          const note = this.currentNotePath ? this.currentNotePath() : "";
+          this.reportInfo("prefetch", note || "/", fid, { state: "summary", note, refs: this.deferCount, deferred: this.deferCount, enqueued: 0, reason: "on-demand" });
+          this.deferCount = 0;
+        }
+        return QUARK_PLACEHOLDER_DATA_URL;
+      }
       if (clean && this.prefetchEnabled()) {
         const entry = this.findEntry(clean);
         if (entry) fid = entry.fid;
@@ -568,6 +596,19 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     const cached = this.cache.get(clean);
     if (cached) return cached;
 
+    // 0.2.13：内存 LRU → IDB mdContent（只对 md）→ 网络
+    if (this.mdStore && isMarkdownPath(clean)) {
+      const indexed = this.findEntry(clean);
+      const record = await this.mdStore.get(clean);
+      if (record && indexed && MdContentStore.isValid(record, indexed)) {
+        const buffer = record.bytes.buffer.slice(record.bytes.byteOffset, record.bytes.byteOffset + record.bytes.byteLength) as ArrayBuffer;
+        this.cache.put(clean, buffer, { fid: indexed.fid, mtime: indexed.mtime });
+        this.reportInfo("cache", clean, indexed.fid, { state: "hit-md", bytes: buffer.byteLength });
+        return buffer;
+      }
+      if (record && indexed) await this.mdStore.delete(clean);
+    }
+
     const entry = this.findEntry(clean);
     if (!entry) throw new QuarkEntryNotFoundError(clean);
     if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
@@ -582,6 +623,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
+      // 0.2.13：md 正文同时落 IDB（附件永不进 IDB）
+      if (this.mdStore && isMarkdownPath(clean)) {
+        await this.mdStore.put(clean, buffer, { fid: entry.fid, size: entry.size, mtime: entry.mtime });
+      }
       this.onDownloaded?.(buffer.byteLength, priorityOverride ?? this.downloadPriority(clean));
       this.downloadUi?.end(token, "done");
       return buffer;

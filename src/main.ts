@@ -48,7 +48,10 @@ import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { DownloadNoticeBook } from "./client/downloadUi";
 import type { DownloadNoticeLike } from "./client/downloadUi";
 import { createPathThrottle, normalizeVaultPath } from "./utils/pathUtils";
-import { runBulkPrefetch } from "./prefetch/bulkPrefetch";
+import { formatBuiltAt } from "./ui/QuarkSettingsTab";
+import { decideAfterLogin } from "./auth/loginDecision";
+import { planBulkMarkdown, runBulkPrefetch } from "./prefetch/bulkPrefetch";
+import { MdContentStore, createIdbMdBackend } from "./store/MdContentStore";
 import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
 import type { DiagAdapterLike } from "./utils/diagLog";
 
@@ -171,6 +174,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkStatBg = { downloads: 0, bytes: 0 };
   private quarkStatBulk = { downloads: 0, bytes: 0 };
   private quarkFileOpenRef: { ref?: unknown } | null = null;
+  /** 0.2.13：md 磁盘缓存与统计。 */
+  private quarkMdStore: MdContentStore | null = null;
+  private quarkMdStats = { count: 0, bytes: 0 };
   /** 0.2.13：bulk（全库 md 正文）预取状态与取消代数。 */
   private quarkBulkGeneration = 0;
   private quarkBulkState = "idle";
@@ -466,6 +472,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCookieStore = new CookieStore({
       app: this.app,
       storageKey: QUARK_COOKIE_STORAGE_KEY,
+      // 0.2.15：固定合规 id；失败回调只记一次 warn 级日志
+      secretId: "quark-cookie",
       loadData: async () => ({ [QUARK_COOKIE_STORAGE_KEY]: this.settings.quarkCookie }),
       saveData: async (data) => {
         // 只在 Cookie 真变化时落盘，避免每个响应都写 data.json
@@ -475,9 +483,19 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         this.lastPersistedQuarkCookie = next;
         await this.updateSettings({ quarkCookie: next });
       },
-      onPersistError: (error) => console.warn("[Quark] cookie persist failed:", error),
+      onPersistError: (error) => this.onQuarkPersistError(error),
     });
     await this.quarkCookieStore.load();
+    // 0.2.15：只允许 secretStorage；历史明文 cookie 字段启动时删除
+    if (this.settings.quarkCookie) {
+      await this.updateSettings({ quarkCookie: "" });
+      try {
+        this.quarkDiag?.log({ level: "warn", stage: "auth", path: "/", fid: "-", message: "state=migrate reason=remove-legacy-plaintext" });
+      } catch { /* 日志失败忽略 */ }
+    }
+    if (!this.quarkCookieStore.secretAvailable) {
+      new Notice("需要 Obsidian 1.11.4 及以上才能保存登录态（当前 secretStorage 不可用）", 8000);
+    }
 
     // 0.2.4 A4′：下载中「正在下载 … [取消]」单例提示（取消 = 丢弃结果 + 不重试 + 不写缓存）
     this.quarkDownloadBook = new DownloadNoticeBook(
@@ -508,6 +526,26 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       adapter: this.mounter.getOriginalAdapter() as unknown as DiagAdapterLike,
       onError: (error) => console.warn("[Quark] diag write failed:", error),
     });
+    // 0.2.13：md 正文磁盘缓存（IDB，仅正文；附件永不进 IDB）
+    if (!this.quarkMdStore) {
+      const dbName = `obsidian-quark-mdcontent-${String(this.app.vault.getName() || "default").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+      this.quarkMdStore = new MdContentStore({
+        backend: createIdbMdBackend(dbName),
+        maxBytes: 50 * 1024 * 1024,
+        onLog: (entry) => {
+          try {
+            this.quarkDiag?.log({
+              level: "info",
+              stage: "cache",
+              path: entry.path || "/",
+              fid: "-",
+              message: "",
+              fields: { state: entry.state, bytes: entry.bytes ?? 0, count: entry.count ?? 0 },
+            });
+          } catch { /* 日志失败不影响缓存 */ }
+        },
+      });
+    }
     this.quarkAdapter = new QuarkReadOnlyAdapter({
       index: this.quarkIndex,
       cache: this.quarkCache,
@@ -522,6 +560,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       // 0.2.8：写操作仍 reject ReadOnlyError；拒绝前回调这里做「回滚视图到云端版本」
       onReadonlyWrite: (info) => this.quarkRollback?.(info),
       // 0.2.12：预取默认开启（字段缺省视为开）；关闭后 getResourcePath/按笔记预取都不入队
+      mdStore: this.quarkMdStore,
+      currentNotePath: () => this.quarkLastNotePath,
       allowPrefetch: () => this.settings.quarkPrefetchImages !== false,
       // 0.2.12：每篇笔记上限（默认 20；0 = 关闭）
       prefetchPerNote: () => this.settings.quarkPrefetchPerNote ?? 20,
@@ -703,6 +743,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCache.stopPrefetchLoop();
     // 0.2.13：bulk 任务作废（代数+1，旧根的任务不再发起）
     this.quarkCancelBulkPrefetch();
+    // 0.2.13：切换库根 → 清空磁盘正文缓存（旧根内容作废）
+    void this.quarkMdStore?.clear().then(() => this.refreshMdStats()).catch(() => undefined);
     await this.quarkIndex.clearAll();
     this.quarkCache.clear();
     await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
@@ -733,6 +775,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
    * 弹窗在登录成功时已自行关闭（A7），同步在后台继续。
    */
   public async quarkOpenQrModal(): Promise<void> {
+    if (!this.quarkCookieStore.secretAvailable) {
+      new Notice("需要 Obsidian 1.11.4 及以上才能保存登录态（当前 secretStorage 不可用）", 8000);
+      return;
+    }
     const modal = new QuarkQrModal({
       app: this.app,
       createAuth: (onProgress: (progress: QuarkQrProgress) => void) =>
@@ -747,6 +793,20 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           this.quarkClient.resetAuth();
           this.refreshQuarkUi();
           new Notice(`夸克已登录（${result.cookieNames?.length ?? 0} 条 cookie），继续…`, 4000);
+          // 0.2.14：已有快照且库根未变 → 直接挂载，零网络、不弹同步确认
+          const action = decideAfterLogin({
+            indexCount: this.quarkIndex.entryCount,
+            rootChosen: (this.settings.quarkRootChosenAt ?? 0) > 0,
+            rootMatches: (this.settings.quarkRootFid || "0") === ((this.quarkIndex.metaInfo as { rootFid?: string } | null)?.rootFid ?? (this.settings.quarkRootFid || "0")),
+          });
+          if (action === "mount") {
+            await this.mountQuark();
+            new Notice(`已登录 · 索引 ${this.quarkIndex.entryCount} 条（${formatBuiltAt(this.quarkIndex.metaInfo.builtAt || 0)}）· 已在只读模式`, 6000);
+            return;
+          }
+          if (action === "rebuild") {
+            new Notice("夸克：库根已变化，需要重建索引", 6000);
+          }
         }
         await this.runQuarkFlow({ type: "login", ok, snapshot: this.quarkSnapshot() }).catch((error) => {
           console.error("[Quark] flow after login failed:", error);
@@ -755,6 +815,21 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
     });
     modal.open();
+  }
+
+  /** 0.2.15：secretStorage 持久化失败 → 只记一条 warn 级日志（reason=invalid-secret-id）。 */
+  private onQuarkPersistError(error: unknown): void {
+    try {
+      const message = error instanceof Error ? error.message : String(error);
+      const reason = /密钥\\s*ID\\s*无效|invalid.*secret|secret.*id/i.test(message) ? "invalid-secret-id" : "secret-error";
+      this.quarkDiag?.log({
+        level: "warn",
+        stage: "auth",
+        path: "/",
+        fid: "-",
+        message: `state=persist-fallback reason=${reason}`,
+      });
+    } catch { /* 日志失败不影响 */ }
   }
 
   /** 同步索引（A8）：BFS 走 client.listDir，进度进状态栏，可取消。 */
@@ -1062,6 +1137,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     new Notice(`夸克：只读库已挂载（${this.quarkIndex.entryCount} 条）`, 5000);
     // 0.2.9：挂载成功后启动预取循环（仅当「预取当前笔记图片」开着时才会入队）
     this.startQuarkPrefetch();
+    // 0.2.13：md 磁盘缓存失效校验 + 统计（索引刷新后比对 validators）
+    void this.quarkMdStore?.invalidate(this.quarkIndex.entries).then(() => this.refreshMdStats()).catch(() => undefined);
     // 0.2.13：全库 md 正文预取（内容搜索用；同步完成后启动，可取消）
     this.startBulkPrefetch();
     // 0.2.11：切换/关闭笔记 → 丢弃未开始的预取任务，避免跨笔记累积
@@ -1157,6 +1234,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     return {
       loginState,
       cookieNameCount: cookieNames.length,
+      secretAvailable: this.quarkCookieStore.secretAvailable,
       rootPath: this.settings.quarkRootPath || "/",
       rootChosen: (this.settings.quarkRootChosenAt ?? 0) > 0,
       indexCount: this.quarkIndex.entryCount,
@@ -1182,6 +1260,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       bulkTotal: this.quarkBulkTotal,
       bulkBytes: this.quarkBulkBytes,
       bulkState: this.quarkBulkState,
+      mdCount: this.quarkMdStats.count,
+      mdBytes: this.quarkMdStats.bytes,
     };
   }
 
@@ -1276,6 +1356,24 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   }
 
   /** 0.2.13：取消进行中的 bulk 预取（保留已缓存内容）。 */
+  /** 0.2.13：更新磁盘正文缓存统计。 */
+  private async refreshMdStats(): Promise<void> {
+    try {
+      this.quarkMdStats = await this.quarkMdStore!.stats();
+      this.refreshQuarkUi();
+    } catch { /* 统计失败忽略 */ }
+  }
+
+  /** 0.2.13：清空磁盘正文缓存。 */
+  public async quarkClearMdCache(): Promise<void> {
+    try {
+      await this.quarkMdStore?.clear();
+      this.quarkMdStats = { count: 0, bytes: 0 };
+      new Notice("夸克：磁盘正文缓存已清空");
+      this.refreshQuarkUi();
+    } catch { /* 清空失败忽略 */ }
+  }
+
   public quarkCancelBulkPrefetch(): void {
     this.quarkBulkGeneration += 1;
     this.quarkBulkState = "canceled";

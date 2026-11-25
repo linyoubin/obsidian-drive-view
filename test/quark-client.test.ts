@@ -303,7 +303,7 @@ describe("CookieStore：set-cookie 解析与合并", () => {
         setSecret: (id: string, value: string) => {
           saved[id] = value;
         },
-        getSecret: (id: string) => (id === DEFAULT_COOKIE_STORAGE_KEY ? "__pus=true; __kps=ok" : null),
+        getSecret: (id: string) => (id === "quark-cookie" ? "__pus=true; __kps=ok" : null),
       },
     };
     expect(resolveSecretStorage(app)).not.toBeNull();
@@ -312,25 +312,24 @@ describe("CookieStore：set-cookie 解析与合并", () => {
     expect(await store.load()).toBe(true);
     expect(store.getHeader()).toBe("__pus=true; __kps=ok");
     expect(await store.save()).toBe(true);
-    expect(saved[DEFAULT_COOKIE_STORAGE_KEY]).toBe("__pus=true; __kps=ok");
+    expect(saved["quark-cookie"]).toBe("__pus=true; __kps=ok");
   });
 
-  test("持久化：无 secretStorage → 回退 saveData/loadData", async () => {
+  test("持久化：无 secretStorage → storageMode=none，不写文件", async () => {
     const saved: Array<Record<string, unknown>> = [];
     const store = new CookieStore({
       app: {},
-      saveData: async (data: Record<string, unknown>) => {
+      saveData: async (data) => {
         saved.push(data);
       },
       loadData: async () => ({ [DEFAULT_COOKIE_STORAGE_KEY]: "__pus=true" }),
     });
-    expect(store.storageMode).toBe("data");
-    expect(await store.load()).toBe(true);
-    expect(store.hasLoginCookie()).toBe(true);
-    expect(await store.save()).toBe(true);
-    expect(saved[0][DEFAULT_COOKIE_STORAGE_KEY]).toBe("__pus=true");
+    // 0.2.15：只允许 secretStorage；无 secretStorage 不写文件
+    expect(store.storageMode).toBe("none");
+    expect(await store.load()).toBe(false);
+    expect(await store.save()).toBe(false);
+    expect(saved).toEqual([]);
   });
-
   test("持久化：两者都不可用 → 纯内存，save 返回 false 不抛", async () => {
     const store = new CookieStore({ pairs: "__pus=true" });
     expect(store.storageMode).toBe("none");

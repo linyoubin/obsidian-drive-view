@@ -21,6 +21,24 @@ export const SET_COOKIE_SPLIT_RE = /,\s*(?=[A-Za-z_][\w-]*=)/;
 /** 默认持久化键名。 */
 export const DEFAULT_COOKIE_STORAGE_KEY = "quark-auth-cookie";
 
+/** 0.2.15：固定、合规的 secretStorage id（小写字母/数字/短横线，≤64）。 */
+export const QUARK_SECRET_ID = "quark-cookie";
+
+/**
+ * 把任意字符串清洗成 Obsidian `secretStorage` 允许的 id：
+ * 小写、非法字符（`:` `/` 空格 中文 大写等）→ `-`、合并连续 `-`、去首尾 `-`、截断 64；空则回退 `quark-cookie`。
+ */
+export function sanitizeSecretId(raw: string): string {
+  const cleaned = String(raw ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+  return cleaned || QUARK_SECRET_ID;
+}
+
 /** 响应头容器：值可能是单串、数组，也可能缺失。 */
 export type HeaderBag = Record<string, string | string[] | null | undefined>;
 
@@ -39,6 +57,8 @@ export interface CookieStoreOptions {
   loadData?: () => Promise<Record<string, unknown> | null | undefined>;
   /** 持久化键名，默认 {@link DEFAULT_COOKIE_STORAGE_KEY}。 */
   storageKey?: string;
+  /** 0.2.15：secretStorage 使用的 id（会被 sanitize；默认 quark-cookie）。 */
+  secretId?: string;
   /** 初始 Cookie（`k=v; k2=v2` 字符串或 `k=v` 数组）。 */
   pairs?: string[] | string;
   /** 持久化失败回调（静默降级为纯内存，不抛给调用方）。 */
@@ -288,21 +308,25 @@ export class CookieStore {
   private readonly saveData?: (data: Record<string, unknown>) => Promise<void>;
   private readonly loadData?: () => Promise<Record<string, unknown> | null | undefined>;
   private readonly storageKey: string;
+  private readonly secretId: string;
   private readonly onPersistError?: (error: unknown) => void;
+  /** 0.2.15：secretStorage 失败一次后本会话永久降级（不重试、不重复打日志）。 */
+  private secretDisabled = false;
 
   constructor(options: CookieStoreOptions = {}) {
     this.app = options.app;
     this.saveData = options.saveData;
     this.loadData = options.loadData;
     this.storageKey = options.storageKey ?? DEFAULT_COOKIE_STORAGE_KEY;
+    this.secretId = sanitizeSecretId(options.secretId ?? QUARK_SECRET_ID);
     this.onPersistError = options.onPersistError;
     if (options.pairs !== undefined) this.setPairs(options.pairs);
   }
 
   /** 当前生效的持久化后端（每次实时检测，便于运行期变化与单测）。 */
   get storageMode(): "secret" | "data" | "none" {
-    if (resolveSecretStorage(this.app)) return "secret";
-    if (typeof this.saveData === "function") return "data";
+    // 0.2.15：只允许 secretStorage，不存在回退「文件」通道
+    if (!this.secretDisabled && resolveSecretStorage(this.app)) return "secret";
     return "none";
   }
 
@@ -388,55 +412,49 @@ export class CookieStore {
     return this.getHeader();
   }
 
-  /** 从持久化后端读回。返回是否读到了非空 Cookie。 */
+  /** 0.2.15：只从 secretStorage 读；不可用返回 false（不降级、不读明文）。 */
   async load(): Promise<boolean> {
     const secret = resolveSecretStorage(this.app);
-    if (secret) {
-      try {
-        const raw = await secret.getSecret(this.storageKey);
-        return this.restore(typeof raw === "string" ? raw : "");
-      } catch (error) {
-        this.warnPersistError(error);
-        return false;
-      }
+    if (this.secretDisabled || !secret) return false;
+    try {
+      const raw = await secret.getSecret(this.secretId);
+      return this.restore(typeof raw === "string" ? raw : "");
+    } catch (error) {
+      this.disableSecret(error);
+      return false;
     }
-    if (typeof this.loadData === "function") {
-      try {
-        const data = await this.loadData();
-        const bag = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
-        const raw = bag ? bag[this.storageKey] : undefined;
-        return this.restore(typeof raw === "string" ? raw : "");
-      } catch (error) {
-        this.warnPersistError(error);
-        return false;
-      }
-    }
-    return false;
   }
 
-  /** 写回持久化后端。返回是否真的落盘（纯内存模式返回 false，不抛）。 */
+  /** 0.2.15：只允许 secretStorage；失败返回 false（不降级、不写明文）。 */
   async save(): Promise<boolean> {
     const header = this.getHeader();
     const secret = resolveSecretStorage(this.app);
-    if (secret) {
-      try {
-        await secret.setSecret(this.storageKey, header);
-        return true;
-      } catch (error) {
-        this.warnPersistError(error);
-        return false;
-      }
+    if (this.secretDisabled || !secret) {
+      this.disableSecret(new Error("secretStorage 不可用"));
+      return false;
     }
-    if (typeof this.saveData === "function") {
-      try {
-        await this.saveData({ [this.storageKey]: header });
-        return true;
-      } catch (error) {
-        this.warnPersistError(error);
-        return false;
-      }
+    try {
+      await secret.setSecret(this.secretId, header);
+      return true;
+    } catch (error) {
+      this.disableSecret(error);
+      return false;
     }
-    return false;
+  }
+  /** secretStorage 是否已降级（设置页显示「文件（降级）」）。 */
+  get secretFallback(): boolean {
+    return this.secretDisabled;
+  }
+
+  /** 0.2.15：secretStorage 是否可用（不可用 = 登录入口禁用）。 */
+  get secretAvailable(): boolean {
+    return !this.secretDisabled && resolveSecretStorage(this.app) !== null;
+  }
+
+  private disableSecret(error: unknown): void {
+    if (this.secretDisabled) return;
+    this.secretDisabled = true;
+    this.warnPersistError(error);
   }
 
   private restore(raw: string): boolean {
@@ -453,4 +471,15 @@ export class CookieStore {
       }
     }
   }
+}
+
+/** 0.2.15：启动时清理历史明文 cookie 字段（返回新对象，不修改入参）。 */
+export function migrateLegacyCookieData(
+  data: Record<string, unknown> | null | undefined,
+  key: string = DEFAULT_COOKIE_STORAGE_KEY
+): { data: Record<string, unknown>; removed: boolean } {
+  const source = data && typeof data === "object" ? { ...data } : {};
+  const removed = typeof source[key] === "string" && source[key] !== "";
+  if (removed) delete source[key];
+  return { data: source, removed };
 }

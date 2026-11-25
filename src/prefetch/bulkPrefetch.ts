@@ -92,3 +92,28 @@ export async function runBulkPrefetch(options: BulkPrefetchOptions): Promise<Bul
   result.elapsedMs = Date.now() - startedAt;
   return result;
 }
+
+/**
+ * 0.2.15：bulk 计划过滤——**只允许 md**，目录与附件一律不计入 paths。
+ * 返回 other 供调用方做安全阀（other>0 必须 abort）。
+ */
+export function planBulkMarkdown(entries: Array<{ path: string; type: string }>): {
+  paths: string[];
+  md: number;
+  other: number;
+  dirs: number;
+  total: number;
+} {
+  const paths: string[] = [];
+  let other = 0;
+  let dirs = 0;
+  for (const entry of entries) {
+    if (entry.type === "folder") {
+      dirs += 1;
+      continue;
+    }
+    if (/\.(md|markdown)$/i.test(entry.path)) paths.push(entry.path);
+    else other += 1;
+  }
+  return { paths, md: paths.length, other, dirs, total: entries.length };
+}

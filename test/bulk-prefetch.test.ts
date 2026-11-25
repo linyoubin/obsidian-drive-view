@@ -96,3 +96,19 @@ describe("runBulkPrefetch：全库 md 正文预取", () => {
     expect(pauses).toEqual([60_000]);
   });
 });
+
+describe("bulk 计划安全阀（0.2.15）", () => {
+  test("计划只含 md：jpeg/pdf 计入 other、目录不计入 paths", async () => {
+    const { planBulkMarkdown } = await import("../src/prefetch/bulkPrefetch");
+    const plan = planBulkMarkdown([
+      { path: "20-notes/a.md", type: "file" },
+      { path: "90-assets/a.jpeg", type: "file" },
+      { path: "90-assets/b.pdf", type: "file" },
+      { path: "90-assets", type: "folder" },
+    ]);
+    expect(plan.paths).toEqual(["20-notes/a.md"]);
+    expect(plan.other).toBe(2);
+    expect(plan.dirs).toBe(1);
+    expect(plan.paths.some((path) => !/\.(md|markdown)$/i.test(path))).toBe(false);
+  });
+});

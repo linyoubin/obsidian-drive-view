@@ -24,7 +24,9 @@ export type DiagStage =
   | "decode"
   | "prefetch"
   | "gate"
-  | "stats";
+  | "stats"
+  | "cache"
+  | "auth";
 
 /** 日志文件（库内路径，走 Obsidian adapter 写）。 */
 export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";

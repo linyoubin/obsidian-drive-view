@@ -201,7 +201,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkLastIndexBuiltAt: 0,
   quarkDownloadConcurrency: 4,
   quarkMaxFileBytes: 50 * 1024 * 1024,
-  quarkPrefetchImages: true,
+  quarkPrefetchImages: false, // 0.2.15：图片默认「点了才下」
   quarkPrefetchPerNote: 0,
   quarkPrefetchAllMarkdown: true,
 };

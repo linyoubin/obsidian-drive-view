@@ -203,6 +203,7 @@ function makeAdapter(options: {
   clientBuffers?: Record<string, ArrayBuffer>;
   allowPrefetch?: () => boolean;
   prefetchPerNote?: () => number;
+  mdStore?: import("../src/store/MdContentStore").MdContentStore;
 } = {}): Harness {
   const index = makeIndex(options.entries ?? indexEntries());
   const cache = makeCache(options.cacheSeed ?? {});
@@ -215,6 +216,7 @@ function makeAdapter(options: {
     baseAdapter: base.baseAdapter,
     allowPrefetch: options.allowPrefetch ?? (() => true),
     prefetchPerNote: options.prefetchPerNote ?? (() => 0),
+    mdStore: options.mdStore ?? null,
   });
   return { adapter, index, cache, client, base };
 }
@@ -589,5 +591,106 @@ describe("QuarkReadOnlyAdapter：预取跳过与 summary（0.2.13）", () => {
     expect(Number(summary!.fields!.enqueued)).toBe(1);
     expect(Number(summary!.fields!.skipped)).toBeGreaterThanOrEqual(1);
     expect(logs.some((entry) => entry.fields?.reason === "cached")).toBe(true);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：md 磁盘缓存读取顺序（0.2.13）", () => {
+  test("IDB 命中优先于网络，并把内容提升进内存 LRU", async () => {
+    const { MdContentStore, MemoryMdContentBackend } = await import("../src/store/MdContentStore");
+    const store = new MdContentStore({ backend: new MemoryMdContentBackend(), now: () => 1 });
+    await store.put("notes/a.md", textBuffer("cached-md"), { fid: "fa", size: 9, mtime: 1 });
+    const { adapter, client, cache } = makeAdapter({
+      mdStore: store,
+      entries: [{ path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: 9, mtime: 1 }],
+    });
+    const text = await adapter.read("notes/a.md");
+    expect(text).toBe("cached-md");
+    expect(client.calls).toEqual([]); // 不发起网络
+    expect(cache.cache.has("notes/a.md")).toBe(true); // 已提升进内存
+  });
+
+  test("附件（非 md）永不写 IDB", async () => {
+    const { MdContentStore, MemoryMdContentBackend } = await import("../src/store/MdContentStore");
+    const store = new MdContentStore({ backend: new MemoryMdContentBackend(), now: () => 1 });
+    const { adapter } = makeAdapter({
+      mdStore: store,
+      entries: [
+        { path: "90-assets/x.jpeg", type: "file", fid: "fimg", parentFid: "0", size: 3, mtime: 1 },
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: 9, mtime: 1 },
+      ],
+      clientBuffers: { fimg: textBuffer("img"), fa: textBuffer("hello-a") },
+    });
+    await adapter.readBinary("90-assets/x.jpeg");
+    await adapter.read("notes/a.md");
+    const stats = await store.stats();
+    expect(stats.count).toBe(1); // 只有 md
+    expect(await store.get("90-assets/x.jpeg")).toBeNull();
+  });
+});
+
+describe("P0 安全阀：图片默认点了才下（0.2.15）", () => {
+  test("未命中返回占位 data URL、不入队、零网络", () => {
+    const logs: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
+    const { adapter, cache, client } = makeAdapter({ allowPrefetch: () => false });
+    const withDiag = new QuarkReadOnlyAdapter({
+      index: makeIndex(indexEntries()),
+      cache: cache.cache,
+      client: client.client,
+      baseAdapter: {} as never,
+      allowPrefetch: () => false,
+      currentNotePath: () => "20-notes/a.md",
+      diag: (entry) => logs.push(entry),
+    });
+    const url = withDiag.getResourcePath("folder/b.md");
+    expect(url.startsWith("data:image/png;base64,")).toBe(true);
+    expect(cache.prefetch).toEqual([]);
+    expect(client.calls).toEqual([]);
+    expect(logs.some((entry) => entry.fields?.reason === "on-demand")).toBe(true);
+  });
+
+  test("零图片引用的普通笔记：prefetchNote 零入队、零网络", async () => {
+    const content = "普通笔记，没有图片引用";
+    const { adapter, cache, client } = makeAdapter({
+      entries: [{ path: "20-notes/a.md", type: "file", fid: "fa", parentFid: "0", size: content.length, mtime: 1 }],
+      clientBuffers: { fa: textBuffer(content) },
+      allowPrefetch: () => true,
+      prefetchPerNote: () => 0,
+    });
+    const result = await adapter.prefetchNote("20-notes/a.md");
+    expect(result.enqueued).toBe(0);
+    expect(cache.prefetch).toEqual([]);
+    // 只下载笔记正文 1 次；附件 0 次（0.2.15）
+    expect(client.calls).toEqual(["fa:interactive"]);
+  });
+
+  test("笔记只引用 1 张图：只入队 1 张（同名目录不扩展）", async () => {
+    const content = "正文 ![](90-assets/A/one.jpeg)";
+    const { adapter, cache } = makeAdapter({
+      entries: [
+        { path: "20-notes/a.md", type: "file", fid: "fa", parentFid: "0", size: content.length, mtime: 1 },
+        { path: "90-assets/A/one.jpeg", type: "file", fid: "f1", parentFid: "0", size: 3, mtime: 1 },
+        { path: "90-assets/A/two.jpeg", type: "file", fid: "f2", parentFid: "0", size: 3, mtime: 1 },
+        { path: "90-assets/A/three.jpeg", type: "file", fid: "f3", parentFid: "0", size: 3, mtime: 1 },
+      ],
+      clientBuffers: { fa: textBuffer(content), f1: textBuffer("1"), f2: textBuffer("2"), f3: textBuffer("3") },
+      prefetchPerNote: () => 0,
+    });
+    const result = await adapter.prefetchNote("20-notes/a.md");
+    expect(result.enqueued).toBe(1);
+    expect(cache.prefetch.map((item) => item.path)).toEqual(["90-assets/A/one.jpeg"]);
+  });
+});
+
+describe("P0：打开图片文件（readBinary）才下载（0.2.15）", () => {
+  test("用户点开图片 → readBinary 下载 1 次，走 background", async () => {
+    const { adapter, client } = makeAdapter({
+      entries: [
+        { path: "90-assets/x.jpeg", type: "file", fid: "fimg", parentFid: "0", size: 3, mtime: 1 },
+      ],
+      clientBuffers: { fimg: textBuffer("img") },
+    });
+    const buffer = await adapter.readBinary("90-assets/x.jpeg");
+    expect(new TextDecoder().decode(buffer)).toBe("img");
+    expect(client.calls).toEqual(["fimg:background"]);
   });
 });
