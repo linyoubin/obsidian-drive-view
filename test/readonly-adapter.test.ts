@@ -97,8 +97,8 @@ interface ClientHarness {
 function makeClient(buffers: Record<string, ArrayBuffer> = {}): ClientHarness {
   const calls: string[] = [];
   const client: QuarkDownloadClient = {
-    downloadFile: async (fid: string) => {
-      calls.push(fid);
+    downloadFile: async (fid: string, options?: { priority?: string; path?: string }) => {
+      calls.push(options?.priority ? `${fid}:${options.priority}` : fid);
       const buffer = buffers[fid];
       if (!buffer) throw new Error(`no fixture bytes for fid=${fid}`);
       return buffer;
@@ -201,6 +201,7 @@ function makeAdapter(options: {
   entries?: IndexEntry[];
   cacheSeed?: Record<string, ArrayBuffer>;
   clientBuffers?: Record<string, ArrayBuffer>;
+  allowPrefetch?: () => boolean;
 } = {}): Harness {
   const index = makeIndex(options.entries ?? indexEntries());
   const cache = makeCache(options.cacheSeed ?? {});
@@ -211,6 +212,7 @@ function makeAdapter(options: {
     cache: cache.cache,
     client: client.client,
     baseAdapter: base.baseAdapter,
+    allowPrefetch: options.allowPrefetch ?? (() => true),
   });
   return { adapter, index, cache, client, base };
 }
@@ -319,12 +321,12 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
     const { adapter, client, cache } = makeAdapter();
     const first = await adapter.read("a.md");
     expect(first).toBe("hello-a");
-    expect(client.calls).toEqual(["fa"]);
+    expect(client.calls).toEqual(["fa:interactive"]);
     expect(cache.puts).toEqual([{ path: "a.md", bytes: 7 }]);
 
     const second = await adapter.read("a.md");
     expect(second).toBe("hello-a");
-    expect(client.calls).toEqual(["fa"]); // 第二次命中缓存
+    expect(client.calls).toEqual(["fa:interactive"]); // 第二次命中缓存
   });
 
   test("readBinary：返回 ArrayBuffer；索引里没有的路径抛 QuarkEntryNotFoundError", async () => {
@@ -336,7 +338,7 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
     await expect(adapter.read("nope.md")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
     await expect(adapter.read("folder")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
     await expect(adapter.read("")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
-    expect(client.calls).toEqual(["fb"]);
+    expect(client.calls).toEqual(["fb:interactive"]);
   });
 });
 
@@ -466,5 +468,46 @@ describe("QuarkReadOnlyAdapter：.obsidian 与插件目录转发（A5）", () =>
     adapter.getResourcePath("a.md");
     await expect(adapter.rmdir("folder", false)).rejects.toBeInstanceOf(ReadOnlyError);
     expect(base.calls).toEqual([]);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：预取默认关 + 优先级分类（0.2.11）", () => {
+  test("allowPrefetch=false：getResourcePath 不入队；开了才入队且 src=render", () => {
+    const off = makeAdapter({ allowPrefetch: () => false });
+    off.adapter.getResourcePath("folder/b.md");
+    expect(off.cache.prefetch).toEqual([]);
+
+    const on = makeAdapter({ allowPrefetch: () => true });
+    const logs: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
+    const withDiag = new QuarkReadOnlyAdapter({
+      index: makeIndex(indexEntries()),
+      cache: on.cache.cache,
+      client: on.client.client,
+      baseAdapter: on.base.baseAdapter,
+      allowPrefetch: () => true,
+      diag: (entry) => logs.push(entry),
+    });
+    withDiag.getResourcePath("folder/b.md");
+    expect(on.cache.prefetch).toEqual([{ path: "folder/b.md", size: 22 }]);
+    const enqueueLog = logs.find((entry) => entry.stage === "prefetch");
+    expect(enqueueLog?.fields).toMatchObject({ state: "enqueue", src: "render" });
+  });
+
+  test("md 正文走 interactive；jpeg/附件走 background", async () => {
+    const { adapter, client } = makeAdapter({
+      clientBuffers: {
+        fa: textBuffer("hello-a"),
+        fb: textBuffer("hello-b"),
+        fimg: textBuffer("img"),
+      },
+      entries: [
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: 7, mtime: 1000 },
+        { path: "notes/b.md", type: "file", fid: "fb", parentFid: "0", size: 7, mtime: 2000 },
+        { path: "90-assets/x.jpeg", type: "file", fid: "fimg", parentFid: "0", size: 3, mtime: 3000 },
+      ],
+    });
+    await adapter.read("notes/a.md");
+    await adapter.readBinary("90-assets/x.jpeg");
+    expect(client.calls).toEqual(["fa:interactive", "fimg:background"]);
   });
 });

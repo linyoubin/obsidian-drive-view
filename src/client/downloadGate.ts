@@ -1,17 +1,23 @@
 /**
- * downloadGate —— 下载通道的有界并发闸门（0.2.4）。
+ * downloadGate —— 下载通道的有界并发闸门（0.2.4 → 0.2.11 双优先级）。
  *
- * 真机证据（2026-11-20 09:00:28）：Obsidian 挂载后扫全库建元数据，同一毫秒数十个
- * 下载并发把通道打爆 → 全部 `Request failed. 请求超时`，随后 cookie 被判失效（401）。
+ * 真机证据：
+ *   - 2026-11-20 09:00:28：Obsidian 挂载后扫全库建元数据，数十个并发下载把通道打爆（超时 + 401）；
+ *   - 2026-11-25 07:48:02：打开一篇嵌了上百张 jpeg 的 md，47ms 内几百个 `stage=read hit=false`，
+ *     图片读取把正文读取**饿死**在队列后面（md 的 read 行根本没出现）。
  *
- * 本模块只做「排队 + 并发上限 + 401 短路」，不含任何网络/存储逻辑，便于单测：
- *   - FIFO；可选 `high` 优先级插队（同优先级仍 FIFO）；
- *   - 并发峰值可观测（`peak`），默认 4，可 1–6 配置；
- *   - 401 熔断：`failAuth()` 立即清空队列（排队任务以 `auth-expired` 拒绝）、
- *     并在冷却期内直接拒绝新任务（不再发请求）；重新扫码后 `resetAuth()` 恢复。
+ * 本模块只做「排队 + 双优先级 + 并发上限 + 401 短路」，不含网络/存储逻辑：
+ *   - `interactive`（用户正在打开的正文/手动点开的文件）：优先，最多 2 路；
+ *   - `background`（预取附件）：interactive 有等待项时**不得占用空闲槽位**，最多 2 路；
+ *   - 总并发仍受 `concurrency`（默认 4，1–6 可配）约束；
+ *   - 401 熔断：`failAuth()` 立即清空两个队列并拒绝排队任务；冷却期内新任务直接拒绝。
+ *
+ * 事件（0.2.11，供 `stage=gate` 日志）：queued / acquired / abandoned，带 prio 与 waitMs。
  */
 
-export type GatePriority = "normal" | "high";
+export type GatePriority = "interactive" | "background" | "high" | "normal";
+export type GatePriorityClass = "i" | "bg";
+export type GateState = "queued" | "acquired" | "abandoned";
 
 /** 可取消信号（结构与 `AbortSignal` 兼容，便于注入）。 */
 export interface GateSignal {
@@ -21,13 +27,29 @@ export interface GateSignal {
 export interface GateRunOptions {
   priority?: GatePriority;
   signal?: GateSignal | null;
+  /** 库内路径（仅用于 `stage=gate` 日志）。 */
+  path?: string;
+}
+
+/** 闸门事件（0.2.11）：main 转成 `stage=gate … state=… prio=… waitMs=…` 日志。 */
+export interface GateEvent {
+  state: GateState;
+  priority: GatePriorityClass;
+  path: string;
+  waitMs: number;
 }
 
 export interface DownloadGateOptions {
-  /** 并发上限，默认 4（范围 1–6）。 */
+  /** 总并发上限，默认 4（范围 1–6）。 */
   concurrency?: number;
+  /** interactive 通道上限，默认 2。 */
+  interactiveLimit?: number;
+  /** background 通道上限，默认 2。 */
+  backgroundLimit?: number;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
+  /** 事件回调（单测/日志用）。 */
+  onEvent?: (event: GateEvent) => void;
 }
 
 export type DownloadGateErrorKind = "auth-expired" | "aborted";
@@ -49,45 +71,79 @@ interface PendingTask<T = unknown> {
   task: () => Promise<T>;
   resolve: (value: T) => void;
   reject: (error: unknown) => void;
-  priority: GatePriority;
+  priority: GatePriorityClass;
   signal: GateSignal | null;
+  path: string;
+  enqueuedAt: number;
 }
 
 // 队列元素类型放宽：run<T> 里的 PendingTask<T> 与内部 push 的 PendingTask 需要兼容
 type QueuedTask = PendingTask<any>;
 
-/** 默认并发上限：4（用户口径「超过 4 个就等待」）。 */
+/** 默认总并发上限：4（用户口径「超过 4 个就等待」）。 */
 export const DEFAULT_DOWNLOAD_CONCURRENCY = 4;
-/** 401 后的默认冷却：60 秒（期间不再发任何下载请求）。 */
+/** interactive 通道默认上限：2。 */
+export const DEFAULT_INTERACTIVE_LIMIT = 2;
+/** background 通道默认上限：2。 */
+export const DEFAULT_BACKGROUND_LIMIT = 2;
+/** 401 后的默认冷却：60 秒。 */
 export const DEFAULT_AUTH_COOLDOWN_MS = 60_000;
+
+/** 优先级归一：`high`/`interactive` → i；`normal`/`background` → bg（默认 background）。 */
+export function normalizeGatePriority(priority: GatePriority | undefined): GatePriorityClass {
+  return priority === "interactive" || priority === "high" ? "i" : "bg";
+}
 
 export class DownloadGate {
   private readonly now: () => number;
-  private queue: QueuedTask[] = [];
-  private activeCount = 0;
+  private readonly onEvent?: (event: GateEvent) => void;
+  private interactiveQueue: QueuedTask[] = [];
+  private backgroundQueue: QueuedTask[] = [];
+  private interactiveActive = 0;
+  private backgroundActive = 0;
   private peakActive = 0;
   private startedCount = 0;
   private concurrencyValue: number;
+  private interactiveLimitValue: number;
+  private backgroundLimitValue: number;
   private authExpiredUntil = 0;
 
   constructor(options: DownloadGateOptions = {}) {
     this.now = options.now ?? ((): number => Date.now());
+    this.onEvent = options.onEvent;
     this.concurrencyValue = normalizeGateConcurrency(options.concurrency);
+    this.interactiveLimitValue = Math.max(1, options.interactiveLimit ?? DEFAULT_INTERACTIVE_LIMIT);
+    this.backgroundLimitValue = Math.max(1, options.backgroundLimit ?? DEFAULT_BACKGROUND_LIMIT);
   }
 
-  /** 当前并发上限。 */
   get concurrency(): number {
     return this.concurrencyValue;
   }
 
-  /** 正在执行的任务数。 */
-  get active(): number {
-    return this.activeCount;
+  get interactiveLimit(): number {
+    return this.interactiveLimitValue;
   }
 
-  /** 排队中的任务数。 */
+  get backgroundLimit(): number {
+    return this.backgroundLimitValue;
+  }
+
+  /** 正在执行的任务数（两个通道合计）。 */
+  get active(): number {
+    return this.interactiveActive + this.backgroundActive;
+  }
+
+  get interactiveActiveCount(): number {
+    return this.interactiveActive;
+  }
+
+  get backgroundActiveCount(): number {
+    return this.backgroundActive;
+  }
+
+  /** 排队中的任务数（两个通道合计）。 */
   get pending(): number {
-    return this.queue.length;
+    return this.interactiveQueue.length + this.backgroundQueue.length;
   }
 
   /** 历史并发峰值（单测断言「never 超过配置值」用）。 */
@@ -100,7 +156,7 @@ export class DownloadGate {
     return this.startedCount;
   }
 
-  /** 调整并发上限（1–6 由设置页保证；这里只做下限/上限保护）。 */
+  /** 调整总并发上限（1–6 由设置页保证；这里只做下限/上限保护）。 */
   setConcurrency(value: number): number {
     this.concurrencyValue = normalizeGateConcurrency(value);
     this.pump();
@@ -110,10 +166,14 @@ export class DownloadGate {
   /** 排队执行一个任务；返回任务结果或拒绝原因。 */
   run<T>(task: () => Promise<T>, options: GateRunOptions = {}): Promise<T> {
     const signal = options.signal ?? null;
+    const priority = normalizeGatePriority(options.priority);
+    const path = options.path ?? "";
     if (signal && signal.aborted) {
+      this.emit("abandoned", priority, path, 0);
       return Promise.reject(new DownloadGateError("aborted", "下载任务已取消"));
     }
     if (this.isAuthExpired()) {
+      this.emit("abandoned", priority, path, 0);
       return Promise.reject(
         new DownloadGateError(
           "auth-expired",
@@ -127,27 +187,35 @@ export class DownloadGate {
         task,
         resolve,
         reject,
-        priority: options.priority === "high" ? "high" : "normal",
+        priority,
         signal,
+        path,
+        enqueuedAt: this.now(),
       };
       this.enqueue(pending);
+      this.emit("queued", priority, path, 0);
       this.pump();
     });
   }
 
   /**
    * 401 熔断：进入 `auth-expired` 状态（冷却 `cooldownMs`，默认 60s），
-   * 清空排队任务并让它们立即以 `auth-expired` 拒绝。已开始的任务不受影响（会自己失败）。
+   * 清空两个队列并让排队任务立即以 `auth-expired` 拒绝。已开始的任务不受影响（会自己失败）。
    */
   failAuth(cooldownMs: number = DEFAULT_AUTH_COOLDOWN_MS): void {
     this.authExpiredUntil = this.now() + Math.max(1, cooldownMs);
-    const rejected = this.queue.splice(0);
+    const rejected = [...this.interactiveQueue, ...this.backgroundQueue];
+    this.interactiveQueue = [];
+    this.backgroundQueue = [];
     const error = new DownloadGateError(
       "auth-expired",
       "登录已失效，请重新扫码（下载已暂停）",
       this.authRetryAfterMs()
     );
-    for (const item of rejected) item.reject(error);
+    for (const item of rejected) {
+      this.emit("abandoned", item.priority, item.path, this.now() - item.enqueuedAt);
+      item.reject(error);
+    }
   }
 
   /** 是否处于 401 冷却期。 */
@@ -166,46 +234,65 @@ export class DownloadGate {
   }
 
   private enqueue(pending: QueuedTask): void {
-    if (pending.priority === "high") {
-      // 插到最后一个 high 之后、所有 normal 之前（同优先级仍 FIFO）
-      let index = this.queue.length;
-      for (let i = 0; i < this.queue.length; i += 1) {
-        if (this.queue[i].priority === "normal") {
-          index = i;
-          break;
+    if (pending.priority === "i") this.interactiveQueue.push(pending);
+    else this.backgroundQueue.push(pending);
+  }
+
+  /**
+   * 调度（0.2.11 双通道）：
+   *   - interactive 有等待项 → 只启动 interactive（background 不得占用空闲槽位）；
+   *   - interactive 队列空 → 用 background 填满剩余槽位；
+   *   - 总启动数始终 ≤ `concurrency`；单通道不超过各自上限。
+   */
+  private pump(): void {
+    for (;;) {
+      const iActive = this.interactiveActive;
+      const bgActive = this.backgroundActive;
+      const total = iActive + bgActive;
+      if (total >= this.concurrencyValue) return;
+
+      if (this.interactiveQueue.length > 0) {
+        if (iActive < this.interactiveLimitValue) {
+          const pending = this.interactiveQueue.shift() as QueuedTask;
+          if (!this.start(pending)) continue;
+          continue;
         }
+        // interactive 已满且还有等待项：background 不抢槽位
+        return;
       }
-      this.queue.splice(index, 0, pending);
+
+      if (this.backgroundQueue.length > 0 && bgActive < this.backgroundLimitValue) {
+        const pending = this.backgroundQueue.shift() as QueuedTask;
+        if (!this.start(pending)) continue;
+        continue;
+      }
       return;
     }
-    this.queue.push(pending);
   }
 
-  private pump(): void {
-    while (this.activeCount < this.concurrencyValue && this.queue.length > 0) {
-      const pending = this.queue.shift() as QueuedTask;
-      if (pending.signal && pending.signal.aborted) {
-        pending.reject(new DownloadGateError("aborted", "下载任务已取消"));
-        continue;
-      }
-      if (this.isAuthExpired()) {
-        pending.reject(
-          new DownloadGateError(
-            "auth-expired",
-            "登录已失效，请重新扫码（下载已暂停）",
-            this.authRetryAfterMs()
-          )
-        );
-        continue;
-      }
-      this.start(pending);
+  /** 启动一个任务；被取消/熔断则返回 false（继续尝试下一个）。 */
+  private start(pending: QueuedTask): boolean {
+    if (pending.signal && pending.signal.aborted) {
+      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt);
+      pending.reject(new DownloadGateError("aborted", "下载任务已取消"));
+      return false;
     }
-  }
-
-  private start(pending: QueuedTask): void {
-    this.activeCount += 1;
+    if (this.isAuthExpired()) {
+      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt);
+      pending.reject(
+        new DownloadGateError(
+          "auth-expired",
+          "登录已失效，请重新扫码（下载已暂停）",
+          this.authRetryAfterMs()
+        )
+      );
+      return false;
+    }
+    if (pending.priority === "i") this.interactiveActive += 1;
+    else this.backgroundActive += 1;
     this.startedCount += 1;
-    if (this.activeCount > this.peakActive) this.peakActive = this.activeCount;
+    if (this.active > this.peakActive) this.peakActive = this.active;
+    this.emit("acquired", pending.priority, pending.path, this.now() - pending.enqueuedAt);
     Promise.resolve()
       .then(() => pending.task())
       .then(
@@ -213,14 +300,25 @@ export class DownloadGate {
         (error) => pending.reject(error)
       )
       .finally(() => {
-        this.activeCount -= 1;
+        if (pending.priority === "i") this.interactiveActive -= 1;
+        else this.backgroundActive -= 1;
         this.pump();
       });
+    return true;
+  }
+
+  private emit(state: GateState, priority: GatePriorityClass, path: string, waitMs: number): void {
+    try {
+      this.onEvent?.({ state, priority, path, waitMs: Math.max(0, Math.round(waitMs)) });
+    } catch {
+      /* 事件回调失败不影响调度 */
+    }
   }
 }
 
 /** 并发上限归一：1–6（设置页暴露 1–6，这里防御越界值）。 */
 export function normalizeGateConcurrency(value: number | undefined): number {
-  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : DEFAULT_DOWNLOAD_CONCURRENCY;
+  const numeric =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : DEFAULT_DOWNLOAD_CONCURRENCY;
   return Math.min(6, Math.max(1, numeric));
 }

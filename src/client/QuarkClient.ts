@@ -424,6 +424,7 @@ export class QuarkClient {
       new DownloadGate({
         concurrency: options.downloadConcurrency ?? DEFAULT_DOWNLOAD_CONCURRENCY,
         now: this.now,
+        onEvent: (event) => this.logGate(event),
       });
     this.limiter =
       options.limiter ??
@@ -633,13 +634,18 @@ export class QuarkClient {
    */
   async downloadFile(
     fid: string,
-    options: { signal?: GateSignal | null; path?: string } = {}
+    options: {
+      signal?: GateSignal | null;
+      path?: string;
+      priority?: "interactive" | "background";
+    } = {}
   ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
     const path = options.path || fid;
+    const priority = options.priority === "interactive" ? "interactive" : "background";
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
     const shared = this.inflight.run(fid, () =>
-      this.downloadGate.run(() => this.downloadWithRetry(fid, signal, path))
+      this.downloadGate.run(() => this.downloadWithRetry(fid, signal, path), { path, priority })
     );
     if (!signal) return shared;
     return this.raceCallerCancel(shared, signal);
@@ -751,6 +757,22 @@ export class QuarkClient {
       buffer.byteLength === 0 ? "empty-body" : ""
     );
     return buffer;
+  }
+
+  /** 闸门事件埋点（0.2.11）：`stage=gate state=… prio=… waitMs=…`。 */
+  private logGate(event: { state: "queued" | "acquired" | "abandoned"; priority: "i" | "bg"; path: string; waitMs: number }): void {
+    try {
+      this.diag?.({
+        level: "info",
+        stage: "gate",
+        path: event.path || "/",
+        fid: "-",
+        message: "",
+        fields: { state: event.state, prio: event.priority, waitMs: event.waitMs },
+      });
+    } catch {
+      /* 日志失败不影响调度 */
+    }
   }
 
   /** 下载埋点（0.2.10）：失败只影响日志，不影响下载结果。 */

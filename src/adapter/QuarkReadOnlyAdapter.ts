@@ -62,7 +62,11 @@ export interface QuarkCacheLike {
 /** 下载器的最小接口（`QuarkClient` 结构上满足）。 */
 export interface QuarkDownloadClient {
   /** 第二参数是取消令牌（`aborted=true` 时客户端丢弃结果、不再重试）。 */
-  downloadFile(fid: string, options?: { signal?: { aborted: boolean } | null; path?: string }): Promise<ArrayBuffer>;
+  downloadFile(fid: string, options?: {
+      signal?: { aborted: boolean } | null;
+      path?: string;
+      priority?: "interactive" | "background";
+    }): Promise<ArrayBuffer>;
 }
 
 /** 日志 cause（0.2.4 A7）：一次失败一条日志，带原因分类。 */
@@ -103,7 +107,9 @@ export type QuarkAdapterDiagStage =
   | "download"
   | "list"
   | "sort"
-  | "decode";
+  | "decode"
+  | "prefetch"
+  | "gate";
 
 /** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5 / 0.2.4 A7）。 */
 export type QuarkAdapterDiagSink = (entry: {
@@ -138,6 +144,10 @@ export interface QuarkReadOnlyAdapterOptions {
    * 写操作仍然 reject `ReadOnlyError`（不假装成功），这里只是通知。
    */
   onReadonlyWrite?: (info: { operation: string; path: string }) => void;
+  /** 0.2.11：预取开关（默认关）；返回 false 时 getResourcePath 未命中不入队。 */
+  allowPrefetch?: () => boolean;
+  /** 0.2.11：每次网络下载成功后回调字节数（会话统计用）。 */
+  onDownloaded?: (bytes: number) => void;
 }
 
 /** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
@@ -230,6 +240,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly diag?: QuarkAdapterDiagSink | null;
   private readonly downloadUi?: QuarkDownloadUi | null;
   private readonly onReadonlyWrite?: (info: { operation: string; path: string }) => void;
+  private readonly allowPrefetch?: () => boolean;
+  private readonly onDownloaded?: (bytes: number) => void;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -244,6 +256,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.diag = options.diag ?? null;
     this.downloadUi = options.downloadUi ?? null;
     this.onReadonlyWrite = options.onReadonlyWrite;
+    this.allowPrefetch = options.allowPrefetch;
+    this.onDownloaded = options.onDownloaded;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -262,10 +276,20 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     try {
       const url = this.cache.getResourceUrl(clean);
       if (url) return url;
-      if (clean) {
+      if (clean && this.prefetchEnabled()) {
         const entry = this.findEntry(clean);
         if (entry) fid = entry.fid;
-        this.cache.enqueuePrefetch([{ path: clean, size: entry ? entry.size : undefined }]);
+        // 0.2.11：唯一允许的入队来源——Obsidian 对当前渲染真实请求的这一个 path
+        const queued = this.cache.enqueuePrefetch([
+          { path: clean, size: entry ? entry.size : undefined },
+        ]) as { queued?: number; dropped?: number; skipped?: number } | undefined;
+        const dropped = queued && typeof queued.dropped === "number" ? queued.dropped : 0;
+        const skipped = queued && typeof queued.skipped === "number" ? queued.skipped : 0;
+        this.reportInfo("prefetch", clean, fid, {
+          state: dropped > 0 ? "drop" : skipped > 0 ? "skip" : "enqueue",
+          src: "render",
+          reason: dropped > 0 ? "queue-full" : "",
+        });
       }
       return "";
     } catch (error) {
@@ -535,9 +559,14 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     const token = this.downloadUi?.begin({ path: clean, fid: entry.fid, sizeBytes: entry.size }) ?? null;
     try {
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
-      const buffer = await this.client.downloadFile(entry.fid, { signal: token, path: clean });
+      const buffer = await this.client.downloadFile(entry.fid, {
+        signal: token,
+        path: clean,
+        priority: this.downloadPriority(clean),
+      });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
+      this.onDownloaded?.(buffer.byteLength);
       this.downloadUi?.end(token, "done");
       return buffer;
     } catch (error) {
@@ -583,6 +612,15 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     }
   }
 
+  /** 0.2.11：预取默认关（设置项 `quarkPrefetchImages`）；未注入视为关闭。 */
+  private prefetchEnabled(): boolean {
+    try {
+      return this.allowPrefetch ? this.allowPrefetch() === true : false;
+    } catch {
+      return false;
+    }
+  }
+
   /** 诊断出口：任何异常都不允许影响读路径；同一错误对象只记一条。 */
   private reportDiag(
     stage: QuarkAdapterDiagStage,
@@ -623,6 +661,11 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       loggedErrors.add(error);
     }
     this.reportDiag(stage, path, fid, error);
+  }
+
+  /** 下载优先级（0.2.11）：md 正文 interactive；图片/PDF/附件 background。 */
+  private downloadPriority(path: string): "interactive" | "background" {
+    return /\.(md|markdown)$/i.test(path) ? "interactive" : "background";
   }
 
   private fidOf(normalizedPath: string): string {

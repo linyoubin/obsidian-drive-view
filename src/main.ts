@@ -157,6 +157,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkRollback: ((info: { operation: string; path: string }) => void) | null = null;
   private readonly quarkPreviewThrottle = createPathThrottle(1000);
   private lastSettingsRefreshAt = 0;
+  /** 0.2.11：本会话下载统计（设置页显示 + 每 30s `stage=stats`）。 */
+  private quarkSessionDownloads = 0;
+  private quarkSessionBytes = 0;
+  private quarkStatsTimerId: number | null = null;
+  private quarkFileOpenRef: { ref?: unknown } | null = null;
 
   private statusBarItemEl: HTMLElement | null = null;
   private pollIntervalId: number | null = null;
@@ -500,6 +505,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
       // 0.2.8：写操作仍 reject ReadOnlyError；拒绝前回调这里做「回滚视图到云端版本」
       onReadonlyWrite: (info) => this.quarkRollback?.(info),
+      // 0.2.11：预取默认关；开启后才允许 getResourcePath 未命中时入队「当前这一个」path
+      allowPrefetch: () => this.settings.quarkPrefetchImages === true,
+      // 0.2.11：会话下载统计（设置页显示 + 每 30s 一条 stage=stats）
+      onDownloaded: (bytes) => {
+        this.quarkSessionDownloads += 1;
+        this.quarkSessionBytes += Math.max(0, bytes);
+      },
     });
 
     this.quarkStatusBarEl = this.addStatusBarItem();
@@ -813,9 +825,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
    */
   private startQuarkPrefetch(): void {
     if (!this.quarkCache || !this.quarkAdapter) return;
-    this.quarkCache.startPrefetchLoop((path) => this.quarkAdapter.readBinary(path), {
-      onLoaded: () => this.refreshQuarkPreviews(),
-    });
+    // 0.2.11：预取完成**不再**触发重绘（重绘会重新请求图片 → 反馈放大）
+    this.quarkCache.startPrefetchLoop((path) => this.quarkAdapter.readBinary(path));
   }
 
   /** 预取完成后的轻量重绘：优先 `previewMode.rerender(true)`，拿不到时回退 `setViewState(getViewState())`。同一文件 1s 内最多 1 次。 */
@@ -899,8 +910,34 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkMounted = true;
     this.refreshQuarkUi();
     new Notice(`夸克：只读库已挂载（${this.quarkIndex.entryCount} 条）`, 5000);
-    // 0.2.9：挂载成功后启动预取循环（getResourcePath 未命中入队的附件由这里消化）
+    // 0.2.9：挂载成功后启动预取循环（仅当「预取当前笔记图片」开着时才会入队）
     this.startQuarkPrefetch();
+    // 0.2.11：切换/关闭笔记 → 丢弃未开始的预取任务，避免跨笔记累积
+    const quarkWorkspace = this.app.workspace as unknown as {
+      on(name: string, callback: () => void): { ref?: unknown };
+      offref(ref: { ref?: unknown }): void;
+    };
+    if (this.quarkFileOpenRef) quarkWorkspace.offref(this.quarkFileOpenRef);
+    this.quarkFileOpenRef = quarkWorkspace.on("file-open", () => {
+      this.quarkCache?.clearPrefetch();
+    });
+    // 0.2.11：会话下载统计，每 30 秒一条日志
+    if (this.quarkStatsTimerId === null) {
+      this.quarkStatsTimerId = window.setInterval(() => {
+        try {
+          this.quarkDiag?.log({
+            level: "info",
+            stage: "stats",
+            path: "/",
+            fid: "-",
+            message: "",
+            fields: { downloads: this.quarkSessionDownloads, bytes: this.quarkSessionBytes },
+          });
+        } catch {
+          /* 统计日志失败不影响运行 */
+        }
+      }, 30_000);
+    }
   }
 
   /** 卸载（QuarkHost 的「退出只读模式」）：还原原生 adapter 并释放内存缓存。 */
@@ -981,6 +1018,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       currentFolder: this.quarkProgress.current,
       downloadConcurrency: this.settings.quarkDownloadConcurrency,
       maxFileBytes: this.settings.quarkMaxFileBytes,
+      prefetchImages: this.settings.quarkPrefetchImages === true,
+      sessionDownloads: this.quarkSessionDownloads,
+      sessionBytes: this.quarkSessionBytes,
     };
   }
 
@@ -1055,6 +1095,12 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
 
 
   /** 设置页：大文件提醒阈值（MB，仅提示，不拦截）。 */
+  /** 0.2.11：预取开关（默认关）。 */
+  public async quarkSetPrefetchImages(value: boolean): Promise<void> {
+    await this.updateSettings({ quarkPrefetchImages: value === true });
+    this.refreshQuarkUi();
+  }
+
   public async quarkSetMaxFileMb(mb: number): Promise<void> {
     const numeric = Number.isFinite(mb) ? mb : 50;
     const safeMb = Math.max(0, Math.min(10240, numeric));

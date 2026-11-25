@@ -29,7 +29,7 @@ interface Harness {
   evicted: Array<{ path: string; bytes: number }>;
 }
 
-function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetchMaxBytes?: number; revokeDelayMs?: number } = {}): Harness {
+function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetchMaxBytes?: number; revokeDelayMs?: number; prefetchQueueMax?: number } = {}): Harness {
   const created: string[] = [];
   const revoked: string[] = [];
   const evicted: Array<{ path: string; bytes: number }> = [];
@@ -38,6 +38,7 @@ function makeCache(options: { maxBytes?: number; prefetchLimit?: number; prefetc
     prefetchLimit: options.prefetchLimit ?? DEFAULT_PREFETCH_LIMIT,
     prefetchMaxBytes: options.prefetchMaxBytes ?? DEFAULT_PREFETCH_MAX_BYTES,
     revokeDelayMs: options.revokeDelayMs ?? 0,
+    prefetchQueueMax: options.prefetchQueueMax ?? 100,
     createObjectUrl: () => {
       const url = `blob:fake-${created.length + 1}`;
       created.push(url);
@@ -196,7 +197,7 @@ describe("ContentCache：预取闸门与批大小", () => {
       { path: "ok.md", size: 1024 },
       { path: "" },
     ]);
-    expect(queued).toEqual({ queued: 1, skipped: 4 });
+    expect(queued).toEqual({ queued: 1, skipped: 4, dropped: 0 });
     expect(cache.pendingPrefetch).toBe(1);
     expect(cache.keys()).toEqual(["cached.md"]);
   });
@@ -343,5 +344,16 @@ describe("ContentCache：blob URL 延迟 revoke（0.2.9）", () => {
     expect(scheduled[0].ms).toBe(60_000);
     scheduled[0].callback(); // 60s 后
     expect(revoked).toEqual([aUrl]);
+  });
+});
+
+describe("ContentCache：预取队列硬上限（0.2.11）", () => {
+  test("上限 8：超过丢弃新增并返回 dropped", () => {
+    const { cache } = makeCache({ prefetchQueueMax: 8 });
+    const items = Array.from({ length: 12 }, (_, i) => ({ path: `img${i}.jpeg` }));
+    const result = cache.enqueuePrefetch(items);
+    expect(result.queued).toBe(8);
+    expect(result.dropped).toBe(4);
+    expect(cache.pendingPrefetch).toBe(8);
   });
 });

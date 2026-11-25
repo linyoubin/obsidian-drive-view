@@ -19,6 +19,8 @@ export const DEFAULT_CONTENT_CACHE_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_PREFETCH_LIMIT = 5;
 /** 单文件超过此大小不自动预取：2 MB。 */
 export const DEFAULT_PREFETCH_MAX_BYTES = 2 * 1024 * 1024;
+/** 预取队列硬上限（0.2.11）：超过 20 条时丢弃新增，等下次重绘再排。 */
+export const DEFAULT_PREFETCH_QUEUE_MAX = 8; // 0.2.11：20 → 8（用户要求更保守）
 
 export interface ContentCacheOptions {
   /** 总字节上限，默认 8 MB。 */
@@ -27,6 +29,8 @@ export interface ContentCacheOptions {
   prefetchLimit?: number;
   /** 单文件自动预取上限，默认 2 MB。 */
   prefetchMaxBytes?: number;
+  /** 预取队列硬上限，默认 20（0.2.11：超出丢弃新增）。 */
+  prefetchQueueMax?: number;
   /** 生成 blob URL；缺省用运行期 `URL.createObjectURL`（不可用则返回空串）。 */
   createObjectUrl?: (data: ArrayBuffer) => string;
   /** 释放 blob URL；缺省用运行期 `URL.revokeObjectURL`。 */
@@ -128,6 +132,7 @@ export class ContentCache {
   private readonly maxBytesValue: number;
   private readonly prefetchLimitValue: number;
   private readonly prefetchMaxBytesValue: number;
+  private readonly prefetchQueueMaxValue: number;
   private readonly createUrl: (data: ArrayBuffer) => string;
   private readonly revokeUrl: (url: string) => void;
   private readonly now: () => number;
@@ -138,6 +143,8 @@ export class ContentCache {
   private prefetchLoader: ContentLoader | null = null;
   private prefetchOnLoaded: ((path: string) => void) | null = null;
   private prefetchWaiter: (() => void) | null = null;
+  /** 正在下载中的 path（0.2.11：入队去重也要算上它们，避免同一文件重复排队）。 */
+  private readonly prefetchInFlight = new Set<string>();
 
   private readonly entries = new Map<string, CacheEntry>();
   private totalBytes = 0;
@@ -147,6 +154,7 @@ export class ContentCache {
     this.maxBytesValue = Math.max(1, options.maxBytes ?? DEFAULT_CONTENT_CACHE_BYTES);
     this.prefetchLimitValue = Math.max(1, options.prefetchLimit ?? DEFAULT_PREFETCH_LIMIT);
     this.prefetchMaxBytesValue = Math.max(1, options.prefetchMaxBytes ?? DEFAULT_PREFETCH_MAX_BYTES);
+    this.prefetchQueueMaxValue = Math.max(1, options.prefetchQueueMax ?? DEFAULT_PREFETCH_QUEUE_MAX);
     this.createUrl = options.createObjectUrl ?? defaultCreateObjectUrl;
     this.revokeUrl = options.revokeObjectUrl ?? defaultRevokeObjectUrl;
     this.now = options.now ?? ((): number => Date.now());
@@ -284,12 +292,13 @@ export class ContentCache {
    *
    * 跳过：已缓存、已在队列、无 path、以及已知大小 > `prefetchMaxBytes`（2 MB）的文件。
    */
-  enqueuePrefetch(items: PrefetchItem[]): { queued: number; skipped: number } {
+  enqueuePrefetch(items: PrefetchItem[]): { queued: number; skipped: number; dropped: number } {
     let queued = 0;
     let skipped = 0;
+    let dropped = 0;
     for (const item of items) {
       const path = item && typeof item.path === "string" ? item.path : "";
-      if (!path || this.entries.has(path) || this.queue.some((queuedItem) => queuedItem.path === path)) {
+      if (!path || this.entries.has(path) || this.prefetchInFlight.has(path) || this.queue.some((queuedItem) => queuedItem.path === path)) {
         skipped += 1;
         continue;
       }
@@ -298,10 +307,15 @@ export class ContentCache {
         skipped += 1;
         continue;
       }
+      if (this.queue.length >= this.prefetchQueueMaxValue) {
+        // 0.2.11：硬上限 20，丢弃新增（下次重绘再排），避免图片洪流无限堆积
+        dropped += 1;
+        continue;
+      }
       this.queue.push({ path, size: item.size });
       queued += 1;
     }
-    return { queued, skipped };
+    return { queued, skipped, dropped };
   }
 
   clearPrefetch(): void {
@@ -326,6 +340,8 @@ export class ContentCache {
       const outcomes = await Promise.all(
         batch.map(async (item) => {
           if (this.entries.has(item.path)) return { status: "skipped" as const, bytes: 0, path: item.path };
+          // 0.2.11：下载中也要挡住重复入队
+          this.prefetchInFlight.add(item.path);
           try {
             const data = await loader(item.path);
             // 0.2.9：0 字节也是合法内容，照常缓存（只是没有 blob URL）
@@ -334,6 +350,8 @@ export class ContentCache {
             return { status: "loaded" as const, bytes: byteLengthOf(data), path: item.path };
           } catch {
             return { status: "failed" as const, bytes: 0, path: item.path };
+          } finally {
+            this.prefetchInFlight.delete(item.path);
           }
         })
       );

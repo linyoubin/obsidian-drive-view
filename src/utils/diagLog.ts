@@ -21,12 +21,15 @@ export type DiagStage =
   | "sort"
   | "index"
   | "write"
-  | "decode";
+  | "decode"
+  | "prefetch"
+  | "gate"
+  | "stats";
 
 /** 日志文件（库内路径，走 Obsidian adapter 写）。 */
 export const DIAG_LOG_PATH = ".obsidian/plugins/drive-view/quark-debug.log";
 /** 环形上限：200 KB。 */
-export const DIAG_LOG_MAX_BYTES = 200 * 1024;
+export const DIAG_LOG_MAX_BYTES = 512 * 1024; // 0.2.11：200KB → 512KB（避免 md 的 read 行被图片洪流挤出窗口）
 /** 单条错误消息上限：200 字符。 */
 export const DIAG_MSG_MAX = 200;
 /** 「导出诊断」最多带走的行数。 */

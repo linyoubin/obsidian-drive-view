@@ -146,7 +146,8 @@ describe("DownloadGate：并发上限与排队（A2）", () => {
     await Promise.all(tasks);
     expect(observedPeak).toBeLessThanOrEqual(4);
     expect(gate.peak).toBeLessThanOrEqual(4);
-    expect(gate.peak).toBe(4);
+    // 0.2.11：未标优先级 → background 通道（上限 2）
+    expect(gate.peak).toBe(2);
   });
 
   test("任务异常不泄漏并发槽：失败后下一个仍能跑", async () => {
@@ -410,5 +411,38 @@ describe("0.2.10 埋点：read / decode / download 两跳", () => {
     const hop2 = entries.find((entry) => entry.fields?.hop === 2)!;
     expect(hop2.fields).toMatchObject({ status: 200, contentType: "text/markdown", bytes: 4 });
     expect(String(hop2.fields!.firstBytes)).toBe("23206869"); // "# hi" 的前 4 字节
+  });
+});
+
+// ------------------------------------------------------------------ 0.2.11 双优先级
+
+describe("DownloadGate：双优先级（0.2.11）", () => {
+  test("5 个 background 排队 + 1 个 interactive → interactive 先执行", async () => {
+    const gate = new DownloadGate({ concurrency: 4 });
+    const order: string[] = [];
+    const task = (name: string) => async () => {
+      order.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    };
+    const background = Array.from({ length: 5 }, (_, i) => gate.run(task(`bg${i}`), { priority: "background" }));
+    // 先启动 2 个 bg；再插 1 个 i
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const interactive = gate.run(task("i0"), { priority: "interactive" });
+    await Promise.all([...background, interactive]);
+    // 前两个是 bg（已在跑），第三个必须是 i，不能是 bg2
+    expect(order.slice(0, 3)).toEqual(["bg0", "bg1", "i0"]);
+    expect(order).toHaveLength(6);
+  });
+
+  test("gate 事件：queued/acquired 带 prio 与 waitMs，abandoned 用于取消", async () => {
+    const events: Array<{ state: string; priority: string; waitMs: number }> = [];
+    const gate = new DownloadGate({ concurrency: 1, onEvent: (event) => events.push(event) });
+    await gate.run(async () => "ok", { priority: "interactive" });
+    expect(events.some((event) => event.state === "queued" && event.priority === "i")).toBe(true);
+    expect(events.some((event) => event.state === "acquired" && event.priority === "i")).toBe(true);
+    expect(events.every((event) => event.waitMs >= 0)).toBe(true);
+    const signal = { aborted: true };
+    await expect(gate.run(async () => "x", { priority: "background", signal })).rejects.toThrow("取消");
+    expect(events.some((event) => event.state === "abandoned" && event.priority === "bg")).toBe(true);
   });
 });

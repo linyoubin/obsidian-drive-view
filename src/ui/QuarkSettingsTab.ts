@@ -33,6 +33,12 @@ export interface QuarkUiSnapshot {
   downloadConcurrency: number;
   /** 大文件提醒阈值（字节，0 = 不提醒；仅提示不拦截）。 */
   maxFileBytes: number;
+  /** 0.2.11：是否预取当前笔记的图片（默认关）。 */
+  prefetchImages: boolean;
+  /** 0.2.11：本会话已下载文件数。 */
+  sessionDownloads: number;
+  /** 0.2.11：本会话已下载字节数。 */
+  sessionBytes: number;
 }
 
 /** 主插件暴露给设置页/弹窗的最小接口（避免 UI 直接操作 store/client）。 */
@@ -48,6 +54,8 @@ export interface QuarkHost {
   quarkSetDownloadConcurrency(value: number): Promise<void>;
   /** 0.2.4：大文件提醒阈值（MB，仅提示不拦截）。 */
   quarkSetMaxFileMb(mb: number): Promise<void>;
+  /** 0.2.11：预取开关（默认关）。 */
+  quarkSetPrefetchImages(value: boolean): Promise<void>;
 }
 
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
@@ -68,6 +76,9 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   currentFolder: "",
   downloadConcurrency: 4,
   maxFileBytes: 50 * 1024 * 1024,
+  prefetchImages: false,
+  sessionDownloads: 0,
+  sessionBytes: 0,
 };
 
 /** 登录态文案：未登录 / 已登录（N 个 cookie）/ 登录已过期（缺判据）。 */
@@ -437,6 +448,27 @@ export class QuarkSettingsTab extends settingTabBase() {
             const parsed = Number.parseInt(String(value), 10);
             if (Number.isFinite(parsed)) await this.host.quarkSetDownloadConcurrency(parsed);
           })
+      );
+
+    // 0.2.11：默认不预取；开启后只预取「当前渲染真实请求的图片」，仍受 8 条上限
+    new Setting(container)
+      .setName("预取当前笔记的图片（默认关）")
+      .setDesc(
+        snapshot.prefetchImages
+          ? "已开启：打开笔记时只把 Obsidian 当下请求的图片逐个入队（最多 8 个），不解析笔记、不跨笔记累积"
+          : "关闭：图片只有手动点开时才下载；需要看图请在文件树里点它"
+      )
+      .addToggle((toggle: any) =>
+        toggle.setValue(snapshot.prefetchImages).onChange(async (value: boolean) => {
+          await this.host.quarkSetPrefetchImages(value === true);
+          this.display();
+        })
+      );
+
+    new Setting(container)
+      .setName("本次会话下载统计")
+      .setDesc(
+        `已下载 ${snapshot.sessionDownloads} 个文件 / ${(snapshot.sessionBytes / (1024 * 1024)).toFixed(2)} MB`
       );
 
     // 0.2.4 A6′：「单文件上限」改成提醒阈值，只影响提示、不拦截下载

@@ -185,6 +185,8 @@ export interface QuarkSettings {
    * 大文件**提醒阈值**（字节，默认 50 MB，0 = 不提醒）；**仅影响提示文案，不拦截下载**（0.2.4 A6′）。
    */
   quarkMaxFileBytes: number;
+  /** 0.2.11：默认不预取图片；只有开启后 getResourcePath 未命中才把「当前这一个」path 入队。 */
+  quarkPrefetchImages: boolean;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -195,6 +197,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkLastIndexBuiltAt: 0,
   quarkDownloadConcurrency: 4,
   quarkMaxFileBytes: 50 * 1024 * 1024,
+  quarkPrefetchImages: false,
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */
