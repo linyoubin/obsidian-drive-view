@@ -637,12 +637,12 @@ export class QuarkClient {
     options: {
       signal?: GateSignal | null;
       path?: string;
-      priority?: "interactive" | "background";
+      priority?: "interactive" | "background" | "bulk";
     } = {}
   ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
     const path = options.path || fid;
-    const priority = options.priority === "interactive" ? "interactive" : "background";
+    const priority = options.priority ?? "background";
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
     const shared = this.inflight.run(fid, () =>
       this.downloadGate.run(() => this.downloadWithRetry(fid, signal, path), { path, priority })
@@ -760,7 +760,7 @@ export class QuarkClient {
   }
 
   /** 闸门事件埋点（0.2.11）：`stage=gate state=… prio=… waitMs=…`。 */
-  private logGate(event: { state: "queued" | "acquired" | "abandoned"; priority: "i" | "bg"; path: string; waitMs: number }): void {
+  private logGate(event: { state: "queued" | "acquired" | "abandoned"; priority: "i" | "bg" | "bulk"; path: string; waitMs: number }): void {
     try {
       this.diag?.({
         level: "info",

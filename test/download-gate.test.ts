@@ -446,3 +446,52 @@ describe("DownloadGate：双优先级（0.2.11）", () => {
     expect(events.some((event) => event.state === "abandoned" && event.priority === "bg")).toBe(true);
   });
 });
+
+// ------------------------------------------------------------------ 0.2.13 三级优先级
+
+describe("DownloadGate：三级优先级（0.2.13）", () => {
+  test("bulk 让位于 background：bg 先于剩余 bulk 执行", async () => {
+    const gate = new DownloadGate({ concurrency: 2 });
+    const order: string[] = [];
+    const task = (name: string) => async () => {
+      order.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    };
+    const bulk = Array.from({ length: 4 }, (_, i) => gate.run(task(`bulk${i}`), { priority: "bulk" }));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const bg = gate.run(task("bg0"), { priority: "background" });
+    await Promise.all([...bulk, bg]);
+    expect(order.indexOf("bg0")).toBeLessThan(order.indexOf("bulk2"));
+    expect(order).toHaveLength(5);
+  });
+
+  test("interactive 到达时 bulk 让路", async () => {
+    const gate = new DownloadGate({ concurrency: 2 });
+    const order: string[] = [];
+    const task = (name: string) => async () => {
+      order.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    };
+    const bulk = Array.from({ length: 4 }, (_, i) => gate.run(task(`bulk${i}`), { priority: "bulk" }));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const interactive = gate.run(task("i0"), { priority: "interactive" });
+    await Promise.all([...bulk, interactive]);
+    const iAt = order.indexOf("i0");
+    expect(iAt).toBeGreaterThanOrEqual(2);
+    expect(iAt).toBeLessThan(order.indexOf("bulk2"));
+  });
+});
+
+describe("DownloadGate：bulk 事件与取消（0.2.13）", () => {
+  test("bulk 任务事件带 prio=bulk；failAuth 清空 bulk 队列", async () => {
+    const events: Array<{ state: string; priority: string }> = [];
+    const gate = new DownloadGate({ concurrency: 1, onEvent: (event) => events.push(event) });
+    const running = gate.run(async () => new Promise((resolve) => setTimeout(resolve, 5)), { priority: "bulk" });
+    const queued = gate.run(async () => "x", { priority: "bulk" });
+    gate.failAuth(1000);
+    await expect(queued).rejects.toThrow();
+    await running.catch(() => undefined);
+    expect(events.some((event) => event.priority === "bulk" && event.state === "queued")).toBe(true);
+    expect(events.some((event) => event.priority === "bulk" && event.state === "abandoned")).toBe(true);
+  });
+});

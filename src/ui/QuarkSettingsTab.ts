@@ -35,6 +35,17 @@ export interface QuarkUiSnapshot {
   maxFileBytes: number;
   /** 0.2.11：是否预取当前笔记的图片（默认关）。 */
   prefetchImages: boolean;
+  /** 0.2.13：每篇笔记预取上限（0 = 不限）。 */
+  prefetchPerNote: number;
+  /** 0.2.13：全库 md 正文预取开关。 */
+  prefetchAllMarkdown: boolean;
+  /** 0.2.13：bulk 进度（已下载/总数/字节/状态）。 */
+  bulkDone: number;
+  bulkTotal: number;
+  bulkBytes: number;
+  bulkState: string;
+  /** 0.2.12：当前笔记本批入队数量。 */
+  lastNotePrefetch: number;
   /** 0.2.11：本会话已下载文件数。 */
   sessionDownloads: number;
   /** 0.2.11：本会话已下载字节数。 */
@@ -56,6 +67,10 @@ export interface QuarkHost {
   quarkSetMaxFileMb(mb: number): Promise<void>;
   /** 0.2.11：预取开关（默认关）。 */
   quarkSetPrefetchImages(value: boolean): Promise<void>;
+  /** 0.2.12：每篇笔记预取上限（0–200）。 */
+  quarkSetPrefetchPerNote(value: number): Promise<void>;
+  quarkSetPrefetchAllMarkdown(value: boolean): Promise<void>;
+  quarkCancelBulkPrefetch(): void;
 }
 
 export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
@@ -76,7 +91,14 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   currentFolder: "",
   downloadConcurrency: 4,
   maxFileBytes: 50 * 1024 * 1024,
-  prefetchImages: false,
+  prefetchImages: true,
+  prefetchPerNote: 0,
+  lastNotePrefetch: 0,
+  prefetchAllMarkdown: true,
+  bulkDone: 0,
+  bulkTotal: 0,
+  bulkBytes: 0,
+  bulkState: "idle",
   sessionDownloads: 0,
   sessionBytes: 0,
 };
@@ -450,13 +472,13 @@ export class QuarkSettingsTab extends settingTabBase() {
           })
       );
 
-    // 0.2.11：默认不预取；开启后只预取「当前渲染真实请求的图片」，仍受 8 条上限
+    // 0.2.13：按笔记精准预取（默认开；上限 0 = 不限）
     new Setting(container)
-      .setName("预取当前笔记的图片（默认关）")
+      .setName("预取当前笔记的图片（默认开）")
       .setDesc(
         snapshot.prefetchImages
-          ? "已开启：打开笔记时只把 Obsidian 当下请求的图片逐个入队（最多 8 个），不解析笔记、不跨笔记累积"
-          : "关闭：图片只有手动点开时才下载；需要看图请在文件树里点它"
+          ? `打开 .md 时只预取这篇笔记真实引用的附件：本笔记 ${snapshot.lastNotePrefetch} 张，上限 ${snapshot.prefetchPerNote === 0 ? "不限" : snapshot.prefetchPerNote}，队列上限 8、并发 2`
+          : "关闭：图片只有在文件树里手动点开时才下载"
       )
       .addToggle((toggle: any) =>
         toggle.setValue(snapshot.prefetchImages).onChange(async (value: boolean) => {
@@ -466,9 +488,43 @@ export class QuarkSettingsTab extends settingTabBase() {
       );
 
     new Setting(container)
+      .setName("每篇笔记预取上限（0 = 不限）")
+      .setDesc(`当前 ${snapshot.prefetchPerNote === 0 ? "不限" : snapshot.prefetchPerNote} 张；0 表示有多少取多少`)
+      .addText((text: any) =>
+        text
+          .setPlaceholder("0")
+          .setValue(String(snapshot.prefetchPerNote))
+          .onChange(async (value: string) => {
+            const parsed = Number.parseInt(String(value), 10);
+            if (Number.isFinite(parsed)) await this.host.quarkSetPrefetchPerNote(parsed);
+          })
+      );
+
+    // 0.2.13：全库 md 正文预取（内容搜索用，默认开）
+    new Setting(container)
+      .setName("预取全库 Markdown 正文（默认开）")
+      .setDesc(
+        snapshot.prefetchAllMarkdown
+          ? `后台低优先级预取（供内容搜索）：${snapshot.bulkDone}/${snapshot.bulkTotal} · ${(snapshot.bulkBytes / (1024 * 1024)).toFixed(2)} MB · ${snapshot.bulkState}`
+          : "关闭：全局搜索首次会现拉文件；只影响搜索速度，不影响打开笔记"
+      )
+      .addToggle((toggle: any) =>
+        toggle.setValue(snapshot.prefetchAllMarkdown).onChange(async (value: boolean) => {
+          await this.host.quarkSetPrefetchAllMarkdown(value === true);
+          this.display();
+        })
+      )
+      .addButton((button: any) =>
+        button.setButtonText("取消正文预取").onClick(() => {
+          this.host.quarkCancelBulkPrefetch();
+          this.display();
+        })
+      );
+
+    new Setting(container)
       .setName("本次会话下载统计")
       .setDesc(
-        `已下载 ${snapshot.sessionDownloads} 个文件 / ${(snapshot.sessionBytes / (1024 * 1024)).toFixed(2)} MB`
+        `已下载 ${snapshot.sessionDownloads} 个文件 / ${(snapshot.sessionBytes / (1024 * 1024)).toFixed(2)} MB（正文与附件合计）`
       );
 
     // 0.2.4 A6′：「单文件上限」改成提醒阈值，只影响提示、不拦截下载

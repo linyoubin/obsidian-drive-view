@@ -31,6 +31,7 @@ import {
 } from "../client/QuarkClient";
 import { DownloadGateError } from "../client/downloadGate";
 import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
+import { attachmentCandidates, extractAttachmentRefs, isMarkdownPath } from "../utils/noteRefs";
 import { ReadOnlyError } from "./readonlyError";
 
 /** 本 adapter 的固定名字（`getName()` 返回值）。 */
@@ -57,6 +58,8 @@ export interface QuarkCacheLike {
     meta?: { fid?: string; mtime?: number }
   ): { cached: boolean };
   enqueuePrefetch(items: Array<{ path: string; size?: number }>): unknown;
+  /** 0.2.12：是否在队列/下载中（按笔记精准预取时跳过）。 */
+  isPrefetching?(path: string): boolean;
 }
 
 /** 下载器的最小接口（`QuarkClient` 结构上满足）。 */
@@ -65,7 +68,7 @@ export interface QuarkDownloadClient {
   downloadFile(fid: string, options?: {
       signal?: { aborted: boolean } | null;
       path?: string;
-      priority?: "interactive" | "background";
+      priority?: "interactive" | "background" | "bulk";
     }): Promise<ArrayBuffer>;
 }
 
@@ -146,8 +149,10 @@ export interface QuarkReadOnlyAdapterOptions {
   onReadonlyWrite?: (info: { operation: string; path: string }) => void;
   /** 0.2.11：预取开关（默认关）；返回 false 时 getResourcePath 未命中不入队。 */
   allowPrefetch?: () => boolean;
+  /** 0.2.12：每篇笔记的预取上限（默认 20；0 = 关闭）。 */
+  prefetchPerNote?: () => number;
   /** 0.2.11：每次网络下载成功后回调字节数（会话统计用）。 */
-  onDownloaded?: (bytes: number) => void;
+  onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
 }
 
 /** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
@@ -241,7 +246,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly downloadUi?: QuarkDownloadUi | null;
   private readonly onReadonlyWrite?: (info: { operation: string; path: string }) => void;
   private readonly allowPrefetch?: () => boolean;
-  private readonly onDownloaded?: (bytes: number) => void;
+  private readonly prefetchPerNote?: () => number;
+  private readonly onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -257,6 +263,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.downloadUi = options.downloadUi ?? null;
     this.onReadonlyWrite = options.onReadonlyWrite;
     this.allowPrefetch = options.allowPrefetch;
+    this.prefetchPerNote = options.prefetchPerNote;
     this.onDownloaded = options.onDownloaded;
   }
 
@@ -414,6 +421,12 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     }
   }
 
+  /** 0.2.13：bulk 预取专用读取——强制 bulk 优先级（永远让位于 interactive/background）。 */
+  async readForBulk(normalizedPath: string): Promise<ArrayBuffer> {
+    if (this.shouldForward(normalizedPath)) return this.baseAdapter.readBinary(normalizedPath);
+    return await this.loadBinary(normalizedPath, "bulk");
+  }
+
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
     if (this.shouldForward(normalizedPath)) {
       return this.baseAdapter.readBinary(normalizedPath);
@@ -545,7 +558,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
    * 取消 = 丢弃结果 + 不写缓存 + 抛 `QuarkDownloadCanceledError`；
    * `requestUrl` 无 AbortSignal，**无法中断已发出的 HTTP**，这里也不假装能中断。
    */
-  private async loadBinary(normalizedPath: string): Promise<ArrayBuffer> {
+  private async loadBinary(
+    normalizedPath: string,
+    priorityOverride?: "interactive" | "background" | "bulk"
+  ): Promise<ArrayBuffer> {
     const clean = normalizeVaultPath(normalizedPath);
     if (!clean) throw new QuarkEntryNotFoundError(clean);
 
@@ -562,11 +578,11 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       const buffer = await this.client.downloadFile(entry.fid, {
         signal: token,
         path: clean,
-        priority: this.downloadPriority(clean),
+        priority: priorityOverride ?? this.downloadPriority(clean),
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
-      this.onDownloaded?.(buffer.byteLength);
+      this.onDownloaded?.(buffer.byteLength, priorityOverride ?? this.downloadPriority(clean));
       this.downloadUi?.end(token, "done");
       return buffer;
     } catch (error) {
@@ -666,6 +682,92 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   /** 下载优先级（0.2.11）：md 正文 interactive；图片/PDF/附件 background。 */
   private downloadPriority(path: string): "interactive" | "background" {
     return /\.(md|markdown)$/i.test(path) ? "interactive" : "background";
+  }
+
+  /**
+   * 0.2.12：按笔记精准预取——只取**这篇笔记真实引用、索引里存在、非 md** 的附件。
+   *
+   * - 解析六种写法（见 `utils/noteRefs`），按出现顺序；
+   * - 跳过：not-indexed / cached / inflight / duplicate(fid)；
+   * - 每篇上限 `prefetchPerNote`（默认 20，0=关闭）；超出记 `state=drop reason=cap`；
+   * - 队列上限仍为 8；完成后写一条 `state=summary`。
+   */
+  async prefetchNote(notePath: string): Promise<{
+    enqueued: number;
+    skipped: number;
+    dropped: number;
+    total: number;
+  }> {
+    const clean = normalizeVaultPath(notePath);
+    const zero = { enqueued: 0, skipped: 0, dropped: 0, total: 0 };
+    if (!clean || !this.prefetchEnabled() || !isMarkdownPath(clean)) return zero;
+
+    const capRaw = this.prefetchPerNote ? this.prefetchPerNote() : 0;
+    // 0.2.13：0 = 不限（有多少取多少）；非 0 才是手动上限
+    const cap = Number.isFinite(capRaw) && capRaw > 0 ? Math.floor(capRaw) : Number.POSITIVE_INFINITY;
+
+    let content = "";
+    try {
+      content = await this.read(clean);
+    } catch {
+      return zero;
+    }
+
+    const refs = attachmentCandidates(extractAttachmentRefs(content), clean);
+    const fidSeen = new Set<string>();
+    let enqueued = 0;
+    let skipped = 0;
+    let dropped = 0;
+
+    for (let order = 0; order < refs.length; order += 1) {
+      const candidate = refs[order];
+      const entry = this.findEntry(candidate);
+      if (!entry) {
+        skipped += 1;
+        this.reportInfo("prefetch", candidate, "-", { state: "skip", reason: "not-indexed", order });
+        continue;
+      }
+      if (fidSeen.has(entry.fid)) {
+        skipped += 1;
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "skip", reason: "duplicate", order });
+        continue;
+      }
+      if (this.cache.has(candidate)) {
+        skipped += 1;
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "skip", reason: "cached", order });
+        continue;
+      }
+      if (this.cache.isPrefetching?.(candidate)) {
+        skipped += 1;
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "skip", reason: "inflight", order });
+        continue;
+      }
+      if (enqueued >= cap) {
+        dropped += 1;
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "drop", reason: "cap", order, dropped });
+        continue;
+      }
+      const result = this.cache.enqueuePrefetch([{ path: candidate, size: entry.size }]) as
+        | { queued?: number; dropped?: number }
+        | undefined;
+      if (result && typeof result.queued === "number" && result.queued > 0) {
+        enqueued += 1;
+        fidSeen.add(entry.fid);
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "enqueue", src: "note", order });
+      } else {
+        dropped += 1;
+        this.reportInfo("prefetch", candidate, entry.fid, { state: "drop", reason: "cap", order, dropped });
+      }
+    }
+
+    this.reportInfo("prefetch", clean, "-", {
+      state: "summary",
+      src: "note",
+      enqueued,
+      skipped,
+      dropped,
+    });
+    return { enqueued, skipped, dropped, total: refs.length };
   }
 
   private fidOf(normalizedPath: string): string {

@@ -48,6 +48,7 @@ import { GoogleDriveSettingTab } from "./ui/SettingsTab";
 import { DownloadNoticeBook } from "./client/downloadUi";
 import type { DownloadNoticeLike } from "./client/downloadUi";
 import { createPathThrottle, normalizeVaultPath } from "./utils/pathUtils";
+import { runBulkPrefetch } from "./prefetch/bulkPrefetch";
 import { DIAG_LOG_PATH, DIAG_TAIL_LINES, DiagLogger, tailDiagLines } from "./utils/diagLog";
 import type { DiagAdapterLike } from "./utils/diagLog";
 
@@ -161,7 +162,21 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkSessionDownloads = 0;
   private quarkSessionBytes = 0;
   private quarkStatsTimerId: number | null = null;
+  /** 0.2.12：当前笔记与预取数量（设置页显示）。 */
+  private quarkLastNotePath = "";
+  private quarkLastNotePrefetch = 0;
+  private quarkRerenderTimer: number | null = null;
+  private quarkLastRerenderAt = 0;
+  private quarkStatI = { downloads: 0, bytes: 0 };
+  private quarkStatBg = { downloads: 0, bytes: 0 };
+  private quarkStatBulk = { downloads: 0, bytes: 0 };
   private quarkFileOpenRef: { ref?: unknown } | null = null;
+  /** 0.2.13：bulk（全库 md 正文）预取状态与取消代数。 */
+  private quarkBulkGeneration = 0;
+  private quarkBulkState = "idle";
+  private quarkBulkDone = 0;
+  private quarkBulkTotal = 0;
+  private quarkBulkBytes = 0;
 
   private statusBarItemEl: HTMLElement | null = null;
   private pollIntervalId: number | null = null;
@@ -266,6 +281,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     hideQuarkSyncNotice();
     // 0.2.9：预取循环随插件卸载停止
     this.quarkCache?.stopPrefetchLoop();
+    this.quarkCancelBulkPrefetch();
     await this.mounter.unmount(this.driveAdapter);
     // 夸克只读库：若是我们挂的，随插件卸载一起还原原生 adapter
     if (this.quarkMounted) {
@@ -505,12 +521,18 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
       // 0.2.8：写操作仍 reject ReadOnlyError；拒绝前回调这里做「回滚视图到云端版本」
       onReadonlyWrite: (info) => this.quarkRollback?.(info),
-      // 0.2.11：预取默认关；开启后才允许 getResourcePath 未命中时入队「当前这一个」path
-      allowPrefetch: () => this.settings.quarkPrefetchImages === true,
+      // 0.2.12：预取默认开启（字段缺省视为开）；关闭后 getResourcePath/按笔记预取都不入队
+      allowPrefetch: () => this.settings.quarkPrefetchImages !== false,
+      // 0.2.12：每篇笔记上限（默认 20；0 = 关闭）
+      prefetchPerNote: () => this.settings.quarkPrefetchPerNote ?? 20,
       // 0.2.11：会话下载统计（设置页显示 + 每 30s 一条 stage=stats）
-      onDownloaded: (bytes) => {
+      onDownloaded: (bytes, priority) => {
+        const size = Math.max(0, bytes);
         this.quarkSessionDownloads += 1;
-        this.quarkSessionBytes += Math.max(0, bytes);
+        this.quarkSessionBytes += size;
+        if (priority === "interactive") { this.quarkStatI.downloads += 1; this.quarkStatI.bytes += size; }
+        else if (priority === "bulk") { this.quarkStatBulk.downloads += 1; this.quarkStatBulk.bytes += size; }
+        else { this.quarkStatBg.downloads += 1; this.quarkStatBg.bytes += size; }
       },
     });
 
@@ -679,6 +701,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     }
     // 0.2.9：改库根时停止预取（旧库的附件不该再下载）
     this.quarkCache.stopPrefetchLoop();
+    // 0.2.13：bulk 任务作废（代数+1，旧根的任务不再发起）
+    this.quarkCancelBulkPrefetch();
     await this.quarkIndex.clearAll();
     this.quarkCache.clear();
     await this.updateSettings({ quarkLastIndexBuiltAt: 0 });
@@ -829,6 +853,67 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     this.quarkCache.startPrefetchLoop((path) => this.quarkAdapter.readBinary(path));
   }
 
+  /**
+   * 0.2.12：文件打开 → 清空上一笔记未开始的预取 → 按当前笔记精准预取 → 节流重绘。
+   * 只处理 `.md`；开关关闭或上限 0 时完全不预取。
+   */
+  private async onQuarkFileOpen(): Promise<void> {
+    const cache = this.quarkCache;
+    if (!cache) return;
+    cache.clearPrefetch(); // 切换/关闭笔记：丢弃未开始的任务
+    const workspace = this.app.workspace as unknown as {
+      activeLeaf?: { view?: { file?: { path?: string } | null } | null } | null;
+    };
+    const path = workspace.activeLeaf?.view?.file?.path ?? "";
+    this.quarkLastNotePath = path;
+    this.quarkLastNotePrefetch = 0;
+    if (!path || !/\.(md|markdown)$/i.test(path) || !this.quarkAdapter) {
+      this.refreshQuarkUi();
+      return;
+    }
+    if (this.settings.quarkPrefetchImages === false) return;
+    if ((this.settings.quarkPrefetchPerNote ?? 20) <= 0) return;
+    try {
+      const result = await this.quarkAdapter.prefetchNote(path);
+      this.quarkLastNotePrefetch = result.enqueued;
+      this.scheduleActivePreviewRefresh();
+      this.refreshQuarkUi();
+    } catch {
+      /* 预取失败不影响阅读 */
+    }
+  }
+
+  /**
+   * 0.2.12：整批完成或每 1.5 秒最多一次，只重绘**当前活动叶子**（不遍历所有视图）。
+   */
+  private scheduleActivePreviewRefresh(): void {
+    if (this.quarkRerenderTimer !== null) return;
+    const tick = (): void => {
+      const now = Date.now();
+      const pending = this.quarkCache?.pendingPrefetch ?? 0;
+      if (pending > 0 || now - this.quarkLastRerenderAt < 1500) {
+        this.quarkRerenderTimer = window.setTimeout(tick, pending > 0 ? 300 : 1500 - (now - this.quarkLastRerenderAt));
+        return;
+      }
+      this.quarkRerenderTimer = null;
+      this.quarkLastRerenderAt = now;
+      this.refreshActivePreview();
+    };
+    this.quarkRerenderTimer = window.setTimeout(tick, 300);
+  }
+
+  /** 只重绘当前活动叶子（0.2.12：不再遍历 workspace.iterateAllLeaves）。 */
+  private refreshActivePreview(): void {
+    try {
+      const workspace = this.app.workspace as unknown as {
+        activeLeaf?: { view?: { previewMode?: { rerender?: (force?: boolean) => void } | null } | null } | null;
+      };
+      workspace.activeLeaf?.view?.previewMode?.rerender?.(true);
+    } catch {
+      /* 重绘失败不影响阅读 */
+    }
+  }
+
   /** 预取完成后的轻量重绘：优先 `previewMode.rerender(true)`，拿不到时回退 `setViewState(getViewState())`。同一文件 1s 内最多 1 次。 */
   private refreshQuarkPreviews(): void {
     const workspace = this.app.workspace as unknown as {
@@ -898,6 +983,71 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     }));
   }
 
+  /**
+   * 0.2.13：全库 md 正文预取（内容搜索用）——bulk 最低优先级、并发 2；
+   * 取消 = 代数变化（切换库根/退出/手动取消），之后不再发起新任务。
+   */
+  private startBulkPrefetch(): void {
+    if (!this.quarkCache || !this.quarkAdapter || !this.quarkIndex) return;
+    if (this.settings.quarkPrefetchAllMarkdown === false) {
+      this.quarkBulkState = "off";
+      return;
+    }
+    const paths = this.quarkIndex.entries
+      .filter((entry) => entry.type !== "folder" && /\.(md|markdown)$/i.test(entry.path))
+      .map((entry) => entry.path);
+    if (paths.length === 0) {
+      this.quarkBulkState = "done";
+      return;
+    }
+    const generation = ++this.quarkBulkGeneration;
+    this.quarkBulkState = "running";
+    this.quarkBulkTotal = paths.length;
+    this.quarkBulkDone = 0;
+    this.quarkBulkBytes = 0;
+    this.refreshQuarkUi();
+    this.logBulk("bulk", { enqueued: paths.length });
+    void runBulkPrefetch({
+      paths,
+      load: (path) => this.quarkAdapter!.readForBulk(path),
+      isCached: (path) => this.quarkCache!.has(path),
+      isInFlight: (path) => this.quarkCache!.isPrefetching(path),
+      shouldStop: () => generation !== this.quarkBulkGeneration,
+      onProgress: (progress) => {
+        this.quarkBulkDone = progress.done;
+        this.quarkBulkBytes = progress.bytes;
+      },
+    })
+      .then((result) => {
+        if (generation !== this.quarkBulkGeneration) return;
+        this.quarkBulkState = result.canceled ? "canceled" : "done";
+        this.logBulk("bulk-done", {
+          downloaded: result.downloaded,
+          bytes: result.bytes,
+          elapsed: Math.round(result.elapsedMs / 1000),
+        });
+        this.refreshQuarkUi();
+      })
+      .catch(() => {
+        if (generation === this.quarkBulkGeneration) this.quarkBulkState = "failed";
+      });
+  }
+
+  /** bulk 诊断日志：stage=prefetch state=bulk/bulk-done。 */
+  private logBulk(state: string, fields: Record<string, string | number | boolean>): void {
+    try {
+      this.quarkDiag?.log({
+        level: "info",
+        stage: "prefetch",
+        path: "/",
+        fid: "-",
+        message: "",
+        fields: { state, ...fields },
+      });
+    } catch {
+      /* 日志失败不影响预取 */
+    }
+  }
   /** 挂载的唯一调用点（A7）：带 `mounted` 保护，走 VaultMounter。 */
   private async mountQuark(): Promise<void> {
     if (this.mounter.isMounted()) {
@@ -912,6 +1062,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     new Notice(`夸克：只读库已挂载（${this.quarkIndex.entryCount} 条）`, 5000);
     // 0.2.9：挂载成功后启动预取循环（仅当「预取当前笔记图片」开着时才会入队）
     this.startQuarkPrefetch();
+    // 0.2.13：全库 md 正文预取（内容搜索用；同步完成后启动，可取消）
+    this.startBulkPrefetch();
     // 0.2.11：切换/关闭笔记 → 丢弃未开始的预取任务，避免跨笔记累积
     const quarkWorkspace = this.app.workspace as unknown as {
       on(name: string, callback: () => void): { ref?: unknown };
@@ -919,7 +1071,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
     if (this.quarkFileOpenRef) quarkWorkspace.offref(this.quarkFileOpenRef);
     this.quarkFileOpenRef = quarkWorkspace.on("file-open", () => {
-      this.quarkCache?.clearPrefetch();
+      void this.onQuarkFileOpen();
     });
     // 0.2.11：会话下载统计，每 30 秒一条日志
     if (this.quarkStatsTimerId === null) {
@@ -951,6 +1103,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     }
     // 0.2.9：卸载时停止预取循环（不再往已卸载的库下载附件）
     this.quarkCache.stopPrefetchLoop();
+    // 0.2.13：取消 bulk（切换库根/退出）
+    this.quarkCancelBulkPrefetch();
     this.quarkCache.clear();
     this.refreshQuarkUi();
   }
@@ -1021,6 +1175,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       prefetchImages: this.settings.quarkPrefetchImages === true,
       sessionDownloads: this.quarkSessionDownloads,
       sessionBytes: this.quarkSessionBytes,
+      prefetchPerNote: this.settings.quarkPrefetchPerNote ?? 20,
+      lastNotePrefetch: this.quarkLastNotePrefetch,
+      prefetchAllMarkdown: this.settings.quarkPrefetchAllMarkdown !== false,
+      bulkDone: this.quarkBulkDone,
+      bulkTotal: this.quarkBulkTotal,
+      bulkBytes: this.quarkBulkBytes,
+      bulkState: this.quarkBulkState,
     };
   }
 
@@ -1098,6 +1259,26 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   /** 0.2.11：预取开关（默认关）。 */
   public async quarkSetPrefetchImages(value: boolean): Promise<void> {
     await this.updateSettings({ quarkPrefetchImages: value === true });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.12：每篇笔记预取上限（0–200）。 */
+  public async quarkSetPrefetchPerNote(value: number): Promise<void> {
+    const numeric = Number.isFinite(value) ? Math.floor(value) : 20;
+    await this.updateSettings({ quarkPrefetchPerNote: Math.min(200, Math.max(0, numeric)) });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.13：全库 md 正文预取开关（内容搜索用）。 */
+  public async quarkSetPrefetchAllMarkdown(value: boolean): Promise<void> {
+    await this.updateSettings({ quarkPrefetchAllMarkdown: value === true });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.13：取消进行中的 bulk 预取（保留已缓存内容）。 */
+  public quarkCancelBulkPrefetch(): void {
+    this.quarkBulkGeneration += 1;
+    this.quarkBulkState = "canceled";
     this.refreshQuarkUi();
   }
 

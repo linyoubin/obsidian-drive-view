@@ -15,8 +15,8 @@
  * 事件（0.2.11，供 `stage=gate` 日志）：queued / acquired / abandoned，带 prio 与 waitMs。
  */
 
-export type GatePriority = "interactive" | "background" | "high" | "normal";
-export type GatePriorityClass = "i" | "bg";
+export type GatePriority = "interactive" | "background" | "bulk" | "high" | "normal";
+export type GatePriorityClass = "i" | "bg" | "bulk";
 export type GateState = "queued" | "acquired" | "abandoned";
 
 /** 可取消信号（结构与 `AbortSignal` 兼容，便于注入）。 */
@@ -46,6 +46,8 @@ export interface DownloadGateOptions {
   interactiveLimit?: number;
   /** background 通道上限，默认 2。 */
   backgroundLimit?: number;
+  /** bulk 通道上限，默认 2（全库 md 正文，最低优先级）。 */
+  bulkLimit?: number;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
   /** 事件回调（单测/日志用）。 */
@@ -86,12 +88,16 @@ export const DEFAULT_DOWNLOAD_CONCURRENCY = 4;
 export const DEFAULT_INTERACTIVE_LIMIT = 2;
 /** background 通道默认上限：2。 */
 export const DEFAULT_BACKGROUND_LIMIT = 2;
+/** bulk 通道默认上限：2（全库 md 正文预取，最低优先级）。 */
+export const DEFAULT_BULK_LIMIT = 2;
 /** 401 后的默认冷却：60 秒。 */
 export const DEFAULT_AUTH_COOLDOWN_MS = 60_000;
 
 /** 优先级归一：`high`/`interactive` → i；`normal`/`background` → bg（默认 background）。 */
 export function normalizeGatePriority(priority: GatePriority | undefined): GatePriorityClass {
-  return priority === "interactive" || priority === "high" ? "i" : "bg";
+  if (priority === "interactive" || priority === "high") return "i";
+  if (priority === "bulk") return "bulk";
+  return "bg";
 }
 
 export class DownloadGate {
@@ -101,11 +107,14 @@ export class DownloadGate {
   private backgroundQueue: QueuedTask[] = [];
   private interactiveActive = 0;
   private backgroundActive = 0;
+  private bulkQueue: QueuedTask[] = [];
+  private bulkActive = 0;
   private peakActive = 0;
   private startedCount = 0;
   private concurrencyValue: number;
   private interactiveLimitValue: number;
   private backgroundLimitValue: number;
+  private bulkLimitValue: number;
   private authExpiredUntil = 0;
 
   constructor(options: DownloadGateOptions = {}) {
@@ -114,6 +123,7 @@ export class DownloadGate {
     this.concurrencyValue = normalizeGateConcurrency(options.concurrency);
     this.interactiveLimitValue = Math.max(1, options.interactiveLimit ?? DEFAULT_INTERACTIVE_LIMIT);
     this.backgroundLimitValue = Math.max(1, options.backgroundLimit ?? DEFAULT_BACKGROUND_LIMIT);
+    this.bulkLimitValue = Math.max(1, options.bulkLimit ?? DEFAULT_BULK_LIMIT);
   }
 
   get concurrency(): number {
@@ -130,7 +140,7 @@ export class DownloadGate {
 
   /** 正在执行的任务数（两个通道合计）。 */
   get active(): number {
-    return this.interactiveActive + this.backgroundActive;
+    return this.interactiveActive + this.backgroundActive + this.bulkActive;
   }
 
   get interactiveActiveCount(): number {
@@ -143,7 +153,7 @@ export class DownloadGate {
 
   /** 排队中的任务数（两个通道合计）。 */
   get pending(): number {
-    return this.interactiveQueue.length + this.backgroundQueue.length;
+    return this.interactiveQueue.length + this.backgroundQueue.length + this.bulkQueue.length;
   }
 
   /** 历史并发峰值（单测断言「never 超过配置值」用）。 */
@@ -235,6 +245,7 @@ export class DownloadGate {
 
   private enqueue(pending: QueuedTask): void {
     if (pending.priority === "i") this.interactiveQueue.push(pending);
+    else if (pending.priority === "bulk") this.bulkQueue.push(pending);
     else this.backgroundQueue.push(pending);
   }
 
@@ -245,24 +256,32 @@ export class DownloadGate {
    *   - 总启动数始终 ≤ `concurrency`；单通道不超过各自上限。
    */
   private pump(): void {
+    let startedBackground = false;
     for (;;) {
-      const iActive = this.interactiveActive;
-      const bgActive = this.backgroundActive;
-      const total = iActive + bgActive;
-      if (total >= this.concurrencyValue) return;
+      if (this.active >= this.concurrencyValue) return;
 
       if (this.interactiveQueue.length > 0) {
-        if (iActive < this.interactiveLimitValue) {
+        if (this.interactiveActive < this.interactiveLimitValue) {
           const pending = this.interactiveQueue.shift() as QueuedTask;
           if (!this.start(pending)) continue;
           continue;
         }
-        // interactive 已满且还有等待项：background 不抢槽位
-        return;
+        return; // interactive 等待项存在：background / bulk 不抢槽位
       }
 
-      if (this.backgroundQueue.length > 0 && bgActive < this.backgroundLimitValue) {
-        const pending = this.backgroundQueue.shift() as QueuedTask;
+      if (this.backgroundQueue.length > 0) {
+        if (this.backgroundActive < this.backgroundLimitValue) {
+          const pending = this.backgroundQueue.shift() as QueuedTask;
+          if (!this.start(pending)) continue;
+          startedBackground = true;
+          continue;
+        }
+        return; // background 在等：bulk 让路
+      }
+
+      // 本轮刚启动过 background → bulk 让路（下一轮 pump 再启动 bulk）
+      if (!startedBackground && this.bulkQueue.length > 0 && this.bulkActive < this.bulkLimitValue) {
+        const pending = this.bulkQueue.shift() as QueuedTask;
         if (!this.start(pending)) continue;
         continue;
       }

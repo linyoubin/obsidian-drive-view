@@ -283,6 +283,12 @@ export class ContentCache {
 
   // ------------------------------------------------------------ 预取
 
+  /** 该 path 是否正在预取中（0.2.12：按笔记精确定位时跳过 in-flight）。 */
+  isPrefetching(path: string): boolean {
+    const key = String(path ?? "");
+    return !!key && (this.prefetchInFlight.has(key) || this.queue.some((item) => item.path === key));
+  }
+
   get pendingPrefetch(): number {
     return this.queue.length;
   }

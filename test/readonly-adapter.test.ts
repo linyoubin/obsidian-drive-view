@@ -202,6 +202,7 @@ function makeAdapter(options: {
   cacheSeed?: Record<string, ArrayBuffer>;
   clientBuffers?: Record<string, ArrayBuffer>;
   allowPrefetch?: () => boolean;
+  prefetchPerNote?: () => number;
 } = {}): Harness {
   const index = makeIndex(options.entries ?? indexEntries());
   const cache = makeCache(options.cacheSeed ?? {});
@@ -213,6 +214,7 @@ function makeAdapter(options: {
     client: client.client,
     baseAdapter: base.baseAdapter,
     allowPrefetch: options.allowPrefetch ?? (() => true),
+    prefetchPerNote: options.prefetchPerNote ?? (() => 0),
   });
   return { adapter, index, cache, client, base };
 }
@@ -509,5 +511,83 @@ describe("QuarkReadOnlyAdapter：预取默认关 + 优先级分类（0.2.11）",
     await adapter.read("notes/a.md");
     await adapter.readBinary("90-assets/x.jpeg");
     expect(client.calls).toEqual(["fa:interactive", "fimg:background"]);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：按笔记精准预取（0.2.12/0.2.13）", () => {
+  const noteContent = "![[one.jpeg]] ![[two.jpeg|300]] ![](three.png) ![[missing.jpeg]] ![[text.md]]";
+  function noteAdapter(prefetchPerNote?: number) {
+    return makeAdapter({
+      entries: [
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: noteContent.length, mtime: 1000 },
+        { path: "notes/one.jpeg", type: "file", fid: "f1", parentFid: "0", size: 3, mtime: 1000 },
+        { path: "notes/two.jpeg", type: "file", fid: "f2", parentFid: "0", size: 3, mtime: 1000 },
+        { path: "notes/three.png", type: "file", fid: "f3", parentFid: "0", size: 3, mtime: 1000 },
+      ],
+      clientBuffers: {
+        fa: textBuffer(noteContent),
+        f1: textBuffer("111"),
+        f2: textBuffer("222"),
+        f3: textBuffer("333"),
+      },
+      prefetchPerNote: () => (prefetchPerNote === undefined ? 0 : prefetchPerNote),
+    });
+  }
+
+  test("上限 0（不限）：所有被引用的附件都入队，md 与不存在项被跳过", async () => {
+    const { adapter, cache } = noteAdapter(0);
+    const result = await adapter.prefetchNote("notes/a.md");
+    expect(cache.prefetch.map((item) => item.path)).toEqual([
+      "notes/one.jpeg",
+      "notes/two.jpeg",
+      "notes/three.png",
+    ]);
+    expect(result.enqueued).toBe(3);
+    expect(result.skipped).toBeGreaterThanOrEqual(2); // missing.jpeg + text.md
+    expect(result.dropped).toBe(0);
+  });
+
+  test("手动上限 2：超出的丢弃且 dropped 计数正确", async () => {
+    const { adapter, cache } = noteAdapter(2);
+    const result = await adapter.prefetchNote("notes/a.md");
+    expect(cache.prefetch).toHaveLength(2);
+    expect(result.enqueued).toBe(2);
+    expect(result.dropped).toBe(1);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：预取跳过与 summary（0.2.13）", () => {
+  test("已缓存 / 在途被跳过；summary 记录 enqueued/skipped/dropped", async () => {
+    const content = "![[one.jpeg]] ![[two.jpeg]]";
+    const { adapter, cache } = makeAdapter({
+      entries: [
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: content.length, mtime: 1 },
+        { path: "notes/one.jpeg", type: "file", fid: "f1", parentFid: "0", size: 3, mtime: 1 },
+        { path: "notes/two.jpeg", type: "file", fid: "f2", parentFid: "0", size: 3, mtime: 1 },
+      ],
+      cacheSeed: { "notes/one.jpeg": textBuffer("aaa") },
+      clientBuffers: { fa: textBuffer(content), f1: textBuffer("aaa"), f2: textBuffer("bbb") },
+      prefetchPerNote: () => 0,
+    });
+    const logs: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
+    const withDiag = new QuarkReadOnlyAdapter({
+      index: makeIndex([
+        { path: "notes/a.md", type: "file", fid: "fa", parentFid: "0", size: content.length, mtime: 1 },
+        { path: "notes/one.jpeg", type: "file", fid: "f1", parentFid: "0", size: 3, mtime: 1 },
+        { path: "notes/two.jpeg", type: "file", fid: "f2", parentFid: "0", size: 3, mtime: 1 },
+      ]),
+      cache: cache.cache,
+      client: { downloadFile: async (fid: string) => (fid === "fa" ? textBuffer(content) : textBuffer("x")) },
+      baseAdapter: {} as never,
+      allowPrefetch: () => true,
+      prefetchPerNote: () => 0,
+      diag: (entry) => logs.push(entry),
+    });
+    await withDiag.prefetchNote("notes/a.md");
+    const summary = logs.find((entry) => entry.fields?.state === "summary");
+    expect(summary).toBeTruthy();
+    expect(Number(summary!.fields!.enqueued)).toBe(1);
+    expect(Number(summary!.fields!.skipped)).toBeGreaterThanOrEqual(1);
+    expect(logs.some((entry) => entry.fields?.reason === "cached")).toBe(true);
   });
 });

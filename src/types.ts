@@ -187,6 +187,10 @@ export interface QuarkSettings {
   quarkMaxFileBytes: number;
   /** 0.2.11：默认不预取图片；只有开启后 getResourcePath 未命中才把「当前这一个」path 入队。 */
   quarkPrefetchImages: boolean;
+  /** 0.2.13：每篇笔记预取上限；0 = 不限（默认）。 */
+  quarkPrefetchPerNote: number;
+  /** 0.2.13：全库 md 正文预取（内容搜索用，默认开）。 */
+  quarkPrefetchAllMarkdown: boolean;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -197,7 +201,9 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkLastIndexBuiltAt: 0,
   quarkDownloadConcurrency: 4,
   quarkMaxFileBytes: 50 * 1024 * 1024,
-  quarkPrefetchImages: false,
+  quarkPrefetchImages: true,
+  quarkPrefetchPerNote: 0,
+  quarkPrefetchAllMarkdown: true,
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */
