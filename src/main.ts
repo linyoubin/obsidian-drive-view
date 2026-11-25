@@ -562,17 +562,22 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       // 0.2.12：预取默认开启（字段缺省视为开）；关闭后 getResourcePath/按笔记预取都不入队
       mdStore: this.quarkMdStore,
       currentNotePath: () => this.quarkLastNotePath,
+      activeNotePath: () => this.quarkLastNotePath,
       allowPrefetch: () => this.settings.quarkPrefetchImages !== false,
       // 0.2.12：每篇笔记上限（默认 20；0 = 关闭）
       prefetchPerNote: () => this.settings.quarkPrefetchPerNote ?? 20,
       // 0.2.11：会话下载统计（设置页显示 + 每 30s 一条 stage=stats）
-      onDownloaded: (bytes, priority) => {
+      onDownloaded: (bytes, priority, path) => {
         const size = Math.max(0, bytes);
         this.quarkSessionDownloads += 1;
         this.quarkSessionBytes += size;
         if (priority === "interactive") { this.quarkStatI.downloads += 1; this.quarkStatI.bytes += size; }
         else if (priority === "bulk") { this.quarkStatBulk.downloads += 1; this.quarkStatBulk.bytes += size; }
         else { this.quarkStatBg.downloads += 1; this.quarkStatBg.bytes += size; }
+        // 0.2.16：活动笔记正文读完 → 提前恢复 bulk（3 秒内）
+        if (priority === "interactive" && path && path === this.quarkLastNotePath) {
+          this.quarkClient?.downloadGate.resumeBulk();
+        }
       },
     });
 
@@ -1148,6 +1153,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
     if (this.quarkFileOpenRef) quarkWorkspace.offref(this.quarkFileOpenRef);
     this.quarkFileOpenRef = quarkWorkspace.on("file-open", () => {
+      // 0.2.16：点击让路——bulk 暂停 3 秒（活动笔记读完可提前恢复）
+      this.quarkClient?.downloadGate.pauseBulk(3000);
       void this.onQuarkFileOpen();
     });
     // 0.2.11：会话下载统计，每 30 秒一条日志

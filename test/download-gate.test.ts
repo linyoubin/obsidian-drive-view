@@ -62,7 +62,8 @@ describe("DownloadGate：并发上限与排队（A2）", () => {
     const results = await Promise.all(tasks);
     expect(observedPeak).toBeLessThanOrEqual(2);
     expect(gate.peak).toBeLessThanOrEqual(2);
-    expect(gate.peak).toBe(2);
+    // 0.2.16：给 interactive 强制留 1 槽 → bg/bulk 峰值 = concurrency-1
+    expect(gate.peak).toBe(1);
     expect(results.length).toBe(50);
     expect(gate.active).toBe(0);
     expect(gate.pending).toBe(0);
@@ -477,8 +478,9 @@ describe("DownloadGate：三级优先级（0.2.13）", () => {
     const interactive = gate.run(task("i0"), { priority: "interactive" });
     await Promise.all([...bulk, interactive]);
     const iAt = order.indexOf("i0");
-    expect(iAt).toBeGreaterThanOrEqual(2);
-    expect(iAt).toBeLessThan(order.indexOf("bulk2"));
+    // 0.2.16：单 bulk 槽（lowCap=1）→ i 在第 2 位之前启动，且先于下一个 bulk
+    expect(iAt).toBeGreaterThanOrEqual(1);
+    expect(iAt).toBeLessThan(order.indexOf("bulk1"));
   });
 });
 
@@ -493,5 +495,74 @@ describe("DownloadGate：bulk 事件与取消（0.2.13）", () => {
     await running.catch(() => undefined);
     expect(events.some((event) => event.priority === "bulk" && event.state === "queued")).toBe(true);
     expect(events.some((event) => event.priority === "bulk" && event.state === "abandoned")).toBe(true);
+  });
+});
+
+// ------------------------------------------------------------------ 0.2.16 队列调度
+
+describe("DownloadGate：0.2.16 留槽与让路", () => {
+  test("interactive 队列非空时 bulk/bg 不启动新任务（i 先执行）", async () => {
+    const gate = new DownloadGate({ concurrency: 4, bulkLimit: 2, backgroundLimit: 2 });
+    const order: string[] = [];
+    const task = (name: string) => async () => {
+      order.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    };
+    const bulks = Array.from({ length: 5 }, (_, i) => gate.run(task(`bulk${i}`), { priority: "bulk" }));
+    const bgs = Array.from({ length: 2 }, (_, i) => gate.run(task(`bg${i}`), { priority: "background" }));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const i = gate.run(task("i0"), { priority: "interactive" });
+    await Promise.all([...bulks, ...bgs, i]);
+    // i 必须出现在队列前几个中（bulk/bg 不再占用新槽位）
+    expect(order.indexOf("i0")).toBeLessThan(order.indexOf("bulk3"));
+    expect(order.indexOf("i0")).toBeLessThanOrEqual(3);
+  });
+
+  test("bulk+bg 并发合计 ≤ concurrency-1（10 个 bulk、并发 4 → 峰值 ≤3）", async () => {
+    const gate = new DownloadGate({ concurrency: 4 });
+    let active = 0;
+    let peak = 0;
+    const tasks = Array.from({ length: 10 }, () =>
+      gate.run(async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        active -= 1;
+      }, { priority: "bulk" })
+    );
+    await Promise.all(tasks);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(gate.peak).toBeLessThanOrEqual(3);
+  });
+
+  test("点击让路：pauseBulk 3 秒内 bulk 不启动，3 秒后恢复", async () => {
+    let now = 0;
+    const gate = new DownloadGate({ concurrency: 4, now: () => now });
+    const order: string[] = [];
+    gate.pauseBulk(3000);
+    const task = (name: string) => async () => {
+      order.push(name);
+    };
+    const bulk = gate.run(task("bulk0"), { priority: "bulk" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(order).toEqual([]); // 3 秒内不启动
+    now = 3001;
+    gate.resumeBulk();
+    await bulk;
+    expect(order).toEqual(["bulk0"]);
+  });
+
+  test("点击瞬间 5 个 bulk 排队：interactive 在 1 个 pump 周期内启动", async () => {
+    const gate = new DownloadGate({ concurrency: 4, bulkLimit: 1 });
+    const order: string[] = [];
+    const task = (name: string) => async () => {
+      order.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    };
+    const bulks = Array.from({ length: 5 }, (_, i) => gate.run(task(`bulk${i}`), { priority: "bulk" }));
+    const i = gate.run(task("i0"), { priority: "interactive" });
+    await Promise.all([...bulks, i]);
+    // i 在 bulk1 之前即被启动（同一个 pump 周期内）
+    expect(order.indexOf("i0")).toBeLessThan(order.indexOf("bulk1"));
   });
 });

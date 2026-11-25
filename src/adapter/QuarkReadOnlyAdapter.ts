@@ -158,11 +158,13 @@ export interface QuarkReadOnlyAdapterOptions {
   /** 0.2.12：每篇笔记的预取上限（默认 20；0 = 关闭）。 */
   prefetchPerNote?: () => number;
   /** 0.2.11：每次网络下载成功后回调字节数（会话统计用）。 */
-  onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
+  onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk", path?: string) => void;
   /** 0.2.13：md 正文磁盘缓存（只存 .md；附件永不进 IDB）。 */
   mdStore?: MdStoreType | null;
   /** 0.2.15：当前活动笔记路径（defer 汇总日志用）。 */
   currentNotePath?: () => string;
+  /** 0.2.16：当前活动笔记路径（决定 interactive 优先级，不按扩展名）。 */
+  activeNotePath?: () => string;
 }
 
 /** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
@@ -257,9 +259,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly onReadonlyWrite?: (info: { operation: string; path: string }) => void;
   private readonly allowPrefetch?: () => boolean;
   private readonly prefetchPerNote?: () => number;
-  private readonly onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk") => void;
+  private readonly onDownloaded?: (bytes: number, priority: "interactive" | "background" | "bulk", path?: string) => void;
   private readonly mdStore?: MdStoreType | null;
   private readonly currentNotePath?: () => string;
+  private readonly activeNotePath?: () => string;
   private deferCount = 0;
   private deferLoggedAt = 0;
 
@@ -281,6 +284,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.onDownloaded = options.onDownloaded;
     this.mdStore = options.mdStore ?? null;
     this.currentNotePath = options.currentNotePath;
+    this.activeNotePath = options.activeNotePath;
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -627,7 +631,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       if (this.mdStore && isMarkdownPath(clean)) {
         await this.mdStore.put(clean, buffer, { fid: entry.fid, size: entry.size, mtime: entry.mtime });
       }
-      this.onDownloaded?.(buffer.byteLength, priorityOverride ?? this.downloadPriority(clean));
+      this.onDownloaded?.(buffer.byteLength, priorityOverride ?? this.downloadPriority(clean), clean);
       this.downloadUi?.end(token, "done");
       return buffer;
     } catch (error) {
@@ -724,9 +728,12 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.reportDiag(stage, path, fid, error);
   }
 
-  /** 下载优先级（0.2.11）：md 正文 interactive；图片/PDF/附件 background。 */
-  private downloadPriority(path: string): "interactive" | "background" {
-    return /\.(md|markdown)$/i.test(path) ? "interactive" : "background";
+  /** 下载优先级（0.2.16）：只给「当前活动笔记」interactive；其它 md → bulk；附件 → background。 */
+  private downloadPriority(path: string): "interactive" | "background" | "bulk" {
+    const active = this.activeNotePath ? String(this.activeNotePath() ?? "") : "";
+    if (active && path === active) return "interactive";
+    if (isMarkdownPath(path)) return "bulk";
+    return "background";
   }
 
   /**

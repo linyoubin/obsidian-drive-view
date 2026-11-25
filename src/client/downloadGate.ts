@@ -116,6 +116,8 @@ export class DownloadGate {
   private backgroundLimitValue: number;
   private bulkLimitValue: number;
   private authExpiredUntil = 0;
+  /** 0.2.16：点击让路——bulk 暂停到此时间（0 = 未暂停）。 */
+  private bulkPausedUntil = 0;
 
   constructor(options: DownloadGateOptions = {}) {
     this.now = options.now ?? ((): number => Date.now());
@@ -255,8 +257,13 @@ export class DownloadGate {
    *   - interactive 队列空 → 用 background 填满剩余槽位；
    *   - 总启动数始终 ≤ `concurrency`；单通道不超过各自上限。
    */
+  /**
+   * 调度（0.2.16 三通道 + 留槽 + 让路）：
+   *   - interactive 队列非空 → 只启动 interactive（bg/bulk 不抢槽位）；
+   *   - **强制留 1 槽**：bg+bulk 合计并发 ≤ max(1, concurrency-1)；
+   *   - 点击让路：bulk 在 `bulkPausedUntil` 之前不启动。
+   */
   private pump(): void {
-    let startedBackground = false;
     for (;;) {
       if (this.active >= this.concurrencyValue) return;
 
@@ -266,21 +273,24 @@ export class DownloadGate {
           if (!this.start(pending)) continue;
           continue;
         }
-        return; // interactive 等待项存在：background / bulk 不抢槽位
+        return; // interactive 等待项存在：bg/bulk 不启动新任务
       }
+
+      // 0.2.16：给 interactive 强制留 1 个槽位
+      const lowCap = Math.max(1, this.concurrencyValue - 1);
+      if (this.backgroundActive + this.bulkActive >= lowCap) return;
 
       if (this.backgroundQueue.length > 0) {
         if (this.backgroundActive < this.backgroundLimitValue) {
           const pending = this.backgroundQueue.shift() as QueuedTask;
           if (!this.start(pending)) continue;
-          startedBackground = true;
           continue;
         }
         return; // background 在等：bulk 让路
       }
 
-      // 本轮刚启动过 background → bulk 让路（下一轮 pump 再启动 bulk）
-      if (!startedBackground && this.bulkQueue.length > 0 && this.bulkActive < this.bulkLimitValue) {
+      if (this.now() < this.bulkPausedUntil) return; // 点击让路：暂停 bulk 3 秒
+      if (this.bulkQueue.length > 0 && this.bulkActive < this.bulkLimitValue) {
         const pending = this.bulkQueue.shift() as QueuedTask;
         if (!this.start(pending)) continue;
         continue;
@@ -289,6 +299,16 @@ export class DownloadGate {
     }
   }
 
+  /** 0.2.16：点击让路——暂停 bulk `ms` 毫秒（默认 3000）。 */
+  pauseBulk(ms: number = 3000): void {
+    this.bulkPausedUntil = this.now() + Math.max(0, ms);
+  }
+
+  /** 0.2.16：活动笔记已读完 → 提前恢复 bulk。 */
+  resumeBulk(): void {
+    this.bulkPausedUntil = 0;
+    this.pump();
+  }
   /** 启动一个任务；被取消/熔断则返回 false（继续尝试下一个）。 */
   private start(pending: QueuedTask): boolean {
     if (pending.signal && pending.signal.aborted) {
@@ -308,6 +328,7 @@ export class DownloadGate {
       return false;
     }
     if (pending.priority === "i") this.interactiveActive += 1;
+    else if (pending.priority === "bulk") this.bulkActive += 1;
     else this.backgroundActive += 1;
     this.startedCount += 1;
     if (this.active > this.peakActive) this.peakActive = this.active;
@@ -320,6 +341,7 @@ export class DownloadGate {
       )
       .finally(() => {
         if (pending.priority === "i") this.interactiveActive -= 1;
+        else if (pending.priority === "bulk") this.bulkActive -= 1;
         else this.backgroundActive -= 1;
         this.pump();
       });

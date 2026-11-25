@@ -204,6 +204,7 @@ function makeAdapter(options: {
   allowPrefetch?: () => boolean;
   prefetchPerNote?: () => number;
   mdStore?: import("../src/store/MdContentStore").MdContentStore;
+  activeNotePath?: () => string;
 } = {}): Harness {
   const index = makeIndex(options.entries ?? indexEntries());
   const cache = makeCache(options.cacheSeed ?? {});
@@ -217,6 +218,7 @@ function makeAdapter(options: {
     allowPrefetch: options.allowPrefetch ?? (() => true),
     prefetchPerNote: options.prefetchPerNote ?? (() => 0),
     mdStore: options.mdStore ?? null,
+    activeNotePath: options.activeNotePath,
   });
   return { adapter, index, cache, client, base };
 }
@@ -325,12 +327,12 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
     const { adapter, client, cache } = makeAdapter();
     const first = await adapter.read("a.md");
     expect(first).toBe("hello-a");
-    expect(client.calls).toEqual(["fa:interactive"]);
+    expect(client.calls).toEqual(["fa:bulk"]);
     expect(cache.puts).toEqual([{ path: "a.md", bytes: 7 }]);
 
     const second = await adapter.read("a.md");
     expect(second).toBe("hello-a");
-    expect(client.calls).toEqual(["fa:interactive"]); // 第二次命中缓存
+    expect(client.calls).toEqual(["fa:bulk"]); // 第二次命中缓存
   });
 
   test("readBinary：返回 ArrayBuffer；索引里没有的路径抛 QuarkEntryNotFoundError", async () => {
@@ -342,7 +344,7 @@ describe("QuarkReadOnlyAdapter：读路径只查索引（A3）", () => {
     await expect(adapter.read("nope.md")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
     await expect(adapter.read("folder")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
     await expect(adapter.read("")).rejects.toBeInstanceOf(QuarkEntryNotFoundError);
-    expect(client.calls).toEqual(["fb:interactive"]);
+    expect(client.calls).toEqual(["fb:bulk"]);
   });
 });
 
@@ -512,7 +514,7 @@ describe("QuarkReadOnlyAdapter：预取默认关 + 优先级分类（0.2.11）",
     });
     await adapter.read("notes/a.md");
     await adapter.readBinary("90-assets/x.jpeg");
-    expect(client.calls).toEqual(["fa:interactive", "fimg:background"]);
+    expect(client.calls).toEqual(["fa:bulk", "fimg:background"]);
   });
 });
 
@@ -660,7 +662,7 @@ describe("P0 安全阀：图片默认点了才下（0.2.15）", () => {
     expect(result.enqueued).toBe(0);
     expect(cache.prefetch).toEqual([]);
     // 只下载笔记正文 1 次；附件 0 次（0.2.15）
-    expect(client.calls).toEqual(["fa:interactive"]);
+    expect(client.calls).toEqual(["fa:bulk"]);
   });
 
   test("笔记只引用 1 张图：只入队 1 张（同名目录不扩展）", async () => {
@@ -692,5 +694,25 @@ describe("P0：打开图片文件（readBinary）才下载（0.2.15）", () => {
     const buffer = await adapter.readBinary("90-assets/x.jpeg");
     expect(new TextDecoder().decode(buffer)).toBe("img");
     expect(client.calls).toEqual(["fimg:background"]);
+  });
+});
+
+describe("QuarkReadOnlyAdapter：0.2.16 优先级按活动笔记", () => {
+  test("当前活动笔记 read → interactive；非活动 md → bulk；jpeg → background", async () => {
+    const activeContent = "hello-active";
+    const otherContent = "hello-other";
+    const { adapter, client } = makeAdapter({
+      entries: [
+        { path: "20-notes/active.md", type: "file", fid: "fa", parentFid: "0", size: activeContent.length, mtime: 1 },
+        { path: "20-notes/other.md", type: "file", fid: "fo", parentFid: "0", size: otherContent.length, mtime: 1 },
+        { path: "90-assets/x.jpeg", type: "file", fid: "fimg", parentFid: "0", size: 3, mtime: 1 },
+      ],
+      clientBuffers: { fa: textBuffer(activeContent), fo: textBuffer(otherContent), fimg: textBuffer("img") },
+      activeNotePath: () => "20-notes/active.md",
+    });
+    await adapter.read("20-notes/active.md");
+    await adapter.read("20-notes/other.md");
+    await adapter.readBinary("90-assets/x.jpeg");
+    expect(client.calls).toEqual(["fa:interactive", "fo:bulk", "fimg:background"]);
   });
 });
