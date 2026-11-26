@@ -9,6 +9,7 @@ import {
   createObsidianAdapterProxy,
   createReadonlyRollback,
   isQuarkAttachmentPath,
+  quarkViewKind,
   reloadLeafView,
 } from "./adapter/QuarkReadOnlyAdapter";
 import type {
@@ -16,6 +17,12 @@ import type {
   ReadonlyRollbackLeaf,
   RefreshableLeafLike,
 } from "./adapter/QuarkReadOnlyAdapter";
+import {
+  createUnpreviewableOpenFlow,
+  isQuarkUnpreviewable,
+} from "./adapter/QuarkOpenExternal";
+import type { UnpreviewableOpenResult } from "./adapter/QuarkOpenExternal";
+import { OpenInQuarkModal } from "./ui/OpenInQuarkModal";
 import { VaultMounter } from "./adapter/VaultMounter";
 import type { VaultMountable } from "./adapter/VaultMounter";
 import { CookieStore } from "./auth/CookieStore";
@@ -172,6 +179,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkDownloadBook: DownloadNoticeBook | null = null;
   private quarkAuthExpired = false;
   private quarkRollback: ((info: { operation: string; path: string }) => void) | null = null;
+  /** 0.2.28：不可预览文件（docx/xlsx/zip…）点击 → 去夸克打开所在目录。 */
+  private quarkUnpreviewableFlow:
+    | ((info: { path: string; fid?: string; parentFid?: string }) => Promise<UnpreviewableOpenResult>)
+    | null = null;
   private readonly quarkPreviewThrottle = createPathThrottle(1000);
   private lastSettingsRefreshAt = 0;
   /** 0.2.11：本会话下载统计（设置页显示 + 每 30s `stage=stats`）。 */
@@ -645,6 +656,72 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       },
       onError: (path, error) => {
         console.warn(`[Quark] attachment warmup failed: ${path}`, error);
+        // 0.2.27：失败要给明确提示（否则图片/PDF 视图只是空白）
+        const name = path.split("/").pop() || path;
+        try {
+          new Notice(`只读库：附件下载失败（${name}）。可稍后重试`, 6000);
+        } catch {
+          /* 提示失败不影响其它视图 */
+        }
+        try {
+          this.quarkDiag?.log({
+            level: "warn",
+            stage: "view",
+            path: path || "/",
+            fid: "-",
+            message: "state=failed",
+            fields: { kind: quarkViewKind(path) },
+          });
+        } catch {
+          /* 日志失败不影响其它视图 */
+        }
+      },
+    });
+
+    // 0.2.28：不可预览文件（docx/xlsx/zip/epub…）点击 → 确认后打开它所在的夸克目录。
+    // URL 实测：`https://pan.quark.cn/list#/list/all/<folderFid>` 能进入该目录；
+    // 文件级 URL（`.../<fileFid>` 或 `?fid=`）实测无效，因此退一步打开所在目录。
+    this.quarkUnpreviewableFlow = createUnpreviewableOpenFlow({
+      isEnabled: () => this.settings.quarkOpenUnpreviewableInQuark !== false,
+      confirm: (info) =>
+        new Promise<boolean>((resolve) => {
+          try {
+            new OpenInQuarkModal(this.app, {
+              path: info.path,
+              extension: info.extension,
+              onConfirm: () => resolve(true),
+              onCancel: () => resolve(false),
+            }).open();
+          } catch {
+            resolve(false);
+          }
+        }),
+      openExternal: (url) => this.openExternalUrl(url),
+      copyLink: async (url) => {
+        try {
+          const clipboard = (globalThis as { navigator?: { clipboard?: { writeText?: (text: string) => Promise<void> } } })
+            .navigator?.clipboard;
+          if (!clipboard?.writeText) return false;
+          await clipboard.writeText(url);
+          new Notice("已复制夸克链接，可在浏览器中打开", 6000);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      log: (entry) => {
+        try {
+          this.quarkDiag?.log({
+            level: "info",
+            stage: "open-external",
+            path: entry.path || "/",
+            fid: entry.fid || "-",
+            message: `result=${entry.result}`,
+            fields: { domain: entry.domain, length: entry.length },
+          });
+        } catch {
+          /* 日志失败不影响打开流程 */
+        }
       },
     });
 
@@ -1021,6 +1098,17 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     // 0.2.26：记录「刚打开」的时间窗 —— Obsidian 可能先 read 再触发 file-open，
     // 窗内对该 path 的读一律 interactive（详见 QuarkReadOnlyAdapter.markNoteOpened）。
     if (path) this.quarkAdapter?.markNoteOpened(path);
+    // 0.2.28：Obsidian 不能原生预览的二进制（docx/xlsx/zip/epub…）→ 确认后去夸克打开所在目录
+    if (path && this.quarkAdapter && isQuarkUnpreviewable(path)) {
+      const entry = this.quarkIndex?.entries.find((item) => item.path === path);
+      void this.quarkUnpreviewableFlow?.({
+        path,
+        fid: entry?.fid ?? "",
+        parentFid: entry?.parentFid || this.settings.quarkRootFid || "0",
+      });
+      this.refreshQuarkUi();
+      return;
+    }
     // 0.2.17：熔断期间点开笔记 → 额外提示一次（同一失效期只一次）
     if (this.quarkAuthExpired && this.quarkAuthGate.shouldShow()) {
       new Notice(QUARK_AUTH_READ_BLOCKED_TEXT, 8000);
@@ -1421,6 +1509,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       prefetchPerNote: this.settings.quarkPrefetchPerNote ?? 20,
       lastNotePrefetch: this.quarkLastNotePrefetch,
       prefetchAllMarkdown: this.settings.quarkPrefetchAllMarkdown !== false,
+      openUnpreviewableInQuark: this.settings.quarkOpenUnpreviewableInQuark !== false,
       bulkDone: this.quarkBulkDone,
       bulkTotal: this.quarkBulkTotal,
       bulkBytes: this.quarkBulkBytes,
@@ -1517,6 +1606,38 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public async quarkSetPrefetchAllMarkdown(value: boolean): Promise<void> {
     await this.updateSettings({ quarkPrefetchAllMarkdown: value === true });
     this.refreshQuarkUi();
+  }
+
+  /** 0.2.28：不可预览文件点击跳夸克开关（默认开）。 */
+  public async quarkSetOpenUnpreviewableInQuark(value: boolean): Promise<void> {
+    await this.updateSettings({ quarkOpenUnpreviewableInQuark: value === true });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.28：外部打开 URL —— 桌面优先 electron.shell.openExternal，其次 window.open（手机走系统浏览器）。 */
+  private async openExternalUrl(url: string): Promise<boolean> {
+    try {
+      const electron = (
+        globalThis as {
+          require?: (id: string) => { shell?: { openExternal?: (href: string) => Promise<void> | void } };
+        }
+      ).require?.("electron");
+      if (electron?.shell?.openExternal) {
+        await electron.shell.openExternal(url);
+        return true;
+      }
+    } catch {
+      /* 非桌面 / electron 不可用：走 window.open */
+    }
+    try {
+      const opened = (
+        globalThis as { open?: (href: string, target?: string) => unknown }
+      ).open?.(url, "_blank");
+      if (opened) return true;
+    } catch {
+      /* 弹窗被拦截：返回 false 让调用方降级复制链接 */
+    }
+    return false;
   }
 
   /** 0.2.13：取消进行中的 bulk 预取（保留已缓存内容）。 */

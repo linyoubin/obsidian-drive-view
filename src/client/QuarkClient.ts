@@ -714,12 +714,15 @@ export class QuarkClient {
       priority?: "interactive" | "background" | "background-user" | "bulk";
       /** 0.2.26：优先级判定来源（仅 `stage=gate` 日志）。 */
       reason?: string;
+      /** 0.2.27：本次下载的硬超时（按文件大小放宽；不传用默认 20s）。 */
+      timeoutMs?: number;
     } = {}
   ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
     const path = options.path || fid;
     const priority = options.priority ?? "background";
     const reason = options.reason ?? "";
+    const timeoutOverrideMs = options.timeoutMs;
     // 0.2.20 N3：控制位（外层超时时置 aborted → 僵尸请求不再发后续跳/不再重试）
     const control: DownloadControl = { aborted: false };
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
@@ -733,7 +736,7 @@ export class QuarkClient {
         // 超时后底层继续跑：登记为僵尸（有 TTL/条数上限），供同 fid 复用或串行等待
         return this.withDownloadTimeout(control, () => underlying, () =>
           this.rememberZombie(fid, underlying)
-        );
+        , timeoutOverrideMs);
       }, { path, priority, reason });
     });
     if (!signal) return shared;
@@ -831,9 +834,10 @@ export class QuarkClient {
   private withDownloadTimeout<T>(
     control: DownloadControl,
     run: () => Promise<T>,
-    onTimeout?: () => void
+    onTimeout?: () => void,
+    timeoutOverrideMs?: number
   ): Promise<T> {
-    const timeoutMs = this.downloadTimeoutMs;
+    const timeoutMs = Math.max(0, timeoutOverrideMs ?? this.downloadTimeoutMs);
     if (!(timeoutMs > 0)) return run();
     return new Promise<T>((resolve, reject) => {
       let settled = false;

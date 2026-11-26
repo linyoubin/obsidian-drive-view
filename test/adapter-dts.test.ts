@@ -56,6 +56,7 @@ const NON_CONTRACT_MEMBERS = new Set([
   "readBinaryForUser",
   "readonlyWrite",
   "markNoteOpened",
+  "reportViewOpen",
   "shouldForward",
   "findEntry",
   "loadBinary",

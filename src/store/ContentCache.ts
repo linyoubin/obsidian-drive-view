@@ -10,8 +10,13 @@
  * 交付给 adapter 的接口是 `getResourceUrl(path)`：命中返回 `blob:` URL，未命中返回 `""`
  * （`DataAdapter.getResourcePath` 是同步接口，不能等网络；未命中由调用方排队预取）。
  *
+ * 0.2.27：blob 必须带 MIME（按扩展名）。改前 `new Blob([data])` 没有 type，
+ * PDF/图片视图会拒渲染（`blob:` 无类型）。
+ *
  * 不 import `fs`/`path`/`child_process`/`electron`/`node:`，不引 npm 依赖。
  */
+
+import { guessMimeType } from "../utils/pathUtils";
 
 /** 默认上限：8 MB（`ledger-任务.md` 定档）。 */
 export const DEFAULT_CONTENT_CACHE_BYTES = 8 * 1024 * 1024;
@@ -32,7 +37,7 @@ export interface ContentCacheOptions {
   /** 预取队列硬上限，默认 20（0.2.11：超出丢弃新增）。 */
   prefetchQueueMax?: number;
   /** 生成 blob URL；缺省用运行期 `URL.createObjectURL`（不可用则返回空串）。 */
-  createObjectUrl?: (data: ArrayBuffer) => string;
+  createObjectUrl?: (data: ArrayBuffer, path: string) => string;
   /** 释放 blob URL；缺省用运行期 `URL.revokeObjectURL`。 */
   revokeObjectUrl?: (url: string) => void;
   now?: () => number;
@@ -52,6 +57,8 @@ export interface CachedContent {
   path: string;
   bytes: number;
   url: string;
+  /** 0.2.27：blob 的 MIME（按扩展名推断；PDF/图片视图依赖它）。 */
+  mime: string;
   fid: string;
   mtime: number;
   loadedAt: number;
@@ -86,12 +93,13 @@ export interface PutResult {
   evicted: string[];
 }
 
-function defaultCreateObjectUrl(data: ArrayBuffer): string {
+function defaultCreateObjectUrl(data: ArrayBuffer, path: string): string {
   const urlApi = (globalThis as { URL?: { createObjectURL?: (blob: unknown) => string } }).URL;
-  const BlobCtor = (globalThis as { Blob?: new (parts: unknown[]) => unknown }).Blob;
+  const BlobCtor = (globalThis as { Blob?: new (parts: unknown[], options?: { type?: string }) => unknown }).Blob;
   if (!urlApi || typeof urlApi.createObjectURL !== "function" || typeof BlobCtor !== "function") return "";
   try {
-    return urlApi.createObjectURL(new BlobCtor([data]));
+    // 0.2.27：必须带 MIME —— 无 type 的 blob 会让 PDF/图片视图拒渲染
+    return urlApi.createObjectURL(new BlobCtor([data], { type: guessMimeType(path) }));
   } catch {
     return "";
   }
@@ -133,7 +141,7 @@ export class ContentCache {
   private readonly prefetchLimitValue: number;
   private readonly prefetchMaxBytesValue: number;
   private readonly prefetchQueueMaxValue: number;
-  private readonly createUrl: (data: ArrayBuffer) => string;
+  private readonly createUrl: (data: ArrayBuffer, path: string) => string;
   private readonly revokeUrl: (url: string) => void;
   private readonly now: () => number;
   private readonly onEvict?: (path: string, bytes: number) => void;
@@ -206,6 +214,7 @@ export class ContentCache {
       path: entry.path,
       bytes: entry.bytes,
       url: entry.url,
+      mime: entry.mime,
       fid: entry.fid,
       mtime: entry.mtime,
       loadedAt: entry.loadedAt,
@@ -251,11 +260,13 @@ export class ContentCache {
     }
 
     const buffer = toArrayBuffer(data);
+    const mime = guessMimeType(path);
     const entry: CacheEntry = {
       path,
       bytes,
+      mime,
       // 0 字节不生成 blob URL（空 Blob 没有展示意义），但仍缓存内容
-      url: bytes > 0 ? this.createUrl(buffer) : "",
+      url: bytes > 0 ? this.createUrl(buffer, path) : "",
       fid: typeof meta.fid === "string" ? meta.fid : "",
       mtime: typeof meta.mtime === "number" ? meta.mtime : 0,
       loadedAt: this.now(),

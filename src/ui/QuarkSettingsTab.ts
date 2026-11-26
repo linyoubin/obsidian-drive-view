@@ -42,6 +42,8 @@ export interface QuarkUiSnapshot {
   prefetchPerNote: number;
   /** 0.2.13：全库 md 正文预取开关。 */
   prefetchAllMarkdown: boolean;
+  /** 0.2.28：不可预览文件（docx/xlsx/zip…）点击时跳夸克打开。 */
+  openUnpreviewableInQuark: boolean;
   /** 0.2.13：md 磁盘正文缓存统计。 */
   mdCount: number;
   mdBytes: number;
@@ -76,6 +78,8 @@ export interface QuarkHost {
   /** 0.2.12：每篇笔记预取上限（0–200）。 */
   quarkSetPrefetchPerNote(value: number): Promise<void>;
   quarkSetPrefetchAllMarkdown(value: boolean): Promise<void>;
+  /** 0.2.28：不可预览文件点击跳夸克开关。 */
+  quarkSetOpenUnpreviewableInQuark(value: boolean): Promise<void>;
   quarkCancelBulkPrefetch(): void;
   quarkClearMdCache(): Promise<void>;
 }
@@ -103,6 +107,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   prefetchPerNote: 0,
   lastNotePrefetch: 0,
   prefetchAllMarkdown: true,
+  openUnpreviewableInQuark: true,
   bulkDone: 0,
   bulkTotal: 0,
   bulkBytes: 0,
@@ -536,6 +541,21 @@ export class QuarkSettingsTab extends settingTabBase() {
       .addButton((button: any) =>
         button.setButtonText("取消正文预取").onClick(() => {
           this.host.quarkCancelBulkPrefetch();
+          this.display();
+        })
+      );
+
+    // 0.2.28：不可预览文件（docx/xlsx/zip/epub…）点击时跳夸克打开（默认开）
+    new Setting(container)
+      .setName("不可预览文件点击时跳夸克打开（默认开）")
+      .setDesc(
+        snapshot.openUnpreviewableInQuark
+          ? "点击 .docx / .xlsx / .zip / .epub 等 Obsidian 不能预览的文件时，确认后打开它所在的夸克网盘目录"
+          : "关闭：点击这些文件不弹确认、不打开浏览器（按只读占位静默处理）"
+      )
+      .addToggle((toggle: any) =>
+        toggle.setValue(snapshot.openUnpreviewableInQuark).onChange(async (value: boolean) => {
+          await this.host.quarkSetOpenUnpreviewableInQuark(value === true);
           this.display();
         })
       );

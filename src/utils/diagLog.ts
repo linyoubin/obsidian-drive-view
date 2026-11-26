@@ -21,12 +21,14 @@ export type DiagStage =
   | "sort"
   | "index"
   | "write"
+  | "view"
   | "decode"
   | "prefetch"
   | "gate"
   | "stats"
   | "cache"
   | "adapter"
+  | "open-external"
   | "auth";
 
 /** 默认配置目录（Obsidian 默认 `.obsidian`；运行期由 `app.vault.configDir` 覆盖，0.2.18 B2）。 */

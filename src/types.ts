@@ -191,6 +191,11 @@ export interface QuarkSettings {
   quarkPrefetchPerNote: number;
   /** 0.2.13：全库 md 正文预取（内容搜索用，默认开）。 */
   quarkPrefetchAllMarkdown: boolean;
+  /**
+   * 0.2.28：Docx/Office 等不可预览文件点击时跳夸克打开（默认开）。
+   * 关闭后按只读占位静默处理（不弹确认、不打开浏览器）。
+   */
+  quarkOpenUnpreviewableInQuark: boolean;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -204,6 +209,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkPrefetchImages: false, // 0.2.15：图片默认「点了才下」
   quarkPrefetchPerNote: 0,
   quarkPrefetchAllMarkdown: true,
+  quarkOpenUnpreviewableInQuark: true,
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */

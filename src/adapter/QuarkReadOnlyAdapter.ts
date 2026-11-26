@@ -24,13 +24,14 @@ import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from "obsidian"
 import { normalizeQuarkMtime } from "../store/IndexStore";
 import type { IndexEntry } from "../store/IndexStore";
 import {
+  QUARK_DOWNLOAD_TIMEOUT_MS,
   QuarkAuthError,
   QuarkDownloadCanceledError,
   QuarkDownloadTimeoutError,
   QuarkFileTooLargeError,
 } from "../client/QuarkClient";
 import { DownloadGateError } from "../client/downloadGate";
-import { arrayBufferToString, getParentPath, normalizeVaultPath } from "../utils/pathUtils";
+import { arrayBufferToString, getParentPath, normalizeVaultPath, guessMimeType, isTextFilePath } from "../utils/pathUtils";
 import { attachmentCandidates, extractAttachmentRefs, isMarkdownPath } from "../utils/noteRefs";
 import { MdContentStore } from "../store/MdContentStore";
 import type { MdContentRecord, MdContentStore as MdStoreType } from "../store/MdContentStore";
@@ -76,6 +77,8 @@ export interface QuarkDownloadClient {
       priority?: "interactive" | "background" | "background-user" | "bulk";
       /** 0.2.26：优先级判定来源（`recentOpened|active|md-default|bulk|bg|bg-user`）。 */
       reason?: string;
+      /** 0.2.27：按文件大小放宽后的硬超时（毫秒）。 */
+      timeoutMs?: number;
     }): Promise<ArrayBuffer>;
 }
 
@@ -134,7 +137,9 @@ export type QuarkAdapterDiagStage =
   | "prefetch"
   | "gate"
   | "cache"
-  | "write";
+  | "write"
+  /** 0.2.27：图片/PDF 附件打开的自证埋点（`kind/mime/bytes/getResourcePath`）。 */
+  | "view";
 
 /** 诊断出口：只在 catch 分支调用，不改变任何读写行为（0.2.3 A5 / 0.2.4 A7）。 */
 export type QuarkAdapterDiagSink = (entry: {
@@ -281,6 +286,17 @@ export class QuarkEntryNotFoundError extends Error {
   constructor(path: string) {
     super(`索引中没有该路径：${path || "根目录"}`);
     this.name = "QuarkEntryNotFoundError";
+    this.path = path;
+  }
+}
+
+/** 0.2.27：二进制扩展名被当作文本读（明确报错，而不是把字节按 UTF-8 解码成乱码）。 */
+export class QuarkBinaryReadError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`二进制文件不能按文本读取：${path}（应使用 readBinary / 附件视图）`);
+    this.name = "QuarkBinaryReadError";
     this.path = path;
   }
 }
@@ -491,6 +507,14 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       return this.baseAdapter.read(normalizedPath);
     }
     const clean = normalizeVaultPath(normalizedPath);
+    // 0.2.27：二进制扩展名不能按文本读（PDF/图片会被 UTF-8 解码成乱码/空白）。
+    // 只拦「索引里确实是文件」的路径：目录/不存在的路径仍走原来的 QuarkEntryNotFoundError。
+    const extension = clean.slice(clean.lastIndexOf(".") + 1).toLowerCase();
+    const binaryEntry = extension ? this.findEntry(clean) : null;
+    if (binaryEntry && !isDirectoryLike(binaryEntry) && !isTextFilePath(clean)) {
+      this.reportInfo("read", clean, binaryEntry.fid, { state: "binary" });
+      throw new QuarkBinaryReadError(clean);
+    }
     const fid = this.fidOf(clean);
     const entry = this.findEntry(clean);
     // 0.2.10 入口埋点：命中缓存与否 + 索引里的 size（区分「空文件」与「下载到空内容」）
@@ -560,14 +584,39 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   /**
    * 0.2.21 S3：用户点开的附件读取 —— 走 `background-user`（预取让路、取消按钮可取消）。
    * 预取循环仍用 `readBinary`（普通 background），两者互不影响。
+   *
+   * 0.2.27：成功后记 `stage=view`（kind/mime/bytes/getResourcePath），下次 PDF/图片打不开
+   * 可直接看是「blob 没生成」「MIME 不对」还是「根本没下载」。
    */
   async readBinaryForUser(normalizedPath: string): Promise<ArrayBuffer> {
     if (this.shouldForward(normalizedPath)) return this.baseAdapter.readBinary(normalizedPath);
     try {
-      return await this.loadBinary(normalizedPath, { priority: "background-user", reason: "bg-user" });
+      const buffer = await this.loadBinary(normalizedPath, {
+        priority: "background-user",
+        reason: "bg-user",
+      });
+      this.reportViewOpen(normalizedPath, buffer);
+      return buffer;
     } catch (error) {
       this.reportDiagOnce(error, "readBinary", normalizedPath, this.fidOf(normalizedPath));
       throw error;
+    }
+  }
+
+  /** 0.2.27：附件视图自证日志（level=info，不含正文/字节内容）。 */
+  private reportViewOpen(normalizedPath: string, buffer: ArrayBuffer): void {
+    try {
+      const clean = normalizeVaultPath(normalizedPath);
+      const url = this.cache.getResourceUrl(clean);
+      const getResourcePath = url ? "url" : this.prefetchEnabled() ? "" : "placeholder";
+      this.reportInfo("view", clean, this.fidOf(clean), {
+        kind: quarkViewKind(clean),
+        mime: guessMimeType(clean),
+        bytes: buffer.byteLength,
+        getResourcePath,
+      });
+    } catch {
+      /* 日志失败不影响附件读取 */
     }
   }
 
@@ -780,6 +829,11 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
         path: clean,
         priority,
         reason: choice.reason,
+        // 0.2.27：大文件（PDF 等）按大小放宽超时；小文件不传，沿用客户端配置的默认值
+        ...(() => {
+          const scaled = quarkDownloadTimeoutMsForSize(entry.size);
+          return scaled > QUARK_DOWNLOAD_TIMEOUT_MS ? { timeoutMs: scaled } : {};
+        })(),
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
@@ -1089,8 +1143,46 @@ export function isQuarkAttachmentPath(path: string): boolean {
   return QUARK_ATTACHMENT_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase());
 }
 
-/** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */
-export interface AttachmentWarmupHost {
+/** 图片扩展名（0.2.27：`stage=view` 的 kind 判定）。 */
+const QUARK_IMAGE_EXTENSIONS = new Set([
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "svg",
+  "avif",
+  "ico",
+]);
+
+/** 0.2.27：附件视图种类（`image` / `pdf` / `other`），用于 `stage=view` 埋点。 */
+export function quarkViewKind(path: string): "image" | "pdf" | "other" {
+  const clean = normalizeVaultPath(path ?? "").toLowerCase();
+  const dot = clean.lastIndexOf(".");
+  const ext = dot >= 0 ? clean.slice(dot + 1) : "";
+  if (ext === "pdf") return "pdf";
+  if (QUARK_IMAGE_EXTENSIONS.has(ext)) return "image";
+  return "other";
+}
+
+/**
+ * 0.2.27：大文件下载超时随大小放宽（固定 20s 会误杀几十 MB 的 PDF）。
+ *
+ * 估算口径：512 KB/s 下限带宽 → 每 512KB 加 1s；下限 20s（小文件不缩短）、上限 120s。
+ * 例：50MB → 100s；1MB → 20s；500MB → 120s。
+ */
+export function quarkDownloadTimeoutMsForSize(
+  sizeBytes: number | null | undefined,
+  baseMs: number = 20_000
+): number {
+  const base = Math.max(0, Number.isFinite(baseMs) ? baseMs : 20_000);
+  if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes <= 0) return base;
+  const scaled = Math.ceil(sizeBytes / (512 * 1024)) * 1000;
+  return Math.max(base, Math.min(120_000, scaled));
+}
+
+/** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */export interface AttachmentWarmupHost {
   readBinary(path: string): Promise<unknown>;
   /** 兼容旧回调：没有 `activeLeaf` 时用它重绘。 */
   redraw?: (path: string) => void;
@@ -1378,6 +1470,12 @@ export function createAttachmentWarmup(
     try {
       await host.readBinary(clean);
     } catch (error) {
+      // 0.2.27：失败要能自证（附件视图留白时看 stage=view state=failed）
+      try {
+        host.log?.({ path: clean, state: "failed" });
+      } catch {
+        /* 日志失败不影响失败上报 */
+      }
       host.onError?.(clean, error);
       return false;
     }
