@@ -712,11 +712,14 @@ export class QuarkClient {
       signal?: GateSignal | null;
       path?: string;
       priority?: "interactive" | "background" | "background-user" | "bulk";
+      /** 0.2.26：优先级判定来源（仅 `stage=gate` 日志）。 */
+      reason?: string;
     } = {}
   ): Promise<ArrayBuffer> {
     const signal = options.signal ?? null;
     const path = options.path || fid;
     const priority = options.priority ?? "background";
+    const reason = options.reason ?? "";
     // 0.2.20 N3：控制位（外层超时时置 aborted → 僵尸请求不再发后续跳/不再重试）
     const control: DownloadControl = { aborted: false };
     // 去重在闸门之前：同一个 fid 全局只有一份“闸门任务 + 网络请求”
@@ -731,7 +734,7 @@ export class QuarkClient {
         return this.withDownloadTimeout(control, () => underlying, () =>
           this.rememberZombie(fid, underlying)
         );
-      }, { path, priority });
+      }, { path, priority, reason });
     });
     if (!signal) return shared;
     return this.raceCallerCancel(shared, signal);
@@ -1009,6 +1012,7 @@ export class QuarkClient {
     priority: "i" | "bg" | "bg-user" | "bulk";
     path: string;
     waitMs: number;
+    reason?: string;
   }): void {
     try {
       this.diag?.({
@@ -1017,7 +1021,12 @@ export class QuarkClient {
         path: event.path || "/",
         fid: "-",
         message: "",
-        fields: { state: event.state, prio: event.priority, waitMs: event.waitMs },
+        fields: {
+          state: event.state,
+          prio: event.priority,
+          waitMs: event.waitMs,
+          ...(event.reason ? { reason: event.reason } : {}),
+        },
       });
     } catch {
       /* 日志失败不影响调度 */

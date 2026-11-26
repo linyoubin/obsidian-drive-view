@@ -55,6 +55,7 @@ const NON_CONTRACT_MEMBERS = new Set([
   "prefetchNote",
   "readBinaryForUser",
   "readonlyWrite",
+  "markNoteOpened",
   "shouldForward",
   "findEntry",
   "loadBinary",
@@ -64,7 +65,7 @@ const NON_CONTRACT_MEMBERS = new Set([
   "reportDiag",
   "alreadyLogged",
   "reportDiagOnce",
-  "downloadPriority",
+  "notePriority",
   "fidOf",
 ]);
 

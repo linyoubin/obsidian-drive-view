@@ -29,14 +29,21 @@ export interface GateRunOptions {
   signal?: GateSignal | null;
   /** 库内路径（仅用于 `stage=gate` 日志）。 */
   path?: string;
+  /**
+   * 0.2.26：判定来源（`recentOpened|active|md-default|bulk|bg|bg-user`），
+   * 只用于诊断日志，不参与调度。
+   */
+  reason?: string;
 }
 
-/** 闸门事件（0.2.11）：main 转成 `stage=gate … state=… prio=… waitMs=…` 日志。 */
+/** 闸门事件（0.2.11）：main 转成 `stage=gate … state=… prio=… waitMs=… reason=…` 日志。 */
 export interface GateEvent {
   state: GateState;
   priority: GatePriorityClass;
   path: string;
   waitMs: number;
+  /** 0.2.26：优先级判定来源（空串 = 旧调用没传）。 */
+  reason: string;
 }
 
 export interface DownloadGateOptions {
@@ -77,6 +84,8 @@ interface PendingTask<T = unknown> {
   signal: GateSignal | null;
   path: string;
   enqueuedAt: number;
+  /** 0.2.26：判定来源（仅日志）。 */
+  reason: string;
 }
 
 // 队列元素类型放宽：run<T> 里的 PendingTask<T> 与内部 push 的 PendingTask 需要兼容
@@ -153,6 +162,11 @@ export class DownloadGate {
     return this.interactiveActive;
   }
 
+  /** 0.2.26：interactive 排队数（md 默认 interactive 的预算判定用）。 */
+  get interactivePendingCount(): number {
+    return this.interactiveQueue.length;
+  }
+
   get backgroundActiveCount(): number {
     return this.backgroundActive;
   }
@@ -199,12 +213,13 @@ export class DownloadGate {
     const signal = options.signal ?? null;
     const priority = normalizeGatePriority(options.priority);
     const path = options.path ?? "";
+    const reason = options.reason ?? "";
     if (signal && signal.aborted) {
-      this.emit("abandoned", priority, path, 0);
+      this.emit("abandoned", priority, path, 0, reason);
       return Promise.reject(new DownloadGateError("aborted", "下载任务已取消"));
     }
     if (this.isAuthExpired()) {
-      this.emit("abandoned", priority, path, 0);
+      this.emit("abandoned", priority, path, 0, reason);
       return Promise.reject(
         new DownloadGateError(
           "auth-expired",
@@ -222,9 +237,10 @@ export class DownloadGate {
         signal,
         path,
         enqueuedAt: this.now(),
+        reason,
       };
       this.enqueue(pending);
-      this.emit("queued", priority, path, 0);
+      this.emit("queued", priority, path, 0, reason);
       this.pump();
     });
   }
@@ -256,7 +272,7 @@ export class DownloadGate {
       this.authRetryAfterMs()
     );
     for (const item of rejected) {
-      this.emit("abandoned", item.priority, item.path, this.now() - item.enqueuedAt);
+      this.emit("abandoned", item.priority, item.path, this.now() - item.enqueuedAt, item.reason);
       item.reject(error);
     }
     // 队列已空；pump 一次让「刚好在 start 里没被熔断拦住」的边界状态收敛（幂等）
@@ -361,12 +377,12 @@ export class DownloadGate {
   /** 启动一个任务；被取消/熔断则返回 false（继续尝试下一个）。 */
   private start(pending: QueuedTask): boolean {
     if (pending.signal && pending.signal.aborted) {
-      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt);
+      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt, pending.reason);
       pending.reject(new DownloadGateError("aborted", "下载任务已取消"));
       return false;
     }
     if (this.isAuthExpired()) {
-      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt);
+      this.emit("abandoned", pending.priority, pending.path, this.now() - pending.enqueuedAt, pending.reason);
       pending.reject(
         new DownloadGateError(
           "auth-expired",
@@ -382,7 +398,7 @@ export class DownloadGate {
     else this.backgroundActive += 1;
     this.startedCount += 1;
     if (this.active > this.peakActive) this.peakActive = this.active;
-    this.emit("acquired", pending.priority, pending.path, this.now() - pending.enqueuedAt);
+    this.emit("acquired", pending.priority, pending.path, this.now() - pending.enqueuedAt, pending.reason);
     Promise.resolve()
       .then(() => pending.task())
       .then(
@@ -399,9 +415,15 @@ export class DownloadGate {
     return true;
   }
 
-  private emit(state: GateState, priority: GatePriorityClass, path: string, waitMs: number): void {
+  private emit(
+    state: GateState,
+    priority: GatePriorityClass,
+    path: string,
+    waitMs: number,
+    reason = ""
+  ): void {
     try {
-      this.onEvent?.({ state, priority, path, waitMs: Math.max(0, Math.round(waitMs)) });
+      this.onEvent?.({ state, priority, path, waitMs: Math.max(0, Math.round(waitMs)), reason });
     } catch {
       /* 事件回调失败不影响调度 */
     }

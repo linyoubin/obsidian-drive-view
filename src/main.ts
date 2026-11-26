@@ -585,12 +585,21 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         begin: (info) => this.quarkDownloadBook!.begin(info),
         end: (token, outcome) => this.quarkDownloadBook!.end(token, outcome),
       },
-      // 0.2.8：写操作仍 reject ReadOnlyError；拒绝前回调这里做「回滚视图到云端版本」
+      // 0.2.25：写方法静默 resolve；resolve 前回调这里做「回滚视图到云端版本」
       onReadonlyWrite: (info) => this.quarkRollback?.(info),
       // 0.2.12：预取默认开启（字段缺省视为开）；关闭后 getResourcePath/按笔记预取都不入队
       mdStore: this.quarkMdStore,
       currentNotePath: () => this.quarkLastNotePath,
       activeNotePath: () => this.quarkLastNotePath,
+      // 0.2.26：file-open 后 5s 内该 path 的读按 interactive（解决 read 先于 file-open 的竞态）
+      recentOpenTtlMs: 5000,
+      // 0.2.26：md 默认 interactive 的通道预算 —— interactive 通道有空位才给
+      // （满额回落 bulk，避免启动时几百个 md 扫描把交互通道占满）
+      interactiveBudget: () => {
+        const gate = this.quarkClient?.downloadGate;
+        if (!gate) return true;
+        return gate.interactiveActiveCount + gate.interactivePendingCount < gate.interactiveLimit;
+      },
       allowPrefetch: () => this.settings.quarkPrefetchImages !== false,
       // 0.2.12：每篇笔记上限（默认 20；0 = 关闭）
       prefetchPerNote: () => this.settings.quarkPrefetchPerNote ?? 20,
@@ -1009,6 +1018,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     };
     const path = workspace.activeLeaf?.view?.file?.path ?? "";
     this.quarkLastNotePath = path;
+    // 0.2.26：记录「刚打开」的时间窗 —— Obsidian 可能先 read 再触发 file-open，
+    // 窗内对该 path 的读一律 interactive（详见 QuarkReadOnlyAdapter.markNoteOpened）。
+    if (path) this.quarkAdapter?.markNoteOpened(path);
     // 0.2.17：熔断期间点开笔记 → 额外提示一次（同一失效期只一次）
     if (this.quarkAuthExpired && this.quarkAuthGate.shouldShow()) {
       new Notice(QUARK_AUTH_READ_BLOCKED_TEXT, 8000);

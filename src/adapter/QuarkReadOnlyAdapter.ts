@@ -74,6 +74,8 @@ export interface QuarkDownloadClient {
       signal?: { aborted: boolean } | null;
       path?: string;
       priority?: "interactive" | "background" | "background-user" | "bulk";
+      /** 0.2.26：优先级判定来源（`recentOpened|active|md-default|bulk|bg|bg-user`）。 */
+      reason?: string;
     }): Promise<ArrayBuffer>;
 }
 
@@ -185,6 +187,26 @@ export interface QuarkReadOnlyAdapterOptions {
   currentNotePath?: () => string;
   /** 0.2.16：当前活动笔记路径（决定 interactive 优先级，不按扩展名）。 */
   activeNotePath?: () => string;
+  /**
+   * 0.2.26：`file-open` 后「刚打开」的时间窗（毫秒，默认 5000）。
+   * 窗内对该 path 的读一律 interactive（解决「read 先于 file-open」的竞态）。
+   */
+  recentOpenTtlMs?: number;
+  /** 0.2.26：时间源（单测注入假时钟），默认 `Date.now`。 */
+  now?: () => number;
+  /**
+   * 0.2.26：md 读默认 interactive 的通道预算。
+   * 返回 false 时回落 bulk（防止启动扫描把 interactive 通道占满）。
+   */
+  interactiveBudget?: () => boolean;
+}
+
+/** 0.2.26：优先级判定结果（reason 仅用于 `stage=gate` 日志）。 */
+export type QuarkPriorityReason = "recentOpened" | "active" | "md-default" | "bulk" | "bg" | "bg-user";
+
+export interface QuarkPriorityChoice {
+  priority: "interactive" | "background" | "background-user" | "bulk";
+  reason: QuarkPriorityReason;
 }
 
 /** 回滚用到的叶子视图最小形状（Obsidian `WorkspaceLeaf` 结构上满足）。 */
@@ -287,6 +309,11 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly mdStore?: MdStoreType | null;
   private readonly currentNotePath?: () => string;
   private readonly activeNotePath?: () => string;
+  /** 0.2.26：最近 `file-open` 过的 path → 时间戳（TTL 内读按 interactive）。 */
+  private readonly recentOpened = new Map<string, number>();
+  private readonly recentOpenTtlMs: number;
+  private readonly now: () => number;
+  private readonly interactiveBudget?: () => boolean;
   private deferCount = 0;
   private deferLoggedAt = 0;
 
@@ -309,6 +336,29 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     this.mdStore = options.mdStore ?? null;
     this.currentNotePath = options.currentNotePath;
     this.activeNotePath = options.activeNotePath;
+    this.recentOpenTtlMs = Math.max(0, options.recentOpenTtlMs ?? 5000);
+    this.now = options.now ?? (() => Date.now());
+    this.interactiveBudget = options.interactiveBudget;
+  }
+
+  /**
+   * 0.2.26：`file-open` 通知 —— 记住这个 path（TTL 内读一律 interactive）。
+   *
+   * 真机竞态：Obsidian 打开笔记时可能**先发起 read、后触发 file-open**，
+   * 于是这一篇的正文读被判成 bulk 排在后台队列。用 5s 时间窗兜住「file-open 之后的读」，
+   * 时间窗之前的第一次读则由 `interactiveBudget`（md-default）兜住。
+   */
+  markNoteOpened(normalizedPath: string): void {
+    const clean = normalizeVaultPath(normalizedPath);
+    if (!clean) return;
+    const at = this.now();
+    this.recentOpened.set(clean, at);
+    if (this.recentOpened.size > 64) {
+      const cutoff = at - this.recentOpenTtlMs;
+      for (const [path, openedAt] of this.recentOpened) {
+        if (openedAt < cutoff) this.recentOpened.delete(path);
+      }
+    }
   }
 
   // ---------------------------------------------------------------- 同步 2
@@ -491,7 +541,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   /** 0.2.13：bulk 预取专用读取——强制 bulk 优先级（永远让位于 interactive/background）。 */
   async readForBulk(normalizedPath: string): Promise<ArrayBuffer> {
     if (this.shouldForward(normalizedPath)) return this.baseAdapter.readBinary(normalizedPath);
-    return await this.loadBinary(normalizedPath, "bulk");
+    return await this.loadBinary(normalizedPath, { priority: "bulk", reason: "bulk" });
   }
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
@@ -514,7 +564,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   async readBinaryForUser(normalizedPath: string): Promise<ArrayBuffer> {
     if (this.shouldForward(normalizedPath)) return this.baseAdapter.readBinary(normalizedPath);
     try {
-      return await this.loadBinary(normalizedPath, "background-user");
+      return await this.loadBinary(normalizedPath, { priority: "background-user", reason: "bg-user" });
     } catch (error) {
       this.reportDiagOnce(error, "readBinary", normalizedPath, this.fidOf(normalizedPath));
       throw error;
@@ -665,7 +715,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
    */
   private async loadBinary(
     normalizedPath: string,
-    priorityOverride?: "interactive" | "background" | "background-user" | "bulk"
+    priorityOverride?: QuarkPriorityChoice
   ): Promise<ArrayBuffer> {
     const clean = normalizeVaultPath(normalizedPath);
     if (!clean) throw new QuarkEntryNotFoundError(clean);
@@ -719,7 +769,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (!entry) throw new QuarkEntryNotFoundError(clean);
     if (isDirectoryLike(entry)) throw new QuarkEntryNotFoundError(clean);
 
-    const priority = priorityOverride ?? this.downloadPriority(clean);
+    const choice = priorityOverride ?? this.notePriority(clean);
+    const priority = choice.priority;
     const token =
       this.downloadUi?.begin({ path: clean, fid: entry.fid, sizeBytes: entry.size, priority }) ?? null;
     try {
@@ -728,6 +779,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
         signal: token,
         path: clean,
         priority,
+        reason: choice.reason,
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
@@ -846,17 +898,32 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   }
 
   /**
-   * 下载优先级（0.2.20 N1）：附件（点开才下）永远 background → 取消按钮能掐掉；
-   * 当前活动笔记正文 interactive；其它 md → bulk。
+   * 0.2.26：md 正文读的优先级判定（reason 只用于诊断日志）。
    *
-   * 改前「活动路径 === 附件路径」会把刚点开的图片判成 interactive，
-   * 于是默认跳过 interactive 的取消逻辑对它无效。
+   * 竞态背景：Obsidian 打开笔记时可能**先 `read()` 再触发 `file-open`**，这次读若判 bulk
+   * 就会排在后台队列里（手机端表现为长时间空白）。三层判定：
+   *   1. `recentOpened`（file-open 后 5s 内）→ interactive（reason=recentOpened）；
+   *   2. `activeNotePath` 命中 → interactive（reason=active）；
+   *   3. md 默认 interactive，但受 `interactiveBudget` 约束（reason=md-default）；
+   *      预算不足 → bulk（reason=bulk），避免启动扫描把交互通道占满。
+   * 非 md（附件）永远 background（reason=bg），不受交互预算影响。
    */
-  private downloadPriority(path: string): "interactive" | "background" | "bulk" {
-    if (!isMarkdownPath(path)) return "background";
+  private notePriority(path: string): QuarkPriorityChoice {
+    if (!isMarkdownPath(path)) return { priority: "background", reason: "bg" };
+    const openedAt = this.recentOpened.get(path);
+    if (openedAt !== undefined && this.now() - openedAt <= this.recentOpenTtlMs) {
+      return { priority: "interactive", reason: "recentOpened" };
+    }
     const active = this.activeNotePath ? String(this.activeNotePath() ?? "") : "";
-    if (active && path === active) return "interactive";
-    return "bulk";
+    if (active && path === active) return { priority: "interactive", reason: "active" };
+    let budget = false;
+    try {
+      budget = this.interactiveBudget ? this.interactiveBudget() === true : false;
+    } catch {
+      budget = false;
+    }
+    if (budget) return { priority: "interactive", reason: "md-default" };
+    return { priority: "bulk", reason: "bulk" };
   }
 
   /**
