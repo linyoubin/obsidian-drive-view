@@ -1,11 +1,12 @@
 /**
- * 0.2.29：所有非 md 文件统一「点击跳夸克」。
+ * 0.2.29/0.2.30：所有非 md 文件统一「点击跳夸克」。
  *
- * 背景（用户实测 0.2.28）：图片/PDF 的「框架」在，但内容始终空白；Obsidian 内渲染不可靠
- * （PDF 需要本地 `app://` 路径，虚拟库给不了）。因此 0.2.29 起：
- *   - 图片/PDF 默认也走「确认 → 打开夸克所在目录」；
- *   - 开关拆成两个：「Office/压缩包/音视频」与「图片/PDF」，默认都开；
- *   - 关掉「图片/PDF」开关才回到 Obsidian 内尝试渲染（0.2.28 已修 MIME/刷新逻辑）。
+ * 背景（用户实测 0.2.28）：图片/PDF 的「框架」在，但内容始终空白；PDF 需要本地 `app://`
+ * 路径，虚拟库给不了。0.2.30 起：
+ *   - **图片恢复 Obsidian 内渲染**（0.2.30 修占位/换 URL/mtime，见 QuarkReadOnlyAdapter）；
+ *   - **PDF 仍走「确认 → 打开夸克所在目录」**；
+ *   - Office/压缩包/音视频等仍走「确认 → 打开夸克」；
+ *   - 开关拆两个：「Office/压缩包/音视频」与「PDF」，默认都开。
  *
  * URL 实测（2026-11-26，官方网页版）：
  *   - `https://pan.quark.cn/list#/list/all/<folderFid>` 能进入该目录（rootFid 实测有效）；
@@ -16,23 +17,8 @@
 
 import { normalizeVaultPath } from "../utils/pathUtils";
 
-/** 图片/PDF（新开关「图片/PDF：点击跳夸克」）。 */
-export const QUARK_UNPREVIEWABLE_MEDIA_EXTENSIONS: readonly string[] = [
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "svg",
-  "bmp",
-  "heic",
-  "heif",
-  "avif",
-  "ico",
-  "tiff",
-  "tif",
-  "pdf",
-];
+/** PDF（「PDF：点击跳夸克」开关）。0.2.30 起图片恢复 Obsidian 内渲染，不再跳转。 */
+export const QUARK_UNPREVIEWABLE_MEDIA_EXTENSIONS: readonly string[] = ["pdf"];
 
 /**
  * Office / 压缩包 / 音视频 / 电子书 / 安装包（原开关「Office/压缩包/音视频：点击跳夸克」）。

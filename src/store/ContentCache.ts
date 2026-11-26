@@ -238,11 +238,10 @@ export class ContentCache {
   }
 
   /**
-   * 0.2.29：重新生成 blob URL（旧 URL 延迟 revoke，避免渲染器正持有它）。
+   * 0.2.30：重新生成 blob URL（旧 URL 延迟 revoke，避免重载前失效）。
    *
-   * 为什么需要：Obsidian 会缓存已经拿到的资源 URL；若第一次拿到的是占位/旧的空 blob，
-   * 下载完成后只换内容不换 URL，视图可能一直显示空白。下载完成后调用这里强制换新 URL，
-   * 再触发视图重载。返回新 URL（未命中返回 `""`）。
+   * Obsidian 按 path 缓存资源 URL；只换内容不换 URL 时视图可能一直空白。
+   * 图片下载完成后调用这里强制换新 URL，再触发重载。返回新 URL（未命中返回 `""`）。
    */
   regenerateResourceUrl(path: string): string {
     const entry = this.entries.get(path);

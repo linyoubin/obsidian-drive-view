@@ -648,6 +648,19 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           /* 换 URL 失败不影响重载 */
         }
       },
+      notifyModified: (path) => {
+        // 0.2.30：换 URL 后触发 modify，让 Obsidian 立即失效该 path 的资源缓存
+        try {
+          const vault = this.app.vault as unknown as {
+            getAbstractFileByPath?: (path: string) => unknown;
+            trigger?: (name: string, file: unknown) => void;
+          };
+          const file = vault.getAbstractFileByPath?.(path);
+          if (file) vault.trigger?.("modify", file);
+        } catch {
+          /* 事件失败不影响重载 */
+        }
+      },
       log: (entry) => {
         try {
           this.quarkDiag?.log({

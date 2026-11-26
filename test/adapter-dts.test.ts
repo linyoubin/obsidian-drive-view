@@ -59,6 +59,8 @@ const NON_CONTRACT_MEMBERS = new Set([
   "reportViewOpen",
   "refreshResourceUrl",
   "logViewResource",
+  "placeholderUrl",
+  "markResourceUpdated",
   "shouldForward",
   "findEntry",
   "loadBinary",

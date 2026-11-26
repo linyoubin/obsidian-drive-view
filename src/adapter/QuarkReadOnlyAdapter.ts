@@ -42,7 +42,7 @@ export const QUARK_ADAPTER_NAME = "quark-readonly";
 /** 0.2.15：图片「点了才下」——未命中返回 1×1 透明 PNG 占位，不触发下载。 */
 export const QUARK_PLACEHOLDER_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-/** 0.2.29：`stage=view`（getResourcePath）同 path 日志节流窗口。 */
+/** 0.2.30：`stage=view`（getResourcePath）同 path 日志节流窗口。 */
 const QUARK_VIEW_LOG_THROTTLE_MS = 2_000;
 /** 默认配置目录。 */
 export const DEFAULT_CONFIG_DIR = ".obsidian";
@@ -68,9 +68,7 @@ export interface QuarkCacheLike {
   enqueuePrefetch(items: Array<{ path: string; size?: number }>): unknown;
   /** 0.2.12：是否在队列/下载中（按笔记精准预取时跳过）。 */
   isPrefetching?(path: string): boolean;
-  /** 0.2.29：查看缓存条目（`stage=view` 记录 bytes；可选）。 */
-  peek?(path: string): { bytes: number } | null;
-  /** 0.2.29：下载完成后重新生成 blob URL（可选；ContentCache 实现）。 */
+  /** 0.2.30：重新生成 blob URL（可选；ContentCache 实现）。 */
   regenerateResourceUrl?(path: string): string;
 }
 
@@ -340,6 +338,12 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private deferLoggedAt = 0;
   /** 0.2.29：`stage=view`（getResourcePath）节流时间（path → at）。 */
   private readonly viewLoggedAt = new Map<string, number>();
+  /** 0.2.30：每个 path 被 `getResourcePath` 询问的次数（H1 自证）。 */
+  private readonly viewAskCount = new Map<string, number>();
+  /** 0.2.30：图片下载完成后的虚拟 mtime（stat 返回它，让 Obsidian 资源缓存失效）。 */
+  private readonly resourceVersions = new Map<string, number>();
+  /** 0.2.30：占位 URL 序号（每次调用都不同，绕过按 path 的字符串缓存）。 */
+  private placeholderSeq = 0;
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -411,7 +415,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     try {
       const url = this.cache.getResourceUrl(clean);
       if (url) {
-        this.logViewResource(clean, url);
+        this.logViewResource(clean, url, "blob");
         return url;
       }
       if (clean && !this.prefetchEnabled()) {
@@ -424,8 +428,9 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
           this.reportInfo("prefetch", note || "/", fid, { state: "summary", note, refs: this.deferCount, deferred: this.deferCount, enqueued: 0, reason: "on-demand" });
           this.deferCount = 0;
         }
-        this.logViewResource(clean, "");
-        return QUARK_PLACEHOLDER_DATA_URL;
+        const placeholder = this.placeholderUrl();
+        this.logViewResource(clean, placeholder, "placeholder");
+        return placeholder;
       }
       if (clean && this.prefetchEnabled()) {
         const entry = this.findEntry(clean);
@@ -442,11 +447,73 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
           reason: dropped > 0 ? "queue-full" : "",
         });
       }
+      this.logViewResource(clean, "", "empty");
       return "";
     } catch (error) {
       // 诊断：打开失败时记录读的是哪个 path/fid（不改行为：照旧抛出）
       this.reportDiagOnce(error, "getResourcePath", clean, fid);
       throw error;
+    }
+  }
+
+  /** 0.2.30：占位 URL 每次不同（末尾 `#q<seq>`），绕过 Obsidian 按 path 的字符串缓存。 */
+  private placeholderUrl(): string {
+    this.placeholderSeq += 1;
+    return `${QUARK_PLACEHOLDER_DATA_URL}#q${this.placeholderSeq}`;
+  }
+
+  /** 0.2.30：`getResourcePath` 自证（api/result/askCount/mime/urlHead；同 path 2s 内限流）。 */
+  private logViewResource(
+    path: string,
+    url: string,
+    result: "blob" | "placeholder" | "empty"
+  ): void {
+    if (!path || isMarkdownPath(path) || !this.findEntry(path)) return;
+    try {
+      const askCount = (this.viewAskCount.get(path) ?? 0) + 1;
+      this.viewAskCount.set(path, askCount);
+      const at = this.now();
+      const previous = this.viewLoggedAt.get(path);
+      if (previous !== undefined && at - previous < QUARK_VIEW_LOG_THROTTLE_MS) return;
+      this.viewLoggedAt.set(path, at);
+      this.reportInfo("view", path, this.fidOf(path), {
+        api: "getResourcePath",
+        result,
+        askCount,
+        kind: quarkViewKind(path),
+        mime: guessMimeType(path),
+        urlHead: url.slice(0, 20),
+      });
+    } catch {
+      /* 日志失败不影响资源路径返回 */
+    }
+  }
+
+  /**
+   * 0.2.30：图片下载完成后重新生成 blob URL（不复用旧 URL）。
+   *
+   * Obsidian 按 path 缓存资源 URL；只换内容不换 URL 时图片会一直空白。
+   * warmup 在重载前调用这里强制换新（旧 URL 延迟 revoke，避免重载前失效）。
+   */
+  refreshResourceUrl(normalizedPath: string): string {
+    if (this.shouldForward(normalizedPath)) return this.baseAdapter.getResourcePath(normalizedPath);
+    const clean = normalizeVaultPath(normalizedPath);
+    if (!clean) return "";
+    try {
+      if (this.cache.regenerateResourceUrl) return this.cache.regenerateResourceUrl(clean);
+      return this.cache.getResourceUrl(clean);
+    } catch {
+      return this.cache.getResourceUrl(clean);
+    }
+  }
+
+  /** 0.2.30：下载完成后把该 path 的虚拟 mtime 置为当前时间（stat 返回它）。 */
+  private markResourceUpdated(path: string): void {
+    if (!path) return;
+    try {
+      this.resourceVersions.set(path, this.now());
+    } catch {
+      /* 记录失败不影响下载结果 */
     }
   }
 
@@ -483,7 +550,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     if (!entry) return null;
     // 索引里没有 ctime（夸克只给 updated_at），ctime 取 mtime 兜底
     // 0.2.9：mtime 统一成毫秒（秒级 updated_at 在 IndexStore 已归一，这里再兜一层）
-    const mtime = normalizeQuarkMtime(entry.mtime);
+    // 0.2.30：下载过该文件则用「下载完成时间」当 mtime（让 Obsidian 资源缓存失效）
+    const indexedMtime = normalizeQuarkMtime(entry.mtime);
+    const bumped = this.resourceVersions.get(clean) ?? 0;
+    const mtime = Math.max(indexedMtime, bumped);
     return { type: entry.type, ctime: mtime, mtime, size: entry.size };
   }
 
@@ -607,7 +677,9 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
         priority: "background-user",
         reason: "bg-user",
       });
-      this.reportViewOpen(normalizedPath, buffer);
+      // 0.2.30：下载完成后换新 blob URL（Obsidian 可能缓存旧的占位/空 blob）
+      this.refreshResourceUrl(normalizedPath);
+      this.reportViewOpen(normalizedPath, buffer, "readBinary");
       return buffer;
     } catch (error) {
       this.reportDiagOnce(error, "readBinary", normalizedPath, this.fidOf(normalizedPath));
@@ -638,48 +710,6 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     }
   }
 
-  /**
-   * 0.2.29：`getResourcePath` 的自证日志（同 path 2s 内只记一次，避免图片连刷日志）。
-   * 记录 `api/mime/bytes/urlHead`——判断 Obsidian 渲染器到底走 `getResourcePath` 还是 `readBinary`。
-   */
-  private logViewResource(path: string, url: string): void {
-    if (!path || isMarkdownPath(path) || !this.findEntry(path)) return;
-    try {
-      const at = this.now();
-      const previous = this.viewLoggedAt.get(path);
-      if (previous !== undefined && at - previous < QUARK_VIEW_LOG_THROTTLE_MS) return;
-      this.viewLoggedAt.set(path, at);
-      const peek = this.cache.peek ? this.cache.peek(path) : null;
-      this.reportInfo("view", path, this.fidOf(path), {
-        api: "getResourcePath",
-        kind: quarkViewKind(path),
-        mime: guessMimeType(path),
-        bytes: peek && typeof peek.bytes === "number" ? peek.bytes : 0,
-        urlHead: url.slice(0, 20),
-        state: url ? "hit" : this.prefetchEnabled() ? "miss" : "placeholder",
-      });
-    } catch {
-      /* 日志失败不影响资源路径返回 */
-    }
-  }
-
-  /**
-   * 0.2.29：下载完成后重新生成 blob URL（不复用旧 URL）。
-   *
-   * Obsidian 可能缓存第一次拿到的资源 URL（占位 `data:` 或旧的空 blob），
-   * 只换内容不换 URL 时视图会一直空白；warmup 在重载前调用这里强制换新。
-   */
-  refreshResourceUrl(normalizedPath: string): string {
-    if (this.shouldForward(normalizedPath)) return this.baseAdapter.getResourcePath(normalizedPath);
-    const clean = normalizeVaultPath(normalizedPath);
-    if (!clean) return "";
-    try {
-      if (this.cache.regenerateResourceUrl) return this.cache.regenerateResourceUrl(clean);
-      return this.cache.getResourceUrl(clean);
-    } catch {
-      return this.cache.getResourceUrl(clean);
-    }
-  }
 
   // ---------------------------------------------------------------- 写 12（只读 no-op，0.2.25）
 
@@ -898,6 +928,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
       });
       if (token && token.aborted) throw new QuarkDownloadCanceledError();
       this.cache.put(clean, buffer, { fid: entry.fid, mtime: entry.mtime });
+      // 0.2.30：下载完成 → 递增虚拟 mtime（stat 返回它），让 Obsidian 资源缓存失效
+      this.markResourceUpdated(clean);
       // 0.2.13：md 正文同时落 IDB（附件永不进 IDB）
       // 0.2.19 B5：put 失败只记 cause=cache-put，正文照常返回
       if (this.mdStore && isMarkdownPath(clean)) {
@@ -1253,9 +1285,14 @@ export interface AttachmentWarmupHost {
   /** 0.2.22 M5：当前仍打开的叶子集合（判断发起下载的叶子是否已被关闭）。 */
   openLeaves?: () => RefreshableLeafLike[];
   /**
-   * 0.2.29：下载完成、重载之前调用 —— 重新生成 blob URL（Obsidian 可能缓存旧 URL）。
+   * 0.2.30：下载完成、重载之前调用 —— 重新生成 blob URL（Obsidian 可能缓存旧 URL）。
    */
   refreshResource?: (path: string) => void;
+  /**
+   * 0.2.30：换 URL 之后、重载之前调用 —— 主插件触发一次 `modify` 事件，
+   * 让 Obsidian 立即失效该 path 的资源缓存。
+   */
+  notifyModified?: (path: string) => void;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
   /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
@@ -1550,6 +1587,12 @@ export function createAttachmentWarmup(
       host.refreshResource?.(clean);
     } catch {
       /* 换 URL 失败不影响已下载内容；重载仍会重新取 getResourcePath */
+    }
+    // 0.2.30：再触发一次 modify，让 Obsidian 立即失效该 path 的资源缓存
+    try {
+      host.notifyModified?.(clean);
+    } catch {
+      /* 事件失败不影响重载 */
     }
     // 0.2.20 B1：下载完成后按视图类型重载（Markdown → rerender；图片/PDF/媒体 → setViewState）
     // 0.2.21 S4：叶子已切到别的文件时不重载（path-mismatch）

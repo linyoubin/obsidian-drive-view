@@ -566,11 +566,11 @@ export class QuarkSettingsTab extends settingTabBase() {
       );
 
     new Setting(container)
-      .setName("图片/PDF：点击跳夸克（默认开）")
+      .setName("PDF：点击跳夸克（默认开）")
       .setDesc(
         snapshot.openMediaInQuark
-          ? "点击图片 / PDF 时确认后在夸克网页打开所在目录（Obsidian 内置查看器对虚拟库渲染不可靠）"
-          : "关闭：点击图片 / PDF 仍交回 Obsidian 渲染（0.2.28 已修 MIME 与 blob 刷新）"
+          ? "点击 PDF 时确认后在夸克网页打开所在目录（Obsidian 内置 PDF 阅读器依赖本地 app:// 路径，虚拟库不可用）"
+          : "关闭：点击 PDF 交回 Obsidian 尝试渲染（打开空白即平台限制）"
       )
       .addToggle((toggle: any) =>
         toggle.setValue(snapshot.openMediaInQuark).onChange(async (value: boolean) => {

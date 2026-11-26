@@ -84,9 +84,10 @@ describe("0.2.28 不可预览扩展名判定（0.2.29 起图片/PDF 也纳入）
     for (const path of ["a.md", "a.canvas", "a.txt"]) {
       expect(isQuarkUnpreviewable(path), path).toBe(false);
     }
-    for (const path of ["a.png", "a.pdf", "a.jpg"]) {
-      expect(isQuarkUnpreviewable(path), path).toBe(true);
+    for (const path of ["a.png", "a.jpg"]) {
+      expect(isQuarkUnpreviewable(path), path).toBe(false);
     }
+    expect(isQuarkUnpreviewable("a.pdf")).toBe(true);
     expect(isQuarkUnpreviewable("A.DOCX")).toBe(true);
     expect(quarkExtensionOf("docs/方案.Docx")).toBe("docx");
     expect(QUARK_UNPREVIEWABLE_EXTENSIONS).toContain("docx");
