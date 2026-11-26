@@ -196,6 +196,11 @@ export interface QuarkSettings {
    * 关闭后按只读占位静默处理（不弹确认、不打开浏览器）。
    */
   quarkOpenUnpreviewableInQuark: boolean;
+  /**
+   * 0.2.29：图片/PDF 点击时跳夸克打开（默认开）。
+   * 关闭后才回到 Obsidian 内尝试渲染（0.2.28 已修 MIME/刷新）。
+   */
+  quarkOpenMediaInQuark: boolean;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -210,6 +215,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkPrefetchPerNote: 0,
   quarkPrefetchAllMarkdown: true,
   quarkOpenUnpreviewableInQuark: true,
+  quarkOpenMediaInQuark: true,
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */

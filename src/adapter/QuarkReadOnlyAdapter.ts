@@ -42,6 +42,8 @@ export const QUARK_ADAPTER_NAME = "quark-readonly";
 /** 0.2.15：图片「点了才下」——未命中返回 1×1 透明 PNG 占位，不触发下载。 */
 export const QUARK_PLACEHOLDER_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+/** 0.2.29：`stage=view`（getResourcePath）同 path 日志节流窗口。 */
+const QUARK_VIEW_LOG_THROTTLE_MS = 2_000;
 /** 默认配置目录。 */
 export const DEFAULT_CONFIG_DIR = ".obsidian";
 /** 默认插件目录（配置目录内的子集，转发规则与配置目录相同）。 */
@@ -66,6 +68,10 @@ export interface QuarkCacheLike {
   enqueuePrefetch(items: Array<{ path: string; size?: number }>): unknown;
   /** 0.2.12：是否在队列/下载中（按笔记精准预取时跳过）。 */
   isPrefetching?(path: string): boolean;
+  /** 0.2.29：查看缓存条目（`stage=view` 记录 bytes；可选）。 */
+  peek?(path: string): { bytes: number } | null;
+  /** 0.2.29：下载完成后重新生成 blob URL（可选；ContentCache 实现）。 */
+  regenerateResourceUrl?(path: string): string;
 }
 
 /** 下载器的最小接口（`QuarkClient` 结构上满足）。 */
@@ -332,6 +338,8 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   private readonly interactiveBudget?: () => boolean;
   private deferCount = 0;
   private deferLoggedAt = 0;
+  /** 0.2.29：`stage=view`（getResourcePath）节流时间（path → at）。 */
+  private readonly viewLoggedAt = new Map<string, number>();
 
   constructor(options: QuarkReadOnlyAdapterOptions) {
     if (!options || !options.index || !options.cache || !options.client || !options.baseAdapter) {
@@ -402,7 +410,10 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
     let fid = "-";
     try {
       const url = this.cache.getResourceUrl(clean);
-      if (url) return url;
+      if (url) {
+        this.logViewResource(clean, url);
+        return url;
+      }
       if (clean && !this.prefetchEnabled()) {
         // 0.2.15：默认不下载、不入队；返回占位图（每次笔记一条汇总日志，限流 1s）
         const now = Date.now();
@@ -413,6 +424,7 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
           this.reportInfo("prefetch", note || "/", fid, { state: "summary", note, refs: this.deferCount, deferred: this.deferCount, enqueued: 0, reason: "on-demand" });
           this.deferCount = 0;
         }
+        this.logViewResource(clean, "");
         return QUARK_PLACEHOLDER_DATA_URL;
       }
       if (clean && this.prefetchEnabled()) {
@@ -604,19 +616,68 @@ export class QuarkReadOnlyAdapter implements DataAdapter {
   }
 
   /** 0.2.27：附件视图自证日志（level=info，不含正文/字节内容）。 */
-  private reportViewOpen(normalizedPath: string, buffer: ArrayBuffer): void {
+  private reportViewOpen(
+    normalizedPath: string,
+    buffer: ArrayBuffer,
+    api: "getResourcePath" | "readBinary" = "readBinary"
+  ): void {
     try {
       const clean = normalizeVaultPath(normalizedPath);
       const url = this.cache.getResourceUrl(clean);
       const getResourcePath = url ? "url" : this.prefetchEnabled() ? "" : "placeholder";
       this.reportInfo("view", clean, this.fidOf(clean), {
+        api,
         kind: quarkViewKind(clean),
         mime: guessMimeType(clean),
         bytes: buffer.byteLength,
         getResourcePath,
+        urlHead: url.slice(0, 20),
       });
     } catch {
       /* 日志失败不影响附件读取 */
+    }
+  }
+
+  /**
+   * 0.2.29：`getResourcePath` 的自证日志（同 path 2s 内只记一次，避免图片连刷日志）。
+   * 记录 `api/mime/bytes/urlHead`——判断 Obsidian 渲染器到底走 `getResourcePath` 还是 `readBinary`。
+   */
+  private logViewResource(path: string, url: string): void {
+    if (!path || isMarkdownPath(path) || !this.findEntry(path)) return;
+    try {
+      const at = this.now();
+      const previous = this.viewLoggedAt.get(path);
+      if (previous !== undefined && at - previous < QUARK_VIEW_LOG_THROTTLE_MS) return;
+      this.viewLoggedAt.set(path, at);
+      const peek = this.cache.peek ? this.cache.peek(path) : null;
+      this.reportInfo("view", path, this.fidOf(path), {
+        api: "getResourcePath",
+        kind: quarkViewKind(path),
+        mime: guessMimeType(path),
+        bytes: peek && typeof peek.bytes === "number" ? peek.bytes : 0,
+        urlHead: url.slice(0, 20),
+        state: url ? "hit" : this.prefetchEnabled() ? "miss" : "placeholder",
+      });
+    } catch {
+      /* 日志失败不影响资源路径返回 */
+    }
+  }
+
+  /**
+   * 0.2.29：下载完成后重新生成 blob URL（不复用旧 URL）。
+   *
+   * Obsidian 可能缓存第一次拿到的资源 URL（占位 `data:` 或旧的空 blob），
+   * 只换内容不换 URL 时视图会一直空白；warmup 在重载前调用这里强制换新。
+   */
+  refreshResourceUrl(normalizedPath: string): string {
+    if (this.shouldForward(normalizedPath)) return this.baseAdapter.getResourcePath(normalizedPath);
+    const clean = normalizeVaultPath(normalizedPath);
+    if (!clean) return "";
+    try {
+      if (this.cache.regenerateResourceUrl) return this.cache.regenerateResourceUrl(clean);
+      return this.cache.getResourceUrl(clean);
+    } catch {
+      return this.cache.getResourceUrl(clean);
     }
   }
 
@@ -1182,7 +1243,8 @@ export function quarkDownloadTimeoutMsForSize(
   return Math.max(base, Math.min(120_000, scaled));
 }
 
-/** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */export interface AttachmentWarmupHost {
+/** 附件预热需要的最小宿主：读字节（走 adapter.readBinary → 下载并写缓存）+ 重绘。 */
+export interface AttachmentWarmupHost {
   readBinary(path: string): Promise<unknown>;
   /** 兼容旧回调：没有 `activeLeaf` 时用它重绘。 */
   redraw?: (path: string) => void;
@@ -1190,6 +1252,10 @@ export function quarkDownloadTimeoutMsForSize(
   activeLeaf?: () => RefreshableLeafLike | null | undefined;
   /** 0.2.22 M5：当前仍打开的叶子集合（判断发起下载的叶子是否已被关闭）。 */
   openLeaves?: () => RefreshableLeafLike[];
+  /**
+   * 0.2.29：下载完成、重载之前调用 —— 重新生成 blob URL（Obsidian 可能缓存旧 URL）。
+   */
+  refreshResource?: (path: string) => void;
   /** 时间源（单测注入假时钟），默认 `Date.now`。 */
   now?: () => number;
   /** 下载/重绘失败回调（默认吞掉：预热失败不影响阅读）。 */
@@ -1478,6 +1544,12 @@ export function createAttachmentWarmup(
       }
       host.onError?.(clean, error);
       return false;
+    }
+    // 0.2.29：重载之前先换新 blob URL（Obsidian 可能缓存了旧的占位/空 blob）
+    try {
+      host.refreshResource?.(clean);
+    } catch {
+      /* 换 URL 失败不影响已下载内容；重载仍会重新取 getResourcePath */
     }
     // 0.2.20 B1：下载完成后按视图类型重载（Markdown → rerender；图片/PDF/媒体 → setViewState）
     // 0.2.21 S4：叶子已切到别的文件时不重载（path-mismatch）

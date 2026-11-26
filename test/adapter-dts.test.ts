@@ -57,6 +57,8 @@ const NON_CONTRACT_MEMBERS = new Set([
   "readonlyWrite",
   "markNoteOpened",
   "reportViewOpen",
+  "refreshResourceUrl",
+  "logViewResource",
   "shouldForward",
   "findEntry",
   "loadBinary",

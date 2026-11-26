@@ -238,6 +238,30 @@ export class ContentCache {
   }
 
   /**
+   * 0.2.29：重新生成 blob URL（旧 URL 延迟 revoke，避免渲染器正持有它）。
+   *
+   * 为什么需要：Obsidian 会缓存已经拿到的资源 URL；若第一次拿到的是占位/旧的空 blob，
+   * 下载完成后只换内容不换 URL，视图可能一直显示空白。下载完成后调用这里强制换新 URL，
+   * 再触发视图重载。返回新 URL（未命中返回 `""`）。
+   */
+  regenerateResourceUrl(path: string): string {
+    const entry = this.entries.get(path);
+    if (!entry) return "";
+    const oldUrl = entry.url;
+    if (oldUrl) {
+      try {
+        if (this.revokeDelayMs <= 0) this.revokeUrl(oldUrl);
+        else this.schedule(() => this.revokeUrl(oldUrl), this.revokeDelayMs);
+      } catch {
+        this.revokeUrl(oldUrl);
+      }
+    }
+    entry.url = entry.bytes > 0 ? this.createUrl(entry.data, path) : "";
+    entry.loadedAt = this.now();
+    return entry.url;
+  }
+
+  /**
    * 写入内容。
    *
    * - 单条大于总上限 → 不缓存（返回 `cached:false`，避免进来就把别的全挤掉）；

@@ -44,6 +44,8 @@ export interface QuarkUiSnapshot {
   prefetchAllMarkdown: boolean;
   /** 0.2.28：不可预览文件（docx/xlsx/zip…）点击时跳夸克打开。 */
   openUnpreviewableInQuark: boolean;
+  /** 0.2.29：图片/PDF 点击时跳夸克打开。 */
+  openMediaInQuark: boolean;
   /** 0.2.13：md 磁盘正文缓存统计。 */
   mdCount: number;
   mdBytes: number;
@@ -80,6 +82,8 @@ export interface QuarkHost {
   quarkSetPrefetchAllMarkdown(value: boolean): Promise<void>;
   /** 0.2.28：不可预览文件点击跳夸克开关。 */
   quarkSetOpenUnpreviewableInQuark(value: boolean): Promise<void>;
+  /** 0.2.29：图片/PDF 点击跳夸克开关。 */
+  quarkSetOpenMediaInQuark(value: boolean): Promise<void>;
   quarkCancelBulkPrefetch(): void;
   quarkClearMdCache(): Promise<void>;
 }
@@ -108,6 +112,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   lastNotePrefetch: 0,
   prefetchAllMarkdown: true,
   openUnpreviewableInQuark: true,
+  openMediaInQuark: true,
   bulkDone: 0,
   bulkTotal: 0,
   bulkBytes: 0,
@@ -545,17 +550,31 @@ export class QuarkSettingsTab extends settingTabBase() {
         })
       );
 
-    // 0.2.28：不可预览文件（docx/xlsx/zip/epub…）点击时跳夸克打开（默认开）
+    // 0.2.28/0.2.29：非 md 文件点击时跳夸克打开（两个开关，默认都开）
     new Setting(container)
-      .setName("不可预览文件点击时跳夸克打开（默认开）")
+      .setName("Office/压缩包/音视频：点击跳夸克（默认开）")
       .setDesc(
         snapshot.openUnpreviewableInQuark
-          ? "点击 .docx / .xlsx / .zip / .epub 等 Obsidian 不能预览的文件时，确认后打开它所在的夸克网盘目录"
+          ? "点击 .docx / .xlsx / .zip / .epub / .mp4 等 Obsidian 不能预览的文件时，确认后打开它所在的夸克网盘目录"
           : "关闭：点击这些文件不弹确认、不打开浏览器（按只读占位静默处理）"
       )
       .addToggle((toggle: any) =>
         toggle.setValue(snapshot.openUnpreviewableInQuark).onChange(async (value: boolean) => {
           await this.host.quarkSetOpenUnpreviewableInQuark(value === true);
+          this.display();
+        })
+      );
+
+    new Setting(container)
+      .setName("图片/PDF：点击跳夸克（默认开）")
+      .setDesc(
+        snapshot.openMediaInQuark
+          ? "点击图片 / PDF 时确认后在夸克网页打开所在目录（Obsidian 内置查看器对虚拟库渲染不可靠）"
+          : "关闭：点击图片 / PDF 仍交回 Obsidian 渲染（0.2.28 已修 MIME 与 blob 刷新）"
+      )
+      .addToggle((toggle: any) =>
+        toggle.setValue(snapshot.openMediaInQuark).onChange(async (value: boolean) => {
+          await this.host.quarkSetOpenMediaInQuark(value === true);
           this.display();
         })
       );

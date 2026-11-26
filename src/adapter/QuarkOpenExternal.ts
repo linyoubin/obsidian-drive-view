@@ -1,24 +1,44 @@
 /**
- * 0.2.28：Obsidian 不能原生预览的文件（docx/xlsx/zip/epub…）—— 点击时提示「去夸克打开」。
+ * 0.2.29：所有非 md 文件统一「点击跳夸克」。
  *
- * 为什么只给目录级 URL（实测依据，2026-11-26，`browser` 打开官方网页版）：
- *   - `https://pan.quark.cn/list#/list/all/<folderFid>` → 能进入该目录
- *     （用调试库 rootFid `4e5cda2d01544632b54129bf61c22abb` 实测：显示 `.obsidian / 20-notes / 10-sources …`；
- *      用 `0` 实测显示账号根目录「我的备份 / 个人空间 / 来自：分享 …」）；
- *   - `https://pan.quark.cn/list#/list/all/<folderFid>/<fileFid>` → 空目录视图（该路由段被当作目录，非文件）；
- *   - `https://pan.quark.cn/list#/list/all/<folderFid>?fid=<fileFid>` → 只显示目录列表，query 被忽略。
- * 因此采用「打开所在目录」：`buildQuarkFolderUrl(parentFid)`。
+ * 背景（用户实测 0.2.28）：图片/PDF 的「框架」在，但内容始终空白；Obsidian 内渲染不可靠
+ * （PDF 需要本地 `app://` 路径，虚拟库给不了）。因此 0.2.29 起：
+ *   - 图片/PDF 默认也走「确认 → 打开夸克所在目录」；
+ *   - 开关拆成两个：「Office/压缩包/音视频」与「图片/PDF」，默认都开；
+ *   - 关掉「图片/PDF」开关才回到 Obsidian 内尝试渲染（0.2.28 已修 MIME/刷新逻辑）。
+ *
+ * URL 实测（2026-11-26，官方网页版）：
+ *   - `https://pan.quark.cn/list#/list/all/<folderFid>` 能进入该目录（rootFid 实测有效）；
+ *   - `#/list/all/<folderFid>/<fileFid>` 与 `?fid=<fileFid>` 均无效 → 退一步打开所在目录。
  *
  * 本模块不 import `obsidian`（UI/剪贴板由 main 注入），可直接单测。
  */
 
 import { normalizeVaultPath } from "../utils/pathUtils";
 
+/** 图片/PDF（新开关「图片/PDF：点击跳夸克」）。 */
+export const QUARK_UNPREVIEWABLE_MEDIA_EXTENSIONS: readonly string[] = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "svg",
+  "bmp",
+  "heic",
+  "heif",
+  "avif",
+  "ico",
+  "tiff",
+  "tif",
+  "pdf",
+];
+
 /**
- * Obsidian 不能原生预览的扩展名（弹「在夸克打开」确认）。
- * 注意：csv 也列入（Obsidian 只当纯文本展示，编辑/表格能力差），按产品要求走夸克。
+ * Office / 压缩包 / 音视频 / 电子书 / 安装包（原开关「Office/压缩包/音视频：点击跳夸克」）。
+ * 注意：csv 也列入（Obsidian 只当纯文本，表格能力差），按产品要求走夸克。
  */
-export const QUARK_UNPREVIEWABLE_EXTENSIONS: readonly string[] = [
+export const QUARK_UNPREVIEWABLE_OTHER_EXTENSIONS: readonly string[] = [
   // Office / 文档
   "doc",
   "docx",
@@ -42,6 +62,19 @@ export const QUARK_UNPREVIEWABLE_EXTENSIONS: readonly string[] = [
   "bz2",
   "xz",
   "iso",
+  // 音视频
+  "mp3",
+  "mp4",
+  "mov",
+  "m4a",
+  "m4v",
+  "wav",
+  "ogg",
+  "webm",
+  "mkv",
+  "flac",
+  "avi",
+  "wmv",
   // 电子书
   "epub",
   "mobi",
@@ -82,6 +115,14 @@ export const QUARK_UNPREVIEWABLE_EXTENSIONS: readonly string[] = [
   "torrent",
 ];
 
+/** 全部不可预览扩展名（两个开关的并集；md/canvas/base 永不在内）。 */
+export const QUARK_UNPREVIEWABLE_EXTENSIONS: readonly string[] = Array.from(
+  new Set([...QUARK_UNPREVIEWABLE_MEDIA_EXTENSIONS, ...QUARK_UNPREVIEWABLE_OTHER_EXTENSIONS])
+);
+
+/** 不可预览文件的类别（决定用哪个设置开关）。 */
+export type QuarkUnpreviewableCategory = "media" | "other";
+
 /** 取小写扩展名（无扩展名 → `""`）。 */
 export function quarkExtensionOf(path: string): string {
   const clean = normalizeVaultPath(path ?? "");
@@ -92,10 +133,18 @@ export function quarkExtensionOf(path: string): string {
   return name.slice(dot + 1).toLowerCase();
 }
 
-/** 是否是「Obsidian 不能预览、建议去夸克打开」的文件。 */
-export function isQuarkUnpreviewable(path: string): boolean {
+/** 类别判定：`media` = 图片/PDF；`other` = Office/压缩包/音视频等；`null` = 可预览（md 等）。 */
+export function quarkUnpreviewableCategory(path: string): QuarkUnpreviewableCategory | null {
   const extension = quarkExtensionOf(path);
-  return extension !== "" && QUARK_UNPREVIEWABLE_EXTENSIONS.includes(extension);
+  if (!extension) return null;
+  if (QUARK_UNPREVIEWABLE_MEDIA_EXTENSIONS.includes(extension)) return "media";
+  if (QUARK_UNPREVIEWABLE_OTHER_EXTENSIONS.includes(extension)) return "other";
+  return null;
+}
+
+/** 是否是「Obsidian 不能预览、建议去夸克打开」的文件（任一类别）。 */
+export function isQuarkUnpreviewable(path: string): boolean {
+  return quarkUnpreviewableCategory(path) !== null;
 }
 
 /** 目录级网页地址前缀（实测能进入指定目录）。 */
@@ -124,8 +173,8 @@ export type UnpreviewableOpenResult =
 
 /** 流程宿主（main 注入 UI / 外部打开 / 剪贴板 / 日志）。 */
 export interface UnpreviewableHost {
-  /** 设置项「Docx/Office 等不可预览文件：点击时跳夸克打开」（默认开）。 */
-  isEnabled(): boolean;
+  /** 按类别读取设置开关（media = 图片/PDF；other = Office/压缩包/音视频）。 */
+  isEnabled(category: QuarkUnpreviewableCategory): boolean;
   /** 确认弹窗（Modal 或 Notice 按钮）；true = 去夸克打开。 */
   confirm(info: { path: string; extension: string; url: string }): boolean | Promise<boolean>;
   /** 优先桌面 `electron.shell.openExternal`，其次 `window.open`；返回是否成功。 */
@@ -162,8 +211,8 @@ function describeUrl(url: string): { domain: string; length: number } {
  * 创建「不可预览文件 → 去夸克打开」流程。
  *
  * 语义：
- *   - 非不可预览扩展名 → `not-unpreviewable`（不弹、不记日志）；
- *   - 设置关闭 → `disabled`（不弹、不打开，只记日志）；
+ *   - 可预览扩展名（md 等）→ `not-unpreviewable`（不弹、不记日志）；
+ *   - 对应类别开关关闭 → `disabled`（不弹、不打开，只记日志）；
  *   - 同 path 30s 内重复点击 → `throttled`（不弹、不打开）；
  *   - 用户取消 → `cancelled`；
  *   - 打开成功 → `opened`；打开不可用但复制成功 → `copied`；都失败 → `failed`。
@@ -190,11 +239,12 @@ export function createUnpreviewableOpenFlow(
 
   return async (info) => {
     const clean = normalizeVaultPath(info.path ?? "");
-    if (!isQuarkUnpreviewable(clean)) return "not-unpreviewable";
+    const category = quarkUnpreviewableCategory(clean);
+    if (!category) return "not-unpreviewable";
     const fid = String(info.fid ?? "");
     const url = buildQuarkFolderUrl(info.parentFid ?? "");
 
-    if (!host.isEnabled()) {
+    if (!host.isEnabled(category)) {
       writeLog(clean, fid, url, "disabled");
       return "disabled";
     }

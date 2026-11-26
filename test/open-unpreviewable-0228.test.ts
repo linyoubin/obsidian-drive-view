@@ -76,13 +76,16 @@ function makeHost(
   };
 }
 
-describe("0.2.28 不可预览扩展名判定", () => {
-  test("docx/xlsx/pptx/zip/rar/7z/epub → true；md/png/pdf → false", () => {
+describe("0.2.28 不可预览扩展名判定（0.2.29 起图片/PDF 也纳入）", () => {
+  test("docx/xlsx/pptx/zip/rar/7z/epub → true；md/txt 仍 false；png/pdf 自 0.2.29 起 true", () => {
     for (const path of ["a.docx", "a.xlsx", "a.pptx", "a.doc", "a.ppt", "a.csv", "a.zip", "a.rar", "a.7z", "a.epub"]) {
       expect(isQuarkUnpreviewable(path), path).toBe(true);
     }
-    for (const path of ["a.md", "a.png", "a.pdf", "a.jpg", "a.canvas", "a.txt"]) {
+    for (const path of ["a.md", "a.canvas", "a.txt"]) {
       expect(isQuarkUnpreviewable(path), path).toBe(false);
+    }
+    for (const path of ["a.png", "a.pdf", "a.jpg"]) {
+      expect(isQuarkUnpreviewable(path), path).toBe(true);
     }
     expect(isQuarkUnpreviewable("A.DOCX")).toBe(true);
     expect(quarkExtensionOf("docs/方案.Docx")).toBe("docx");
@@ -186,11 +189,11 @@ describe("0.2.28 点击不可预览文件 → 确认 → 跳夸克", () => {
     expect(logs[0].result).toBe("disabled");
   });
 
-  test("可预览扩展名（md/pdf/png）→ 不弹、不打开、不记日志", async () => {
+  test("可预览扩展名（md/canvas/txt）→ 不弹、不打开、不记日志", async () => {
     const { host, calls, logs } = makeHost();
     const flow = createUnpreviewableOpenFlow(host);
 
-    for (const path of ["a.md", "a.pdf", "a.png"]) {
+    for (const path of ["a.md", "a.canvas", "a.txt"]) {
       await expect(flow({ path, fid: "f", parentFid: "root" })).resolves.toBe("not-unpreviewable");
     }
     expect(calls.confirm).toBe(0);

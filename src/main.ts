@@ -640,6 +640,14 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       // 兜底：拿不到叶子时仍尝试重绘当前活动预览
       redraw: () => this.refreshActivePreview(),
       // 0.2.21 S4：叶子已切走时不重载，只记日志 state=skip reason=path-mismatch
+      refreshResource: (path) => {
+        // 0.2.29：下载完成后换新 blob URL（Obsidian 可能缓存旧的占位/空 blob）
+        try {
+          this.quarkAdapter?.refreshResourceUrl(path);
+        } catch {
+          /* 换 URL 失败不影响重载 */
+        }
+      },
       log: (entry) => {
         try {
           this.quarkDiag?.log({
@@ -682,7 +690,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     // URL 实测：`https://pan.quark.cn/list#/list/all/<folderFid>` 能进入该目录；
     // 文件级 URL（`.../<fileFid>` 或 `?fid=`）实测无效，因此退一步打开所在目录。
     this.quarkUnpreviewableFlow = createUnpreviewableOpenFlow({
-      isEnabled: () => this.settings.quarkOpenUnpreviewableInQuark !== false,
+      // 0.2.29：两个开关 —— media（图片/PDF）与 other（Office/压缩包/音视频）
+      isEnabled: (category) =>
+        category === "media"
+          ? this.settings.quarkOpenMediaInQuark !== false
+          : this.settings.quarkOpenUnpreviewableInQuark !== false,
       confirm: (info) =>
         new Promise<boolean>((resolve) => {
           try {
@@ -1510,6 +1522,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       lastNotePrefetch: this.quarkLastNotePrefetch,
       prefetchAllMarkdown: this.settings.quarkPrefetchAllMarkdown !== false,
       openUnpreviewableInQuark: this.settings.quarkOpenUnpreviewableInQuark !== false,
+      openMediaInQuark: this.settings.quarkOpenMediaInQuark !== false,
       bulkDone: this.quarkBulkDone,
       bulkTotal: this.quarkBulkTotal,
       bulkBytes: this.quarkBulkBytes,
@@ -1611,6 +1624,12 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   /** 0.2.28：不可预览文件点击跳夸克开关（默认开）。 */
   public async quarkSetOpenUnpreviewableInQuark(value: boolean): Promise<void> {
     await this.updateSettings({ quarkOpenUnpreviewableInQuark: value === true });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.29：图片/PDF 点击跳夸克开关（默认开；关掉回到 Obsidian 渲染）。 */
+  public async quarkSetOpenMediaInQuark(value: boolean): Promise<void> {
+    await this.updateSettings({ quarkOpenMediaInQuark: value === true });
     this.refreshQuarkUi();
   }
 
