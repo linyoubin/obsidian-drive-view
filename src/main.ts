@@ -6,11 +6,16 @@ import {
   QuarkFileOpenBinding,
   QuarkReadOnlyAdapter,
   createAttachmentWarmup,
+  createObsidianAdapterProxy,
   createReadonlyRollback,
   isQuarkAttachmentPath,
   reloadLeafView,
 } from "./adapter/QuarkReadOnlyAdapter";
-import type { ReadonlyRollbackLeaf, RefreshableLeafLike } from "./adapter/QuarkReadOnlyAdapter";
+import type {
+  AdapterCallLogEntry,
+  ReadonlyRollbackLeaf,
+  RefreshableLeafLike,
+} from "./adapter/QuarkReadOnlyAdapter";
 import { VaultMounter } from "./adapter/VaultMounter";
 import type { VaultMountable } from "./adapter/VaultMounter";
 import { CookieStore } from "./auth/CookieStore";
@@ -1312,7 +1317,14 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     const adapter = this.quarkAdapter;
     const index = this.quarkIndex;
     const facade = {
-      createProxiedAdapter: (): DataAdapter => adapter,
+      // 0.2.23 P0：挂到 Obsidian 上的外观走 Proxy —— 21 个契约方法带 undefined 埋点/防护，
+      // 契约外成员回落 base adapter；都没有时返回 rejected Promise 并记 unknown-member。
+      createProxiedAdapter: (): DataAdapter =>
+        createObsidianAdapterProxy(adapter, {
+          fallback: this.mounter.getOriginalAdapter() as unknown as Record<string, unknown>,
+          logCall: (entry) => this.logAdapterCall(entry),
+          logUnknown: (entry) => this.logAdapterUnknown(entry),
+        }),
       cache: {
         getAllEntries: () =>
           index.entries.map((entry) => ({
@@ -1326,6 +1338,37 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       flushAllPendingUploads: async (): Promise<void> => undefined,
     };
     return facade;
+  }
+
+  /** 0.2.23 P0：adapter 契约方法返回 undefined 的诊断日志（warn，字段 `name/ret/args`）。 */
+  private logAdapterCall(entry: AdapterCallLogEntry): void {
+    try {
+      this.quarkDiag?.log({
+        level: "warn",
+        stage: "adapter",
+        path: "/",
+        fid: "-",
+        message: "",
+        fields: { name: entry.name, ret: entry.ret, args: entry.args },
+      });
+    } catch {
+      /* 日志失败不影响调用 */
+    }
+  }
+
+  /** 0.2.23 P0：Obsidian 调用了契约外成员（已用 rejected Promise 兜底，不再 undefined.then）。 */
+  private logAdapterUnknown(entry: { name: string; state: "unknown-member" }): void {
+    try {
+      this.quarkDiag?.log({
+        level: "warn",
+        stage: "adapter",
+        path: "/",
+        fid: "-",
+        message: `state=${entry.state} name=${entry.name}`,
+      });
+    } catch {
+      /* 日志失败不影响调用 */
+    }
   }
 
   /** 状态快照（设置页 / 状态栏 / ribbon 分支判定共用）。 */

@@ -1109,6 +1109,153 @@ export class QuarkFileOpenBinding {
   }
 }
 
+// ------------------------------------------------------------------ 0.2.23 P0：调用埋点 + 未知成员兜底
+
+/** Obsidian `DataAdapter` 的 21 个契约方法（与官方文档一致；埋点/审计共用）。 */
+export const DATA_ADAPTER_METHOD_NAMES = [
+  "getName",
+  "getBasePath",
+  "getFullPath",
+  "getResourcePath",
+  "exists",
+  "stat",
+  "list",
+  "read",
+  "readBinary",
+  "write",
+  "writeBinary",
+  "append",
+  "appendBinary",
+  "process",
+  "mkdir",
+  "rmdir",
+  "remove",
+  "rename",
+  "copy",
+  "trashSystem",
+  "trashLocal",
+] as const;
+
+/** 同步返回 string 的 4 个方法（其余契约方法必须返回 Promise）。 */
+const SYNC_ADAPTER_METHODS = new Set<string>(["getName", "getBasePath", "getFullPath", "getResourcePath"]);
+
+/** 一次 adapter 调用埋点（只在返回 undefined 时记录）。 */
+export interface AdapterCallLogEntry {
+  name: string;
+  ret: "promise" | "string" | "undefined";
+  args: number;
+}
+
+/**
+ * 0.2.23 P0：给 21 个契约方法包一层运行期埋点。
+ *
+ * 返回 undefined 时：记 `name/ret/args`（warn），并且**不让 undefined 逃逸**——
+ * 异步方法改成 rejected Promise（避免 Obsidian `writeData` 里 `undefined.then`），
+ * 同步方法按契约给兜底 string。正常返回值不打日志（避免日志爆炸）。
+ */
+export function wrapAdapterCalls<T extends object>(
+  adapter: T,
+  log?: (entry: AdapterCallLogEntry) => void
+): T {
+  const names = new Set<string>(DATA_ADAPTER_METHOD_NAMES);
+  const wrappers = new Map<string, (...args: unknown[]) => unknown>();
+  return new Proxy(adapter, {
+    get(target, prop, receiver) {
+      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+      if (!names.has(prop)) return Reflect.get(target, prop, receiver);
+      const original = Reflect.get(target, prop, receiver);
+      if (typeof original !== "function") return original;
+      const cached = wrappers.get(prop);
+      if (cached) return cached;
+      const wrapped = (...args: unknown[]): unknown => {
+        const result = (original as (...a: unknown[]) => unknown).apply(target, args);
+        const ret: AdapterCallLogEntry["ret"] =
+          result === undefined ? "undefined" : typeof result === "string" ? "string" : "promise";
+        if (ret !== "undefined") return result;
+        try {
+          log?.({ name: prop, ret, args: args.length });
+        } catch {
+          /* 日志失败不影响调用 */
+        }
+        if (SYNC_ADAPTER_METHODS.has(prop)) {
+          return prop === "getName" ? QUARK_ADAPTER_NAME : "";
+        }
+        return Promise.reject(new Error(`adapter.${prop}() 返回 undefined（0.2.23 P0 防护）`));
+      };
+      wrappers.set(prop, wrapped);
+      return wrapped;
+    },
+  }) as T;
+}
+
+/** 未知成员兜底的选项。 */
+export interface AdapterGuardOptions {
+  /** 原生 adapter：契约外成员优先回落到它（真实功能尽量保留）。 */
+  fallback?: Record<string, unknown> | null;
+  /** 未知成员被调用时的日志出口。 */
+  logUnknown?: (entry: { name: string; state: "unknown-member" }) => void;
+  /** 返回 undefined 的调用日志（传给 `wrapAdapterCalls`）。 */
+  logCall?: (entry: AdapterCallLogEntry) => void;
+}
+
+/** 不应被兜底拦截的属性（Promise 探测、序列化、测试库探针等）。 */
+const GUARD_IGNORED_PROPS = new Set([
+  "then",
+  "catch",
+  "finally",
+  "toJSON",
+  "inspect",
+  "constructor",
+  "prototype",
+  "nodeType",
+  "$$typeof",
+  "asymmetricMatch",
+]);
+
+/**
+ * 0.2.23 P0：挂到 `app.vault.adapter` 上的最终外观。
+ *
+ * ① 21 个契约方法走 `wrapAdapterCalls`（undefined → 埋点 + 防护）；
+ * ② 未知成员：base adapter 有 → 回落 base；没有 → 返回
+ *    「返回 rejected Promise 的函数」并记 `state=unknown-member name=<x>`。
+ *    这样 Obsidian 任何 `X(...)` 后取 `.then` 都不会再拿到 undefined。
+ */
+export function createObsidianAdapterProxy<T extends object>(
+  adapter: T,
+  options: AdapterGuardOptions = {}
+): T {
+  const wrapped = options.logCall ? wrapAdapterCalls(adapter, options.logCall) : adapter;
+  const fallback = options.fallback ?? null;
+  return new Proxy(wrapped, {
+    get(target, prop, receiver) {
+      if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+      const name = prop;
+      if (GUARD_IGNORED_PROPS.has(name)) return Reflect.get(target, prop, receiver);
+      const own = Reflect.get(target, prop, receiver);
+      if (own !== undefined) return own;
+      if (fallback) {
+        const external = fallback[name];
+        if (external !== undefined) {
+          return typeof external === "function"
+            ? (external as (...args: unknown[]) => unknown).bind(fallback)
+            : external;
+        }
+      }
+      return (..._args: unknown[]): Promise<never> => {
+        try {
+          options.logUnknown?.({ name, state: "unknown-member" });
+        } catch {
+          /* 日志失败不影响调用 */
+        }
+        return Promise.reject(new Error(`未知 adapter 成员：${name}`));
+      };
+    },
+    has(target, prop) {
+      return Reflect.has(target, prop) || (fallback ? prop in fallback : false);
+    },
+  }) as T;
+}
+
 /**
  * 0.2.18 B1：`file-open` → 附件预热。
  *

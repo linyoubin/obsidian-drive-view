@@ -26,6 +26,7 @@ export type DiagStage =
   | "gate"
   | "stats"
   | "cache"
+  | "adapter"
   | "auth";
 
 /** 默认配置目录（Obsidian 默认 `.obsidian`；运行期由 `app.vault.configDir` 覆盖，0.2.18 B2）。 */
