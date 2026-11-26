@@ -12,7 +12,6 @@ import {
   QuarkReadOnlyAdapter,
   DEFAULT_PLUGIN_DIR,
 } from "../src/adapter/QuarkReadOnlyAdapter";
-import { ReadOnlyError } from "../src/adapter/readonlyError";
 import type { IndexEntry } from "../src/store/IndexStore";
 import * as diag from "../src/utils/diagLog";
 
@@ -126,7 +125,8 @@ describe("0.2.18 B2 configDir 贯通", () => {
     const before = base.calls.length;
     expect(await adapter.exists(".obsidian/app.json")).toBe(false);
     expect(base.calls.length).toBe(before);
-    await expect(adapter.write(".obsidian/app.json", "{}")).rejects.toBeInstanceOf(ReadOnlyError);
+    // 0.2.25：`.obsidian/**` 在 configDir='.config' 下不属于配置目录 → 静默 no-op（resolve，不转发）
+    await expect(adapter.write(".obsidian/app.json", "{}")).resolves.toBeUndefined();
     expect(base.calls.length).toBe(before);
     expect(adapter.getName()).toBe(QUARK_ADAPTER_NAME);
   });

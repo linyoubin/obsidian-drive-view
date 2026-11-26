@@ -1419,9 +1419,11 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   }
 
   /**
-   * 写失败 → 回滚视图（0.2.8）。用户要的是「保存失败就回滚掉，然后可以继续操作其它文件」：
-   * 同一 path 10 秒内只回滚一次、只提示一次；回滚 = 按 adapter 内容强制重载视图。
-   * 找不到打开着的视图（后台保存）只记日志。
+   * 写被静默忽略 → 回滚视图（0.2.8 引入，0.2.25 配合「写方法 resolve」）。
+   *
+   * 0.2.25：写方法不再 reject（否则 Obsidian 自己弹「文件保存失败」，每次重试再弹一次）。
+   * 这里把正在编辑的视图按云端内容强制重载，并且**同一 path 10s 内只回滚/提示一次**。
+   * 日志由 adapter 记 `stage=write msg=readonly-noop cause=readonly`（这里不再重复记）。
    */
   private initQuarkRollback(): void {
     // obsidian.d.ts 未声明 iterateAllLeaves，运行期从 workspace 取
@@ -1433,21 +1435,10 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         iterateAllLeaves: (callback: (leaf: ReadonlyRollbackLeaf) => void) =>
           workspace.iterateAllLeaves((leaf) => callback(leaf as ReadonlyRollbackLeaf)),
       },
-      onRollback: ({ path, reloaded }) => {
-        if (reloaded) {
-          new Notice("只读库：该文件已回滚到云端版本（修改未保存）", 8000);
-        }
-        try {
-          this.quarkDiag?.log({
-            level: "info",
-            stage: "write",
-            path: path || "/",
-            fid: "-",
-            message: "rollback cause=readonly",
-          });
-        } catch {
-          /* 日志失败不影响回滚 */
-        }
+      onRollback: ({ reloaded }) => {
+        if (!reloaded) return;
+        // 文案与「保存失败」区分：告诉用户修改没保存、已回滚，而不是让他反复重试
+        new Notice("只读库：修改不会保存，已回滚到云端版本", 8000);
       },
     });
   }

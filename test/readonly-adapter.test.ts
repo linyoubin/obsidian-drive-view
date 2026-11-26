@@ -2,7 +2,8 @@
  * QuarkReadOnlyAdapter 单测：假索引 / 假缓存 / 假下载器 / 假原生 adapter。
  *
  * 覆盖契约 T-08：A2（19 方法分类）、A3（读路径只查索引、list 非递归且零网络）、
- * A4（getResourcePath 同步两分支）、A5（.obsidian 读写转发）、A6（12 写方法同一 ReadOnlyError）。
+ * A4（getResourcePath 同步两分支）、A5（.obsidian 读写转发）、
+ * A6（12 写方法静默成功，0.2.25 起不再 reject `ReadOnlyError`）。
  */
 
 import { describe, expect, test } from "bun:test";
@@ -16,7 +17,6 @@ import {
   type QuarkDownloadClient,
   type QuarkIndexReader,
 } from "../src/adapter/QuarkReadOnlyAdapter";
-import { ReadOnlyError, isReadOnlyError } from "../src/adapter/readonlyError";
 import type { IndexEntry } from "../src/store/IndexStore";
 
 // ------------------------------------------------------------------ 工具
@@ -372,38 +372,33 @@ describe("QuarkReadOnlyAdapter：getResourcePath 同步两分支（A4）", () =>
 
 // ------------------------------------------------------------------ A6：12 个写方法
 
-describe("QuarkReadOnlyAdapter：12 个写方法抛 ReadOnlyError（A6，0.2.8 写失败由 main 回滚）", () => {
-  test("逐个遍历 12 个写方法：instanceof ReadOnlyError + 消息含「只读」+ operation 正确", async () => {
+describe("QuarkReadOnlyAdapter：12 个写方法静默成功（A6，0.2.25 起不再 reject）", () => {
+  test("逐个遍历 12 个写方法：全部 resolve，且返回契约值（void / true / 原内容）", async () => {
     expect(WRITE_CALLS.length).toBe(12);
     for (const [operation, call] of WRITE_CALLS) {
       const { adapter } = makeAdapter();
       let caught: unknown = null;
+      let value: unknown = "not-called";
       try {
-        await call(adapter);
+        value = await call(adapter);
       } catch (error) {
         caught = error;
       }
-      expect(caught).toBeInstanceOf(ReadOnlyError);
-      expect(isReadOnlyError(caught)).toBe(true);
-      expect((caught as ReadOnlyError).operation).toBe(operation);
-      expect((caught as ReadOnlyError).message).toContain("只读");
+      expect(caught, `${operation} 不得 reject（否则 Obsidian 会弹保存失败）`).toBeNull();
+      if (operation === "trashSystem") expect(value).toBe(true);
+      if (operation === "process") expect(typeof value).toBe("string");
+      if (operation !== "trashSystem" && operation !== "process") expect(value).toBeUndefined();
     }
   });
 
-  test("trashSystem 抛错而不是返回 false", async () => {
+  test("trashSystem 静默返回 true（不再 throw，避免 Obsidian 删除失败弹窗）", async () => {
     const { adapter } = makeAdapter();
-    let returned: unknown = "not-called";
-    await expect(
-      (async () => {
-        returned = await adapter.trashSystem("a.md");
-      })()
-    ).rejects.toBeInstanceOf(ReadOnlyError);
-    expect(returned).toBe("not-called"); // 没有返回 false
+    await expect(adapter.trashSystem("a.md")).resolves.toBe(true);
   });
 
-  test("写方法被拒时不碰缓存、不碰下载器、不碰原生 adapter", async () => {
+  test("写方法被静默忽略时不碰缓存、不碰下载器、不碰原生 adapter", async () => {
     const { adapter, client, cache, base } = makeAdapter();
-    await expect(adapter.write("a.md", "x")).rejects.toBeInstanceOf(ReadOnlyError);
+    await expect(adapter.write("a.md", "x")).resolves.toBeUndefined();
     expect(client.calls).toEqual([]);
     expect(cache.puts).toEqual([]);
     expect(base.calls).toEqual([]);
@@ -436,7 +431,7 @@ describe("QuarkReadOnlyAdapter：.obsidian 与插件目录转发（A5）", () =>
     expect(client.calls).toEqual([]);
   });
 
-  test("写：配置目录与插件目录都转发给 baseAdapter，不抛 ReadOnlyError", async () => {
+  test("写：配置目录与插件目录都转发给 baseAdapter，不触发只读 no-op", async () => {
     const { adapter, base } = makeAdapter();
     await adapter.write(".obsidian/app.json", "{}");
     await adapter.writeBinary(".obsidian/plugins/quark-vault/main.js", new ArrayBuffer(4));
@@ -472,7 +467,7 @@ describe("QuarkReadOnlyAdapter：.obsidian 与插件目录转发（A5）", () =>
     await adapter.stat("a.md");
     await adapter.list("");
     adapter.getResourcePath("a.md");
-    await expect(adapter.rmdir("folder", false)).rejects.toBeInstanceOf(ReadOnlyError);
+    await expect(adapter.rmdir("folder", false)).resolves.toBeUndefined();
     expect(base.calls).toEqual([]);
   });
 });

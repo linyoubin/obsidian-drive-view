@@ -54,7 +54,7 @@ const NON_CONTRACT_MEMBERS = new Set([
   "readForBulk",
   "prefetchNote",
   "readBinaryForUser",
-  "rejectWrite",
+  "readonlyWrite",
   "shouldForward",
   "findEntry",
   "loadBinary",

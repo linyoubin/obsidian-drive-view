@@ -47,12 +47,9 @@ describe("0.2.17 DataAdapter 全方法契约", () => {
       const result = call();
       expect(result, name).toBeDefined();
       expect(typeof (result as { then?: unknown }).then, name).toBe("function");
-      // 只读库：写方法必须是 rejected Promise（不是同步抛）
-      if (name !== "exists" && name !== "stat" && name !== "list" && name !== "read" && name !== "readBinary") {
-        await expect(result, name).rejects.toBeDefined();
-      } else {
-        await result.catch(() => undefined);
-      }
+      // 0.2.25：写方法静默 resolve（不再 reject，否则 Obsidian 弹保存失败）；
+      // 读方法可能 reject（索引里没有该路径），这里都只保证返回 Promise
+      await (result as Promise<unknown>).catch(() => undefined);
     }    expect(typeof adapter.getName()).toBe("string");
     expect(typeof adapter.getResourcePath("notes/a.md")).toBe("string");
     expect(typeof adapter.getBasePath()).toBe("string");
