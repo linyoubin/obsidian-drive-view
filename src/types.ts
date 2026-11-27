@@ -211,6 +211,8 @@ export interface QuarkSettings {
    * 不再默认硬塞 `quarkcloud` 链接；用户可从 App 内分享链接一键生成模板。
    */
   quarkDeepLinkTemplate: string;
+  /** 0.2.33：深链测试器里用户确认「进到 App」的那条（展示用，如 `#3 AASA appID …`）。 */
+  quarkDeepLinkConfirmed: string;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -228,6 +230,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkOpenMediaInQuark: true,
   quarkOpenMode: "app",
   quarkDeepLinkTemplate: "",
+  quarkDeepLinkConfirmed: "",
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */

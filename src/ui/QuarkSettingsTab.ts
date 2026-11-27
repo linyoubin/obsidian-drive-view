@@ -50,6 +50,8 @@ export interface QuarkUiSnapshot {
   openMode: "app" | "browser";
   /** 0.2.31：App 深链模板（含 {fid} 等占位符）。 */
   deepLinkTemplate: string;
+  /** 0.2.33：深链测试器确认可用的那条（展示用）。 */
+  deepLinkConfirmed: string;
   /** 0.2.13：md 磁盘正文缓存统计。 */
   mdCount: number;
   mdBytes: number;
@@ -94,6 +96,8 @@ export interface QuarkHost {
   quarkSetDeepLinkTemplate(template: string): Promise<void>;
   /** 0.2.32：从 App 分享链接生成模板（成功返回 true）。 */
   quarkImportDeepLinkFromShare(link: string): Promise<boolean>;
+  /** 0.2.33：打开深链测试器（仅调试）。 */
+  quarkTestDeepLink(): Promise<void>;
   quarkCancelBulkPrefetch(): void;
   quarkClearMdCache(): Promise<void>;
 }
@@ -125,6 +129,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   openMediaInQuark: true,
   openMode: "app",
   deepLinkTemplate: "",
+  deepLinkConfirmed: "",
   bulkDone: 0,
   bulkTotal: 0,
   bulkBytes: 0,
@@ -637,15 +642,28 @@ export class QuarkSettingsTab extends settingTabBase() {
       );
 
     new Setting(container)
-      .setName("App 深链模板（可改，含 {fid} / {fileFid}）")
+      .setName("深链测试器（调试）：在手机上实测哪个链接能进 App")
+      .setDesc(
+        snapshot.deepLinkConfirmed
+          ? `已确认可用：${snapshot.deepLinkConfirmed}（模板已写入下面）`
+          : "逐条点击候选链接，回答「进到 App 了吗」；确认可用的那条会自动写成深链模板。不会创建任何分享"
+      )
+      .addButton((button: any) =>
+        button.setButtonText("测试深链").onClick(async () => {
+          await this.host.quarkTestDeepLink();
+        })
+      );
+
+    new Setting(container)
+      .setName("深链模板（留空=只用网页目录页）")
       .setDesc(
         snapshot.deepLinkTemplate
           ? `当前模板：${snapshot.deepLinkTemplate}（{fid}=所在目录，{fileFid}=文件，{rootFid}=库根）`
-          : "当前为空：点上面粘贴 App 分享链接，或手动填一个你实测能唤起 App 的链接；空模板时只走网页 → 复制"
+          : "当前为空：只走网页目录页 → 失败则复制链接。可在上面测试器里确认一条可用格式，自动填入"
       )
       .addText((text: any) =>
         text
-          .setPlaceholder("（空）粘贴分享链接或手填深链模板")
+          .setPlaceholder("（空）先用上面的深链测试器确认一条可用格式")
           .setValue(snapshot.deepLinkTemplate)
           .onChange(async (value: string) => {
             await this.host.quarkSetDeepLinkTemplate(value);

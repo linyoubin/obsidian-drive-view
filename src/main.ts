@@ -22,6 +22,14 @@ import {
   isQuarkUnpreviewable,
 } from "./adapter/QuarkOpenExternal";
 import { createQuarkOpenTarget, templateFromShareLink } from "./adapter/QuarkDeepLink";
+import {
+  buildDeeplinkCandidates,
+  canRunDeeplinkTest,
+  candidateTemplate,
+  formatDeeplinkTestLog,
+} from "./adapter/DeepLinkTester";
+import type { DeeplinkTestLogInput } from "./adapter/DeepLinkTester";
+import { DeepLinkAnswerModal, DeepLinkTesterModal } from "./ui/DeepLinkTesterModal";
 import type { UnpreviewableOpenResult } from "./adapter/QuarkOpenExternal";
 import { OpenInQuarkModal } from "./ui/OpenInQuarkModal";
 import { VaultMounter } from "./adapter/VaultMounter";
@@ -259,6 +267,14 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       this.updateStatusBarUi();
     }
 
+
+    this.addCommand({
+      id: "quark-test-deeplink",
+      name: "Quark: 测试深链（调试）",
+      callback: async () => {
+        await this.quarkTestDeepLink();
+      },
+    });
 
     this.addCommand({
       id: "sync-now",
@@ -1564,6 +1580,7 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       openMediaInQuark: this.settings.quarkOpenMediaInQuark !== false,
       openMode: this.settings.quarkOpenMode === "browser" ? "browser" : "app",
       deepLinkTemplate: String(this.settings.quarkDeepLinkTemplate ?? ""),
+      deepLinkConfirmed: String(this.settings.quarkDeepLinkConfirmed ?? ""),
       bulkDone: this.quarkBulkDone,
       bulkTotal: this.quarkBulkTotal,
       bulkBytes: this.quarkBulkBytes,
@@ -1700,6 +1717,86 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     new Notice(`已生成深链模板：${template}（打开时 {fileFid} 会替换成目标文件 id）`, 8000);
     this.refreshQuarkUi();
     return true;
+  }
+
+  /**
+   * 0.2.33：深链测试器（调试用途）。
+   *
+   * 候选全部是「打开」类链接（不创建分享）；每条点击后记录 `case/url/opened`，
+   * 用户回答「进到 App 了吗」后记 `result=app|browser|nothing`；
+   * 选「是」→ 把该条模板写入设置并展示为「已确认可用」。
+   */
+  public async quarkTestDeepLink(): Promise<void> {
+    const rootFid = String(this.settings.quarkRootFid ?? "").trim();
+    const activePath = this.quarkLastNotePath || "";
+    const entry = this.quarkIndex?.entries.find((item) => item.path === activePath);
+    const info = {
+      fid: entry?.parentFid || rootFid,
+      fileFid: entry?.fid || "",
+      rootFid,
+    };
+    if (!canRunDeeplinkTest(info)) {
+      new Notice("深链测试不可用：请先挂载只读库（未取到目录 fid）", 6000);
+      return;
+    }
+    const candidates = buildDeeplinkCandidates(info);
+    if (candidates.length === 0) {
+      new Notice("深链测试不可用：没有可用候选", 6000);
+      return;
+    }
+    new DeepLinkTesterModal(this.app, candidates, {
+      onPick: (candidate) => {
+        void (async () => {
+          const opened = await this.openExternalUrl(candidate.url);
+          this.logDeeplinkTest({
+            caseId: candidate.caseId,
+            template: candidate.template,
+            opened,
+            note: "click",
+          });
+          new DeepLinkAnswerModal(this.app, `#${candidate.caseId} ${candidate.label}`, {
+            onAnswer: (result) => {
+              void (async () => {
+                this.logDeeplinkTest({
+                  caseId: candidate.caseId,
+                  template: candidate.template,
+                  opened,
+                  note: "answer",
+                  result,
+                });
+                if (result === "app") {
+                  const label = `#${candidate.caseId} ${candidate.label}`;
+                  await this.updateSettings({
+                    quarkDeepLinkTemplate: candidateTemplate(candidate),
+                    quarkDeepLinkConfirmed: label,
+                  });
+                  new Notice(`已确认可用：${label}\n模板已写入：${candidateTemplate(candidate)}`, 8000);
+                  this.refreshQuarkUi();
+                }
+              })();
+            },
+          }).open();
+        })();
+      },
+    }).open();
+  }
+
+  /** 0.2.33：深链测试日志（`stage=deeplink-test`，字段 case/url/opened/note/result）。 */
+  private logDeeplinkTest(input: DeeplinkTestLogInput): void {
+    try {
+      const fields = formatDeeplinkTestLog(input);
+      this.quarkDiag?.log({
+        level: "info",
+        stage: "deeplink-test",
+        path: "/",
+        fid: "-",
+        message: `case=${fields.caseId} url=${fields.url} opened=${fields.opened} note=${fields.note}${
+          fields.result ? ` result=${fields.result}` : ""
+        }`,
+      });
+    } catch {
+      /* 日志失败不影响测试 */
+    }
   }
 
   /** 0.2.28：外部打开 URL —— 桌面优先 electron.shell.openExternal，其次 window.open（手机走系统浏览器）。 */
