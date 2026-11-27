@@ -23,12 +23,12 @@ import {
 } from "./adapter/QuarkOpenExternal";
 import { createQuarkOpenTarget, templateFromShareLink } from "./adapter/QuarkDeepLink";
 import {
-  buildDeeplinkCandidates,
-  canRunDeeplinkTest,
-  candidateTemplate,
-  formatDeeplinkTestLog,
-} from "./adapter/DeepLinkTester";
-import type { DeeplinkTestLogInput } from "./adapter/DeepLinkTester";
+  buildDeeplinkCandidates2,
+  candidateTemplate2,
+  formatDeeplinkTestLog2,
+  shouldSaveTemplate,
+} from "./adapter/DeepLinkTester2";
+import type { DeeplinkTestLogInput2 } from "./adapter/DeepLinkTester2";
 import { DeepLinkAnswerModal, DeepLinkTesterModal } from "./ui/DeepLinkTesterModal";
 import type { UnpreviewableOpenResult } from "./adapter/QuarkOpenExternal";
 import { OpenInQuarkModal } from "./ui/OpenInQuarkModal";
@@ -1733,13 +1733,12 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     const info = {
       fid: entry?.parentFid || rootFid,
       fileFid: entry?.fid || "",
-      rootFid,
     };
-    if (!canRunDeeplinkTest(info)) {
+    if (!info.fid) {
       new Notice("深链测试不可用：请先挂载只读库（未取到目录 fid）", 6000);
       return;
     }
-    const candidates = buildDeeplinkCandidates(info);
+    const candidates = buildDeeplinkCandidates2(info);
     if (candidates.length === 0) {
       new Notice("深链测试不可用：没有可用候选", 6000);
       return;
@@ -1747,32 +1746,31 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     new DeepLinkTesterModal(this.app, candidates, {
       onPick: (candidate) => {
         void (async () => {
-          const opened = await this.openExternalUrl(candidate.url);
+          await this.openExternalUrl(candidate.url);
           this.logDeeplinkTest({
             caseId: candidate.caseId,
-            template: candidate.template,
-            opened,
-            note: "click",
+            outer: candidate.outer,
+            inner: candidate.innerTemplate,
+            encoded: candidate.encoded,
           });
           new DeepLinkAnswerModal(this.app, `#${candidate.caseId} ${candidate.label}`, {
             onAnswer: (result) => {
               void (async () => {
                 this.logDeeplinkTest({
                   caseId: candidate.caseId,
-                  template: candidate.template,
-                  opened,
-                  note: "answer",
+                  outer: candidate.outer,
+                  inner: candidate.innerTemplate,
+                  encoded: candidate.encoded,
                   result,
                 });
-                if (result === "app") {
-                  const label = `#${candidate.caseId} ${candidate.label}`;
-                  await this.updateSettings({
-                    quarkDeepLinkTemplate: candidateTemplate(candidate),
-                    quarkDeepLinkConfirmed: label,
-                  });
-                  new Notice(`已确认可用：${label}\n模板已写入：${candidateTemplate(candidate)}`, 8000);
-                  this.refreshQuarkUi();
-                }
+                if (!shouldSaveTemplate(result)) return;
+                const label = `#${candidate.caseId} ${candidate.label}`;
+                await this.updateSettings({
+                  quarkDeepLinkTemplate: candidateTemplate2(candidate),
+                  quarkDeepLinkConfirmed: label,
+                });
+                new Notice(`已确认可用：${label}\n模板已写入：${candidateTemplate2(candidate)}`, 8000);
+                this.refreshQuarkUi();
               })();
             },
           }).open();
@@ -1781,18 +1779,18 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
     }).open();
   }
 
-  /** 0.2.33：深链测试日志（`stage=deeplink-test`，字段 case/url/opened/note/result）。 */
-  private logDeeplinkTest(input: DeeplinkTestLogInput): void {
+  /** 0.2.34：深链测试日志（`stage=deeplink-test case/outer/inner/innerLen/encoded/result`）。 */
+  private logDeeplinkTest(input: DeeplinkTestLogInput2): void {
     try {
-      const fields = formatDeeplinkTestLog(input);
+      const fields = formatDeeplinkTestLog2(input);
       this.quarkDiag?.log({
         level: "info",
         stage: "deeplink-test",
         path: "/",
         fid: "-",
-        message: `case=${fields.caseId} url=${fields.url} opened=${fields.opened} note=${fields.note}${
-          fields.result ? ` result=${fields.result}` : ""
-        }`,
+        message: `case=${fields.caseId} outer=${fields.outer} inner=${fields.inner} innerLen=${
+          fields.innerLen
+        } encoded=${fields.encoded}${fields.result ? ` result=${fields.result}` : ""}`,
       });
     } catch {
       /* 日志失败不影响测试 */

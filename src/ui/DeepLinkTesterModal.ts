@@ -1,25 +1,22 @@
 /**
- * 0.2.33：深链测试器 UI（仅调试用途）。
+ * 0.2.34：深链测试器 UI（第二阶段）。
  *
- * 两个弹窗：
- *   1. 候选清单：每行一个「打开」按钮（case 编号 + 来源说明）；
- *   2. 回答：进到 App / 进了浏览器 / 没反应（对应 result=app|browser|nothing）。
- *
- * 逻辑都在 `adapter/DeepLinkTester`，这里只做展示与回调。
+ * 每行显示：编号 + 优先级 + 外层 scheme + **完整实际发出的串**（可滚动/可选中，便于报错对照）。
+ * 结果四选一：对了 / 进 App 但位置不对 / 空白页或报错 / 没进 App。
  */
 
 import { App, Modal, Setting } from "obsidian";
 
-import type { DeeplinkCandidate } from "../adapter/DeepLinkTester";
+import type { DeeplinkAnswerResult, DeeplinkCandidate2 } from "../adapter/DeepLinkTester2";
 
 export interface DeepLinkTesterModalHost {
-  onPick(candidate: DeeplinkCandidate): void;
+  onPick(candidate: DeeplinkCandidate2): void;
 }
 
 export class DeepLinkTesterModal extends Modal {
   constructor(
     app: App,
-    private readonly candidates: DeeplinkCandidate[],
+    private readonly candidates: DeeplinkCandidate2[],
     private readonly host: DeepLinkTesterModalHost
   ) {
     super(app);
@@ -29,14 +26,25 @@ export class DeepLinkTesterModal extends Modal {
     const { contentEl } = this;
     contentEl.innerHTML = "";
     contentEl.createEl("p", {
-      text: "逐条点击，观察手机是否进入「夸克-AI旗舰应用」。每次只打开一种格式；点完会问你是否进了 App。",
+      text: "第二阶段：外层 scheme 已确认可用，这次逐条测「内层 URL 编码」。每条会显示实际发出的完整串。",
     });
     contentEl.createEl("p", {
-      text: "注意：这些链接不会创建/修改分享，只是打开；确认可用的那条会自动写成深链模板。",
+      text: "建议按编号顺序试：#1 ~ #4 最可能；点完回答四选一。不会创建任何分享。",
       cls: "quark-deeplink-test-hint",
     });
     for (const candidate of this.candidates) {
-      const setting = new Setting(contentEl).setName(`#${candidate.caseId} ${candidate.label}`);
+      const setting = new Setting(contentEl).setName(
+        `#${candidate.caseId} ${
+          candidate.priority === "most-likely" ? "【最可能】" : candidate.priority === "control" ? "【对照】" : ""
+        }${candidate.outerLabel}`
+      );
+      const urlEl = contentEl.createDiv({ cls: "quark-deeplink-test-url" });
+      urlEl.style.whiteSpace = "pre-wrap";
+      urlEl.style.wordBreak = "break-all";
+      urlEl.style.fontFamily = "var(--font-monospace)";
+      urlEl.style.fontSize = "0.8em";
+      urlEl.style.userSelect = "text";
+      urlEl.textContent = candidate.url;
       setting.addButton((button) =>
         button.setButtonText("打开").setCta().onClick(() => {
           this.close();
@@ -52,8 +60,15 @@ export class DeepLinkTesterModal extends Modal {
 }
 
 export interface DeepLinkAnswerModalHost {
-  onAnswer(result: "app" | "browser" | "nothing"): void;
+  onAnswer(result: DeeplinkAnswerResult): void;
 }
+
+const ANSWER_BUTTONS: Array<{ result: DeeplinkAnswerResult; text: string }> = [
+  { result: "ok", text: "对了（位置正确）" },
+  { result: "wrong-place", text: "进 App 了，但位置不对" },
+  { result: "blank", text: "空白页或报错" },
+  { result: "no-app", text: "没进 App" },
+];
 
 export class DeepLinkAnswerModal extends Modal {
   private settled = false;
@@ -69,35 +84,27 @@ export class DeepLinkAnswerModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.innerHTML = "";
-    contentEl.createEl("p", { text: `${this.caseLabel}：进到 App 了吗？` });
+    contentEl.createEl("p", { text: `${this.caseLabel}：结果如何？` });
     const setting = new Setting(contentEl);
-    setting.addButton((button) =>
-      button.setButtonText("是，进了 App").setCta().onClick(() => {
-        this.settle("app");
-      })
-    );
-    setting.addButton((button) =>
-      button.setButtonText("否，进了浏览器").onClick(() => {
-        this.settle("browser");
-      })
-    );
-    setting.addButton((button) =>
-      button.setButtonText("否，没反应").onClick(() => {
-        this.settle("nothing");
-      })
-    );
+    for (const option of ANSWER_BUTTONS) {
+      setting.addButton((button) =>
+        button.setButtonText(option.text).onClick(() => {
+          this.settle(option.result);
+        })
+      );
+    }
   }
 
   onClose(): void {
     this.contentEl.innerHTML = "";
-    // 点 × / Esc 关闭 → 视为「没反应」，保证结果一定被记录
+    // 点 × / Esc → 视为「没进 App」，保证结果一定被记录
     if (!this.settled) {
       this.settled = true;
-      this.host.onAnswer("nothing");
+      this.host.onAnswer("no-app");
     }
   }
 
-  private settle(result: "app" | "browser" | "nothing"): void {
+  private settle(result: DeeplinkAnswerResult): void {
     if (this.settled) return;
     this.settled = true;
     this.close();
