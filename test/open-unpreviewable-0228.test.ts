@@ -31,8 +31,7 @@ function makeHost(
   options: {
     enabled?: boolean;
     confirmResult?: boolean;
-    openResult?: boolean;
-    copyResult?: boolean;
+    targetResult?: "app" | "https" | "copied" | "failed";
     now?: () => number;
     windowMs?: number;
   } = {}
@@ -40,21 +39,16 @@ function makeHost(
   const logs: LogEntry[] = [];
   const calls = { confirm: 0, open: 0, copy: 0 };
   let confirmResult = options.confirmResult ?? true;
-  let openResult = options.openResult ?? true;
-  let copyResult = options.copyResult ?? true;
+  let targetResult: "app" | "https" | "copied" | "failed" = options.targetResult ?? "app";
   const host = {
     isEnabled: () => options.enabled ?? true,
     confirm: async () => {
       calls.confirm += 1;
       return confirmResult;
     },
-    openExternal: async () => {
+    openTarget: async () => {
       calls.open += 1;
-      return openResult;
-    },
-    copyLink: async () => {
-      calls.copy += 1;
-      return copyResult;
+      return targetResult;
     },
     log: (entry: LogEntry) => logs.push(entry),
     now: options.now,
@@ -67,11 +61,8 @@ function makeHost(
     setConfirm: (value: boolean) => {
       confirmResult = value;
     },
-    setOpen: (value: boolean) => {
-      openResult = value;
-    },
-    setCopy: (value: boolean) => {
-      copyResult = value;
+    setTarget: (value: "app" | "https" | "copied" | "failed") => {
+      targetResult = value;
     },
   };
 }
@@ -105,7 +96,7 @@ describe("0.2.28 不可预览扩展名判定（0.2.29 起图片/PDF 也纳入）
 });
 
 describe("0.2.28 点击不可预览文件 → 确认 → 跳夸克", () => {
-  test("docx：确认 1 次、openExternal 1 次，URL 含 parentFid；日志 result=opened", async () => {
+  test("docx：确认 1 次、openTarget 1 次，URL 含 parentFid；日志 result=app", async () => {
     const { host, calls, logs } = makeHost();
     const flow = createUnpreviewableOpenFlow(host);
 
@@ -115,7 +106,7 @@ describe("0.2.28 点击不可预览文件 → 确认 → 跳夸克", () => {
       parentFid: "4e5cda2d01544632b54129bf61c22abb",
     });
 
-    expect(result).toBe("opened");
+    expect(result).toBe("app");
     expect(calls.confirm).toBe(1);
     expect(calls.open).toBe(1);
     expect(logs).toHaveLength(1);
@@ -123,7 +114,7 @@ describe("0.2.28 点击不可预览文件 → 确认 → 跳夸克", () => {
       path: "docs/方案.docx",
       fid: "fid-docx",
       domain: "pan.quark.cn",
-      result: "opened",
+      result: "app",
     });
     expect(logs[0].length).toBeGreaterThan(40);
   });
@@ -156,20 +147,19 @@ describe("0.2.28 点击不可预览文件 → 确认 → 跳夸克", () => {
     expect(logs[0].result).toBe("cancelled");
   });
 
-  test("openExternal 不可用 → 复制链接，result=copied", async () => {
-    const { host, calls, logs } = makeHost({ openResult: false, copyResult: true });
+  test("深链/网页都不可用 → 复制链接，result=copied", async () => {
+    const { host, calls, logs } = makeHost({ targetResult: "copied" });
     const flow = createUnpreviewableOpenFlow(host);
 
     const result = await flow({ path: "docs/a.zip", fid: "f3", parentFid: "root" });
 
     expect(result).toBe("copied");
     expect(calls.open).toBe(1);
-    expect(calls.copy).toBe(1);
     expect(logs[0].result).toBe("copied");
   });
 
   test("打开与复制都失败 → result=failed（不给假成功）", async () => {
-    const { host, logs } = makeHost({ openResult: false, copyResult: false });
+    const { host, logs } = makeHost({ targetResult: "failed" });
     const flow = createUnpreviewableOpenFlow(host);
 
     const result = await flow({ path: "docs/a.rar", fid: "f4", parentFid: "root" });

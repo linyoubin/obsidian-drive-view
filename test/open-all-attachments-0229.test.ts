@@ -34,13 +34,9 @@ function makeHost(options: { media?: boolean; other?: boolean } = {}) {
       calls.confirm += 1;
       return true;
     },
-    openExternal: async () => {
+    openTarget: async () => {
       calls.open += 1;
-      return true;
-    },
-    copyLink: async () => {
-      calls.copy += 1;
-      return true;
+      return "app" as const;
     },
     log: (entry: LogEntry) => logs.push(entry),
   };
@@ -65,10 +61,10 @@ describe("0.2.30 非 md 分类（图片恢复渲染）", () => {
     const { host, calls, logs } = makeHost();
     const flow = createUnpreviewableOpenFlow(host);
     const result = await flow({ path: "docs/a.pdf", fid: "f2", parentFid: "root" });
-    expect(result).toBe("opened");
+    expect(result).toBe("app");
     expect(calls.confirm).toBe(1);
     expect(calls.open).toBe(1);
-    expect(logs[0]).toMatchObject({ path: "docs/a.pdf", result: "opened" });
+    expect(logs[0]).toMatchObject({ path: "docs/a.pdf", result: "app" });
   });
 
   test("关掉 PDF 开关 → pdf 不弹、不打开；Office 仍可跳", async () => {
@@ -76,7 +72,7 @@ describe("0.2.30 非 md 分类（图片恢复渲染）", () => {
     const flow = createUnpreviewableOpenFlow(host);
 
     await expect(flow({ path: "docs/a.pdf", fid: "f2", parentFid: "root" })).resolves.toBe("disabled");
-    await expect(flow({ path: "docs/a.docx", fid: "f3", parentFid: "root" })).resolves.toBe("opened");
+    await expect(flow({ path: "docs/a.docx", fid: "f3", parentFid: "root" })).resolves.toBe("app");
     expect(calls.confirm).toBe(1);
     expect(calls.open).toBe(1);
   });
@@ -86,7 +82,7 @@ describe("0.2.30 非 md 分类（图片恢复渲染）", () => {
     const flow = createUnpreviewableOpenFlow(host);
 
     await expect(flow({ path: "docs/a.docx", fid: "f3", parentFid: "root" })).resolves.toBe("disabled");
-    await expect(flow({ path: "docs/a.pdf", fid: "f2", parentFid: "root" })).resolves.toBe("opened");
+    await expect(flow({ path: "docs/a.pdf", fid: "f2", parentFid: "root" })).resolves.toBe("app");
     expect(calls.confirm).toBe(1);
     expect(calls.open).toBe(1);
   });

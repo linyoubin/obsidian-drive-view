@@ -21,6 +21,7 @@ import {
   createUnpreviewableOpenFlow,
   isQuarkUnpreviewable,
 } from "./adapter/QuarkOpenExternal";
+import { createQuarkOpenTarget } from "./adapter/QuarkDeepLink";
 import type { UnpreviewableOpenResult } from "./adapter/QuarkOpenExternal";
 import { OpenInQuarkModal } from "./ui/OpenInQuarkModal";
 import { VaultMounter } from "./adapter/VaultMounter";
@@ -181,7 +182,13 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   private quarkRollback: ((info: { operation: string; path: string }) => void) | null = null;
   /** 0.2.28：不可预览文件（docx/xlsx/zip…）点击 → 去夸克打开所在目录。 */
   private quarkUnpreviewableFlow:
-    | ((info: { path: string; fid?: string; parentFid?: string }) => Promise<UnpreviewableOpenResult>)
+    | ((info: {
+        path: string;
+        fid?: string;
+        parentFid?: string;
+        fileFid?: string;
+        rootFid?: string;
+      }) => Promise<UnpreviewableOpenResult>)
     | null = null;
   private readonly quarkPreviewThrottle = createPathThrottle(1000);
   private lastSettingsRefreshAt = 0;
@@ -721,19 +728,28 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
             resolve(false);
           }
         }),
-      openExternal: (url) => this.openExternalUrl(url),
-      copyLink: async (url) => {
-        try {
-          const clipboard = (globalThis as { navigator?: { clipboard?: { writeText?: (text: string) => Promise<void> } } })
-            .navigator?.clipboard;
-          if (!clipboard?.writeText) return false;
-          await clipboard.writeText(url);
-          new Notice("已复制夸克链接，可在浏览器中打开", 6000);
-          return true;
-        } catch {
-          return false;
-        }
-      },
+      openTarget: (info) =>
+        createQuarkOpenTarget({
+          // 0.2.31：默认 App 深链优先；设置可切「只用浏览器」
+          mode: this.settings.quarkOpenMode === "browser" ? "browser" : "app",
+          template: this.settings.quarkDeepLinkTemplate,
+          openUrl: (url) => this.openExternalUrl(url),
+          copyLink: async (url) => {
+            try {
+              const clipboard = (
+                globalThis as { navigator?: { clipboard?: { writeText?: (text: string) => Promise<void> } } }
+              ).navigator?.clipboard;
+              if (!clipboard?.writeText) return false;
+              await clipboard.writeText(url);
+              new Notice("已复制夸克链接，可在浏览器中打开", 6000);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          // 结果统一由外层流程写 `stage=open-external`（避免一行重复两次）
+          log: () => undefined,
+        })(info),
       log: (entry) => {
         try {
           this.quarkDiag?.log({
@@ -1130,6 +1146,9 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         path,
         fid: entry?.fid ?? "",
         parentFid: entry?.parentFid || this.settings.quarkRootFid || "0",
+        // 0.2.31：深链模板可选 {fileFid} / {rootFid}
+        fileFid: entry?.fid ?? "",
+        rootFid: this.settings.quarkRootFid || "0",
       });
       this.refreshQuarkUi();
       return;
@@ -1536,6 +1555,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
       prefetchAllMarkdown: this.settings.quarkPrefetchAllMarkdown !== false,
       openUnpreviewableInQuark: this.settings.quarkOpenUnpreviewableInQuark !== false,
       openMediaInQuark: this.settings.quarkOpenMediaInQuark !== false,
+      openMode: this.settings.quarkOpenMode === "browser" ? "browser" : "app",
+      deepLinkTemplate: String(this.settings.quarkDeepLinkTemplate ?? ""),
       bulkDone: this.quarkBulkDone,
       bulkTotal: this.quarkBulkTotal,
       bulkBytes: this.quarkBulkBytes,
@@ -1643,6 +1664,18 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   /** 0.2.29：图片/PDF 点击跳夸克开关（默认开；关掉回到 Obsidian 渲染）。 */
   public async quarkSetOpenMediaInQuark(value: boolean): Promise<void> {
     await this.updateSettings({ quarkOpenMediaInQuark: value === true });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.31：打开方式（App 优先 / 只用浏览器）。 */
+  public async quarkSetOpenMode(mode: "app" | "browser"): Promise<void> {
+    await this.updateSettings({ quarkOpenMode: mode === "browser" ? "browser" : "app" });
+    this.refreshQuarkUi();
+  }
+
+  /** 0.2.31：App 深链模板（含 {fid} / {fileFid} 占位符；空串 = 直接用 https）。 */
+  public async quarkSetDeepLinkTemplate(template: string): Promise<void> {
+    await this.updateSettings({ quarkDeepLinkTemplate: String(template ?? "").slice(0, 500) });
     this.refreshQuarkUi();
   }
 

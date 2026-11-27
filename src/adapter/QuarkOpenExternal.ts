@@ -149,7 +149,8 @@ export function buildQuarkFolderUrl(parentFid: string, rootFid: string = "0"): s
 
 /** 一次「去夸克打开」的结果（用于日志/单测）。 */
 export type UnpreviewableOpenResult =
-  | "opened"
+  | "app"
+  | "https"
   | "copied"
   | "failed"
   | "cancelled"
@@ -157,16 +158,23 @@ export type UnpreviewableOpenResult =
   | "throttled"
   | "not-unpreviewable";
 
-/** 流程宿主（main 注入 UI / 外部打开 / 剪贴板 / 日志）。 */
+/** 流程宿主（main 注入 UI / 打开链 / 日志）。 */
 export interface UnpreviewableHost {
-  /** 按类别读取设置开关（media = 图片/PDF；other = Office/压缩包/音视频）。 */
+  /** 按类别读取设置开关（media = PDF；other = Office/压缩包/音视频）。 */
   isEnabled(category: QuarkUnpreviewableCategory): boolean;
   /** 确认弹窗（Modal 或 Notice 按钮）；true = 去夸克打开。 */
   confirm(info: { path: string; extension: string; url: string }): boolean | Promise<boolean>;
-  /** 优先桌面 `electron.shell.openExternal`，其次 `window.open`；返回是否成功。 */
-  openExternal(url: string): boolean | Promise<boolean>;
-  /** 打开失败时复制链接；返回是否成功。 */
-  copyLink(url: string): boolean | Promise<boolean>;
+  /**
+   * 0.2.31：打开链（App 深链 → https → 复制），实现见 `QuarkDeepLink.createQuarkOpenTarget`。
+   * 返回最终结果，供日志记录 `result=app|https|copied|failed`。
+   */
+  openTarget(info: {
+    path: string;
+    fid: string;
+    fileFid: string;
+    parentFid: string;
+    rootFid?: string;
+  }): Promise<"app" | "https" | "copied" | "failed">;
   /** 诊断日志（`stage=open-external`，URL 已打码为域名 + 长度）。 */
   log(entry: {
     path: string;
@@ -205,7 +213,15 @@ function describeUrl(url: string): { domain: string; length: number } {
  */
 export function createUnpreviewableOpenFlow(
   host: UnpreviewableHost
-): (info: { path: string; fid?: string; parentFid?: string }) => Promise<UnpreviewableOpenResult> {
+): (info: {
+  path: string;
+  fid?: string;
+  parentFid?: string;
+  /** 0.2.31：文件自身 fid（深链模板可用 `{fileFid}`）。 */
+  fileFid?: string;
+  /** 0.2.31：库根 fid（parentFid 为空时回落）。 */
+  rootFid?: string;
+}) => Promise<UnpreviewableOpenResult> {
   const now = host.now ?? ((): number => Date.now());
   const windowMs = Math.max(0, host.windowMs ?? 30_000);
   const lastAt = new Map<string, number>();
@@ -251,28 +267,20 @@ export function createUnpreviewableOpenFlow(
       return "cancelled";
     }
 
-    let opened = false;
+    // 0.2.31：App 深链 → https → 复制（三级回退在 openTarget 内实现并记 result）
+    let result: "app" | "https" | "copied" | "failed" = "failed";
     try {
-      opened = (await host.openExternal(url)) === true;
+      result = await host.openTarget({
+        path: clean,
+        fid,
+        fileFid: String(info.fileFid ?? ""),
+        parentFid: String(info.parentFid ?? ""),
+        rootFid: info.rootFid,
+      });
     } catch {
-      opened = false;
+      result = "failed";
     }
-    if (opened) {
-      writeLog(clean, fid, url, "opened");
-      return "opened";
-    }
-
-    let copied = false;
-    try {
-      copied = (await host.copyLink(url)) === true;
-    } catch {
-      copied = false;
-    }
-    if (copied) {
-      writeLog(clean, fid, url, "copied");
-      return "copied";
-    }
-    writeLog(clean, fid, url, "failed");
-    return "failed";
+    writeLog(clean, fid, url, result);
+    return result;
   };
 }

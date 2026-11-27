@@ -46,6 +46,10 @@ export interface QuarkUiSnapshot {
   openUnpreviewableInQuark: boolean;
   /** 0.2.29：图片/PDF 点击时跳夸克打开。 */
   openMediaInQuark: boolean;
+  /** 0.2.31：打开方式（app 优先 / 只用浏览器）。 */
+  openMode: "app" | "browser";
+  /** 0.2.31：App 深链模板（含 {fid} 等占位符）。 */
+  deepLinkTemplate: string;
   /** 0.2.13：md 磁盘正文缓存统计。 */
   mdCount: number;
   mdBytes: number;
@@ -84,6 +88,10 @@ export interface QuarkHost {
   quarkSetOpenUnpreviewableInQuark(value: boolean): Promise<void>;
   /** 0.2.29：图片/PDF 点击跳夸克开关。 */
   quarkSetOpenMediaInQuark(value: boolean): Promise<void>;
+  /** 0.2.31：打开方式（app / browser）。 */
+  quarkSetOpenMode(mode: "app" | "browser"): Promise<void>;
+  /** 0.2.31：App 深链模板。 */
+  quarkSetDeepLinkTemplate(template: string): Promise<void>;
   quarkCancelBulkPrefetch(): void;
   quarkClearMdCache(): Promise<void>;
 }
@@ -113,6 +121,8 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   prefetchAllMarkdown: true,
   openUnpreviewableInQuark: true,
   openMediaInQuark: true,
+  openMode: "app",
+  deepLinkTemplate: "https://pan.quark.cn/quarkcloud/{fid}",
   bulkDone: 0,
   bulkTotal: 0,
   bulkBytes: 0,
@@ -577,6 +587,39 @@ export class QuarkSettingsTab extends settingTabBase() {
           await this.host.quarkSetOpenMediaInQuark(value === true);
           this.display();
         })
+      );
+
+    // 0.2.31：打开方式（App 深链优先 / 只用浏览器）+ 可编辑深链模板
+    new Setting(container)
+      .setName("打开方式：App 优先（默认）/ 只用浏览器")
+      .setDesc(
+        snapshot.openMode === "app"
+          ? "App 优先：先打开深链（iOS 已证实 Universal Link：pan.quark.cn/quarkcloud/*），失败再回落网页"
+          : "只用浏览器：直接打开网页版（不尝试 App）"
+      )
+      .addDropdown((dropdown: any) =>
+        dropdown
+          .addOption("app", "App 优先（默认）")
+          .addOption("browser", "只用浏览器")
+          .setValue(snapshot.openMode)
+          .onChange(async (value: string) => {
+            await this.host.quarkSetOpenMode(value === "browser" ? "browser" : "app");
+            this.display();
+          })
+      );
+
+    new Setting(container)
+      .setName("App 深链模板（可改，含 {fid} / {fileFid}）")
+      .setDesc(
+        "默认用已证实的 iOS Universal Link 前缀。若你在手机上实测到能定位文件的链接（含 quarkcloud:// 之类的 scheme），把它粘到这里；{fid}=所在目录，{fileFid}=文件"
+      )
+      .addText((text: any) =>
+        text
+          .setPlaceholder("https://pan.quark.cn/quarkcloud/{fid}")
+          .setValue(snapshot.deepLinkTemplate)
+          .onChange(async (value: string) => {
+            await this.host.quarkSetDeepLinkTemplate(value);
+          })
       );
 
     new Setting(container)

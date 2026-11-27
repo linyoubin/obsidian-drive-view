@@ -201,6 +201,15 @@ export interface QuarkSettings {
    * 关闭后才回到 Obsidian 内尝试渲染（0.2.28 已修 MIME/刷新）。
    */
   quarkOpenMediaInQuark: boolean;
+  /**
+   * 0.2.31：打开方式 —— `app` = App 深链优先（默认）；`browser` = 只用浏览器。
+   */
+  quarkOpenMode: "app" | "browser";
+  /**
+   * 0.2.31：App 深链模板（支持 `{fid}` / `{fileFid}` / `{rootFid}`）。
+   * 默认用已证实的 Universal Link 前缀（`/quarkcloud/*`），可改为自己实测有效的链接。
+   */
+  quarkDeepLinkTemplate: string;
 }
 
 export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
@@ -216,6 +225,8 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkPrefetchAllMarkdown: true,
   quarkOpenUnpreviewableInQuark: true,
   quarkOpenMediaInQuark: true,
+  quarkOpenMode: "app",
+  quarkDeepLinkTemplate: "https://pan.quark.cn/quarkcloud/{fid}",
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */
