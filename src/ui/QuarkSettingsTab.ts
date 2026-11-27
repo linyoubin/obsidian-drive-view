@@ -646,7 +646,7 @@ export class QuarkSettingsTab extends settingTabBase() {
       .setDesc(
         snapshot.deepLinkConfirmed
           ? `已确认可用：${snapshot.deepLinkConfirmed}（模板已写入下面）`
-          : "逐条点击候选链接，回答「进到 App 了吗」；确认可用的那条会自动写成深链模板。不会创建任何分享"
+          : "第三阶段：先点控制组 #1/#2/#3（baidu / pan.quark.cn）——若控制组也空白或报错，说明该 App 不允许外部网页深链，直达不可行；建议改用网页目录页，或安装「夸克网盘」App（AASA 已登记）。不会创建任何分享"
       )
       .addButton((button: any) =>
         button.setButtonText("测试深链").onClick(async () => {

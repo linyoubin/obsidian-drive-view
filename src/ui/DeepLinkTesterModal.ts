@@ -7,16 +7,17 @@
 
 import { App, Modal, Setting } from "obsidian";
 
-import type { DeeplinkAnswerResult, DeeplinkCandidate2 } from "../adapter/DeepLinkTester2";
+import type { ControlCandidate } from "../adapter/DeepLinkTester3";
+import type { DeeplinkAnswerResult } from "../adapter/DeepLinkTester2";
 
 export interface DeepLinkTesterModalHost {
-  onPick(candidate: DeeplinkCandidate2): void;
+  onPick(candidate: ControlCandidate): void;
 }
 
 export class DeepLinkTesterModal extends Modal {
   constructor(
     app: App,
-    private readonly candidates: DeeplinkCandidate2[],
+    private readonly candidates: ControlCandidate[],
     private readonly host: DeepLinkTesterModalHost
   ) {
     super(app);
@@ -26,18 +27,16 @@ export class DeepLinkTesterModal extends Modal {
     const { contentEl } = this;
     contentEl.innerHTML = "";
     contentEl.createEl("p", {
-      text: "第二阶段：外层 scheme 已确认可用，这次逐条测「内层 URL 编码」。每条会显示实际发出的完整串。",
+      text: "第三阶段（控制组）：先测 App 能不能打开任意网页，再判断目标链接是否被拒。每条显示实际发出的完整串。",
     });
     contentEl.createEl("p", {
-      text: "建议按编号顺序试：#1 ~ #4 最可能；点完回答四选一。不会创建任何分享。",
+      text: "请先点 #1/#2/#3 控制组：若它们也空白/报错，说明该 App 不支持外部网页深链，继续试后面的变体意义不大。不会创建任何分享。",
       cls: "quark-deeplink-test-hint",
     });
     for (const candidate of this.candidates) {
-      const setting = new Setting(contentEl).setName(
-        `#${candidate.caseId} ${
-          candidate.priority === "most-likely" ? "【最可能】" : candidate.priority === "control" ? "【对照】" : ""
-        }${candidate.outerLabel}`
-      );
+      const groupTag =
+        candidate.group === "control" ? "【控制组】" : candidate.group === "target" ? "【目标·已知失败】" : "【变体】";
+      const setting = new Setting(contentEl).setName(`#${candidate.caseId} ${groupTag}${candidate.outerLabel}`);
       const urlEl = contentEl.createDiv({ cls: "quark-deeplink-test-url" });
       urlEl.style.whiteSpace = "pre-wrap";
       urlEl.style.wordBreak = "break-all";
