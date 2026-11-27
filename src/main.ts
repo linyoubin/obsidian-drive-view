@@ -21,7 +21,7 @@ import {
   createUnpreviewableOpenFlow,
   isQuarkUnpreviewable,
 } from "./adapter/QuarkOpenExternal";
-import { createQuarkOpenTarget } from "./adapter/QuarkDeepLink";
+import { createQuarkOpenTarget, templateFromShareLink } from "./adapter/QuarkDeepLink";
 import type { UnpreviewableOpenResult } from "./adapter/QuarkOpenExternal";
 import { OpenInQuarkModal } from "./ui/OpenInQuarkModal";
 import { VaultMounter } from "./adapter/VaultMounter";
@@ -733,6 +733,8 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
           // 0.2.31：默认 App 深链优先；设置可切「只用浏览器」
           mode: this.settings.quarkOpenMode === "browser" ? "browser" : "app",
           template: this.settings.quarkDeepLinkTemplate,
+          // 0.2.32：模板来源（用户粘贴过分享链接 = user；空/内置 = default）
+          templateSource: String(this.settings.quarkDeepLinkTemplate ?? "").trim() ? "user" : "default",
           openUrl: (url) => this.openExternalUrl(url),
           copyLink: async (url) => {
             try {
@@ -752,13 +754,18 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
         })(info),
       log: (entry) => {
         try {
+          const templateSource = String(this.settings.quarkDeepLinkTemplate ?? "").trim() ? "user" : "default";
           this.quarkDiag?.log({
             level: "info",
             stage: "open-external",
             path: entry.path || "/",
             fid: entry.fid || "-",
             message: `result=${entry.result}`,
-            fields: { domain: entry.domain, length: entry.length },
+            fields: {
+              domain: entry.domain,
+              length: entry.length,
+              "template-source": templateSource,
+            },
           });
         } catch {
           /* 日志失败不影响打开流程 */
@@ -1677,6 +1684,22 @@ export default class GoogleDriveVaultPlugin extends Plugin implements QuarkHost 
   public async quarkSetDeepLinkTemplate(template: string): Promise<void> {
     await this.updateSettings({ quarkDeepLinkTemplate: String(template ?? "").slice(0, 500) });
     this.refreshQuarkUi();
+  }
+
+  /**
+   * 0.2.32：从 App 内「分享 → 复制链接」得到的链接生成深链模板。
+   * 把 id 段换成 `{fileFid}` / `{fid}`，例如 `https://pan.quark.cn/s/abc123` → `https://pan.quark.cn/s/{fileFid}`。
+   */
+  public async quarkImportDeepLinkFromShare(link: string): Promise<boolean> {
+    const template = templateFromShareLink(link);
+    if (!template) {
+      new Notice("无法识别该分享链接：请粘贴夸克 App「分享 → 复制链接」得到的 https://pan.quark.cn/s/… 链接", 8000);
+      return false;
+    }
+    await this.updateSettings({ quarkDeepLinkTemplate: template.slice(0, 500) });
+    new Notice(`已生成深链模板：${template}（打开时 {fileFid} 会替换成目标文件 id）`, 8000);
+    this.refreshQuarkUi();
+    return true;
   }
 
   /** 0.2.28：外部打开 URL —— 桌面优先 electron.shell.openExternal，其次 window.open（手机走系统浏览器）。 */

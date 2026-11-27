@@ -92,6 +92,8 @@ export interface QuarkHost {
   quarkSetOpenMode(mode: "app" | "browser"): Promise<void>;
   /** 0.2.31：App 深链模板。 */
   quarkSetDeepLinkTemplate(template: string): Promise<void>;
+  /** 0.2.32：从 App 分享链接生成模板（成功返回 true）。 */
+  quarkImportDeepLinkFromShare(link: string): Promise<boolean>;
   quarkCancelBulkPrefetch(): void;
   quarkClearMdCache(): Promise<void>;
 }
@@ -122,7 +124,7 @@ export const EMPTY_QUARK_SNAPSHOT: QuarkUiSnapshot = {
   openUnpreviewableInQuark: true,
   openMediaInQuark: true,
   openMode: "app",
-  deepLinkTemplate: "https://pan.quark.cn/quarkcloud/{fid}",
+  deepLinkTemplate: "",
   bulkDone: 0,
   bulkTotal: 0,
   bulkBytes: 0,
@@ -608,14 +610,42 @@ export class QuarkSettingsTab extends settingTabBase() {
           })
       );
 
+    let shareDraft = "";
     new Setting(container)
-      .setName("App 深链模板（可改，含 {fid} / {fileFid}）")
+      .setName("从 App 分享链接生成模板（推荐）")
       .setDesc(
-        "默认用已证实的 iOS Universal Link 前缀。若你在手机上实测到能定位文件的链接（含 quarkcloud:// 之类的 scheme），把它粘到这里；{fid}=所在目录，{fileFid}=文件"
+        "在夸克 App 里把目标文件「分享 → 复制链接」后粘到这里，点「生成模板」：会自动把 id 段替换成 {fileFid} 占位符并填入下面的模板。你的「夸克-AI旗舰应用」不在 pan.quark.cn 的 Universal Link 名单里，默认不再硬塞错误链接"
       )
       .addText((text: any) =>
         text
-          .setPlaceholder("https://pan.quark.cn/quarkcloud/{fid}")
+          .setPlaceholder("https://pan.quark.cn/s/xxxxxx")
+          .onChange((value: string) => {
+            shareDraft = value;
+          })
+      )
+      .addButton((button: any) =>
+        button
+          .setButtonText("生成模板")
+          .setCta()
+          .onClick(async () => {
+            const ok = await this.host.quarkImportDeepLinkFromShare(shareDraft);
+            if (ok) {
+              shareDraft = "";
+              this.display();
+            }
+          })
+      );
+
+    new Setting(container)
+      .setName("App 深链模板（可改，含 {fid} / {fileFid}）")
+      .setDesc(
+        snapshot.deepLinkTemplate
+          ? `当前模板：${snapshot.deepLinkTemplate}（{fid}=所在目录，{fileFid}=文件，{rootFid}=库根）`
+          : "当前为空：点上面粘贴 App 分享链接，或手动填一个你实测能唤起 App 的链接；空模板时只走网页 → 复制"
+      )
+      .addText((text: any) =>
+        text
+          .setPlaceholder("（空）粘贴分享链接或手填深链模板")
           .setValue(snapshot.deepLinkTemplate)
           .onChange(async (value: string) => {
             await this.host.quarkSetDeepLinkTemplate(value);

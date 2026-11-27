@@ -206,8 +206,9 @@ export interface QuarkSettings {
    */
   quarkOpenMode: "app" | "browser";
   /**
-   * 0.2.31：App 深链模板（支持 `{fid}` / `{fileFid}` / `{rootFid}`）。
-   * 默认用已证实的 Universal Link 前缀（`/quarkcloud/*`），可改为自己实测有效的链接。
+   * 0.2.31/0.2.32：App 深链模板（支持 `{fid}` / `{fileFid}` / `{rootFid}`）。
+   * 0.2.32 起**默认空**：用户的「夸克-AI旗舰应用」= com.quark.browser，不在 pan.quark.cn 的 AASA 里，
+   * 不再默认硬塞 `quarkcloud` 链接；用户可从 App 内分享链接一键生成模板。
    */
   quarkDeepLinkTemplate: string;
 }
@@ -226,7 +227,7 @@ export const DEFAULT_QUARK_SETTINGS: QuarkSettings = {
   quarkOpenUnpreviewableInQuark: true,
   quarkOpenMediaInQuark: true,
   quarkOpenMode: "app",
-  quarkDeepLinkTemplate: "https://pan.quark.cn/quarkcloud/{fid}",
+  quarkDeepLinkTemplate: "",
 };
 
 /** CookieStore 在 `data.json` 里使用的键名（与插件设置同文件）。 */

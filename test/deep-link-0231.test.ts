@@ -14,6 +14,7 @@ import {
   DEFAULT_DEEPLINK_TEMPLATE,
   createQuarkOpenTarget,
   renderDeepLinkTemplate,
+  templateFromShareLink,
 } from "../src/adapter/QuarkDeepLink";
 
 interface LogEntry {
@@ -21,7 +22,11 @@ interface LogEntry {
   fid: string;
   url: string;
   result: string;
+  templateSource?: string;
 }
+
+/** 0.2.32：显式模板（默认模板已置空，App 用例需自带模板）。 */
+const APP_TEMPLATE = "https://pan.quark.cn/quarkcloud/{fid}";
 
 function makeHost(
   options: {
@@ -36,9 +41,11 @@ function makeHost(
   const logs: LogEntry[] = [];
   let openIndex = 0;
   const openResults = options.openResults ?? [true];
+  const template = options.template ?? APP_TEMPLATE;
   const host = {
     mode: options.mode ?? "app",
-    template: options.template ?? DEFAULT_DEEPLINK_TEMPLATE,
+    template,
+    templateSource: template.trim() ? ("user" as const) : ("default" as const),
     openUrl: async (url: string) => {
       opened.push(url);
       const result = openResults[openIndex] ?? false;
@@ -65,17 +72,58 @@ describe("0.2.31 深链模板渲染", () => {
       "https://pan.quark.cn/quarkcloud/4e5cda2d01544632b54129bf61c22abb?file=7f941f87972c4dca9732e5272084080d"
     );
     // 目录 fid 与文件 fid 各一例
-    expect(renderDeepLinkTemplate(DEFAULT_DEEPLINK_TEMPLATE, { fid: "dir-fid" })).toBe(
+    expect(renderDeepLinkTemplate(APP_TEMPLATE, { fid: "dir-fid" })).toBe(
       "https://pan.quark.cn/quarkcloud/dir-fid"
     );
     expect(renderDeepLinkTemplate("myapp://open?file={fileFid}", { fileFid: "file-fid" })).toBe(
       "myapp://open?file=file-fid"
     );
+    // 0.2.32：默认模板为空（夸克-AI旗舰应用不在 AASA 名单里）
+    expect(DEFAULT_DEEPLINK_TEMPLATE).toBe("");
+    expect(renderDeepLinkTemplate(DEFAULT_DEEPLINK_TEMPLATE, { fid: "x" })).toBe("");
     // 空模板 / 无 fid 回落 rootFid → "0"
     expect(renderDeepLinkTemplate("", { fid: "x" })).toBe("");
-    expect(renderDeepLinkTemplate(DEFAULT_DEEPLINK_TEMPLATE, {})).toBe(
+    expect(renderDeepLinkTemplate(APP_TEMPLATE, {})).toBe(
       "https://pan.quark.cn/quarkcloud/0"
     );
+  });
+
+  test("0.2.32 从 App 分享链接生成模板：id 段替换为 {fileFid}/{fid}", () => {
+    expect(templateFromShareLink("https://pan.quark.cn/s/abc123def")).toBe(
+      "https://pan.quark.cn/s/{fileFid}"
+    );
+    expect(templateFromShareLink("pan.quark.cn/s/AbC-123_x")).toBe(
+      "https://pan.quark.cn/s/{fileFid}"
+    );
+    expect(templateFromShareLink("https://pan.quark.cn/quarkcloud/4e5cda2d01544632b54129bf61c22abb")).toBe(
+      "https://pan.quark.cn/quarkcloud/{fileFid}"
+    );
+    expect(
+      templateFromShareLink("https://pan.quark.cn/list#/list/all/4e5cda2d01544632b54129bf61c22abb")
+    ).toBe("https://pan.quark.cn/list#/list/all/{fid}");
+    // 已是模板 / 无法识别
+    expect(templateFromShareLink("https://pan.quark.cn/s/{fileFid}")).toBe(
+      "https://pan.quark.cn/s/{fileFid}"
+    );
+    expect(templateFromShareLink("https://example.com/s/abc")).toBe("");
+    expect(templateFromShareLink("")).toBe("");
+  });
+
+  test("0.2.32 模板为空（默认）→ 不尝试深链，直接 https，日志记 template-source=default", async () => {
+    const { host, opened, logs } = makeHost({ mode: "app", template: "" });
+    const target = createQuarkOpenTarget(host);
+
+    const result = await target({ path: "docs/a.pdf", fid: "file-fid", parentFid: "dir-fid" });
+
+    expect(result).toBe("https");
+    expect(opened).toEqual(["https://pan.quark.cn/list#/list/all/dir-fid"]); // 没有 quarkcloud 尝试
+    expect(logs[0]).toMatchObject({ result: "https", templateSource: "default" });
+  });
+
+  test("0.2.32 用户模板 → 日志 template-source=user", async () => {
+    const { host, logs } = makeHost({ mode: "app", template: APP_TEMPLATE });
+    await createQuarkOpenTarget(host)({ path: "a.docx", fid: "f", parentFid: "dir" });
+    expect(logs[0]).toMatchObject({ result: "app", templateSource: "user" });
   });
 });
 
